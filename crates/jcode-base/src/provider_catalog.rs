@@ -7,8 +7,12 @@ pub use jcode_provider_metadata::*;
 use std::collections::{HashMap, HashSet};
 
 pub const OPENAI_COMPAT_LOCAL_ENABLED_ENV: &str = "JCODE_OPENAI_COMPAT_LOCAL_ENABLED";
+pub const MINIMAX_GLOBAL_OPENAI_API_BASE: &str = "https://api.minimax.io/v1";
+pub const MINIMAX_GLOBAL_ANTHROPIC_API_BASE: &str = "https://api.minimax.io/anthropic/v1";
 pub const MINIMAX_CHINA_API_BASE: &str = "https://api.minimaxi.com/v1";
-pub const MINIMAX_CHINA_SETUP_URL: &str = "https://platform.minimaxi.com/docs/llms.txt";
+pub const MINIMAX_CHINA_ANTHROPIC_API_BASE: &str = "https://api.minimaxi.com/anthropic/v1";
+pub const MINIMAX_CHINA_SETUP_URL: &str =
+    "https://platform.minimaxi.com/docs/api-reference/api-overview";
 
 pub fn api_base_uses_localhost(raw: &str) -> bool {
     let Ok(parsed) = url::Url::parse(raw) else {
@@ -496,6 +500,7 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
         // before the picker/routes are rebuilt. Keep the documented text models
         // selectable immediately after saving a key.
         "minimax" => {
+            push("MiniMax-M3");
             push("MiniMax-M2.7");
             push("MiniMax-M2.7-highspeed");
             push("MiniMax-M2.5");

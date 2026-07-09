@@ -92,6 +92,11 @@ fn auth_issue_profile_metadata_matches_direct_provider_endpoints() {
     assert_eq!(DEEPSEEK_PROFILE.default_model, Some("deepseek-v4-flash"));
     assert_eq!(DEEPSEEK_PROFILE.setup_url, "https://api-docs.deepseek.com/");
     assert_eq!(MINIMAX_PROFILE.api_base, "https://api.minimax.io/v1");
+    assert_eq!(MINIMAX_PROFILE.default_model, Some("MiniMax-M3"));
+    assert_eq!(
+        MINIMAX_PROFILE.setup_url,
+        "https://platform.minimax.io/docs/api-reference/api-overview"
+    );
     assert_eq!(MINIMAX_PROFILE.api_key_env, "OPENAI_API_KEY");
     assert_eq!(
         ALIBABA_CODING_PLAN_PROFILE.api_base,
@@ -200,10 +205,14 @@ fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_internatio
     crate::env::remove_var("OPENAI_API_KEY");
 
     let international = resolve_openai_compatible_profile(MINIMAX_PROFILE);
-    assert_eq!(international.api_base, "https://api.minimax.io/v1");
+    assert_eq!(international.api_base, MINIMAX_GLOBAL_OPENAI_API_BASE);
+    assert_eq!(
+        MINIMAX_GLOBAL_ANTHROPIC_API_BASE,
+        "https://api.minimax.io/anthropic/v1"
+    );
     assert_eq!(
         international.setup_url,
-        "https://platform.minimax.io/docs/guides/text-generation"
+        "https://platform.minimax.io/docs/api-reference/api-overview"
     );
 
     let china = resolve_openai_compatible_profile_with_api_key_hint(
@@ -211,6 +220,10 @@ fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_internatio
         Some("sk-cp-test-token"),
     );
     assert_eq!(china.api_base, MINIMAX_CHINA_API_BASE);
+    assert_eq!(
+        MINIMAX_CHINA_ANTHROPIC_API_BASE,
+        "https://api.minimaxi.com/anthropic/v1"
+    );
     assert_eq!(china.setup_url, MINIMAX_CHINA_SETUP_URL);
 }
 
@@ -1095,6 +1108,8 @@ fn open_weight_family_context_limits_match_published_windows() {
 
     // Other open-weight families.
     assert_eq!(f("kimi-k2.5"), Some(262_144));
+    assert_eq!(f("minimax-m3"), Some(1_000_000));
+    assert_eq!(f("MiniMax-M3"), Some(1_000_000));
     assert_eq!(f("minimax-m2.7"), Some(204_800));
     assert_eq!(f("mimo-v2.5"), Some(262_144));
     assert_eq!(f("deepseek-v3.2"), Some(163_840));

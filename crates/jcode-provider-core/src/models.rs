@@ -257,7 +257,8 @@ pub fn context_limit_for_model_with_provider_and_cache(
 /// each family's published context window; a live `/v1/models` catalog or an
 /// explicit user `context_window` config overrides these upstream.
 pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
-    let m = model;
+    let m = model.to_ascii_lowercase();
+    let m = m.as_str();
 
     // --- Z.AI GLM family ---
     if m.contains("glm") {
@@ -299,7 +300,10 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
         return Some(262_144);
     }
 
-    // --- MiniMax M2 family: 204,800 context ---
+    // --- MiniMax M3 family: 1M context; M2 family: 204,800 context ---
+    if m.contains("minimax-m3") {
+        return Some(1_000_000);
+    }
     if m.contains("minimax") {
         return Some(204_800);
     }
