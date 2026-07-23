@@ -1,3 +1,6 @@
+use super::minimax_image_generation::{
+    is_minimax_image_model, prompt_from_messages, run as run_minimax_image_generation,
+};
 use super::openrouter_sse_stream::run_stream_with_retries;
 use super::*;
 use jcode_base::provider::{ModelCatalogRefreshSummary, summarize_model_catalog_refresh};
@@ -42,6 +45,41 @@ impl Provider for OpenRouterProvider {
         _resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
         let model = self.model.read().await.clone();
+        if is_minimax_image_model(self.profile_id.as_deref(), &self.api_base, &model) {
+            let prompt = prompt_from_messages(messages)?;
+            let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(16);
+            let client = self.client.clone();
+            let api_base = self.api_base.clone();
+            let auth = self.auth.clone();
+            let model_for_generation = model.clone();
+
+            tokio::spawn(async move {
+                if tx
+                    .send(Ok(StreamEvent::ConnectionType {
+                        connection: "https/image-generation".to_string(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if let Err(error) = run_minimax_image_generation(
+                    client,
+                    api_base,
+                    auth,
+                    model_for_generation,
+                    prompt,
+                    tx.clone(),
+                )
+                .await
+                {
+                    let _ = tx.send(Err(error)).await;
+                }
+            });
+
+            return Ok(Box::pin(ReceiverStream::new(rx)));
+        }
+
         let reasoning_effort = self.reasoning_effort();
         let thinking_override = Self::thinking_override();
         // Moonshot's dedicated Kimi coding endpoint enables thinking server-side

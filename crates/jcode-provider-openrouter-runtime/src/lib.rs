@@ -2745,6 +2745,8 @@ impl OpenRouterProvider {
     }
 }
 
+#[path = "minimax_image_generation.rs"]
+mod minimax_image_generation;
 #[path = "openrouter_provider_impl.rs"]
 mod openrouter_provider_impl;
 #[path = "openrouter_sse_stream.rs"]

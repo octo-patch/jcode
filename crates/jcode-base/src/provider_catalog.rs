@@ -495,6 +495,9 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
         // model activation should not depend on the catalog refresh completing
         // before the picker/routes are rebuilt. Keep the documented text models
         // selectable immediately after saving a key.
+        // MiniMax exposes image-generation model ids through the same provider
+        // profile. They are listed so users can select the provider-native
+        // generation path even though they do not have a chat context window.
         "minimax" => {
             push("MiniMax-M2.7");
             push("MiniMax-M2.7-highspeed");
@@ -503,6 +506,8 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
             push("MiniMax-M2.1");
             push("MiniMax-M2.1-highspeed");
             push("MiniMax-M2");
+            push("image-01");
+            push("image-01-live");
         }
         "alibaba-coding-plan" => {
             push("qwen3-coder-plus");

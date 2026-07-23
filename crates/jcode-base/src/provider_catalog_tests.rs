@@ -215,6 +215,13 @@ fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_internatio
 }
 
 #[test]
+fn minimax_static_models_include_image_generation_models() {
+    let models = openai_compatible_profile_static_models(MINIMAX_PROFILE);
+    assert!(models.iter().any(|model| model == "image-01"));
+    assert!(models.iter().any(|model| model == "image-01-live"));
+}
+
+#[test]
 fn auth_issue_lan_openai_compatible_bases_are_valid_for_local_model_servers() {
     assert_eq!(
         normalize_api_base("http://100.103.78.84:11434/v1").as_deref(),
@@ -1049,6 +1056,7 @@ fn every_static_profile_model_has_a_known_context_limit() {
         m.starts_with("claude-")
             || m.starts_with("gpt-")
             || m.starts_with("gemini-")
+            || m.starts_with("image-")
             || m.starts_with("o3")
             || m.starts_with("o4")
     }
