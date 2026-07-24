@@ -1,6 +1,125 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedGeneratedImage {
+    pub id: String,
+    pub path: String,
+    pub metadata_path: Option<String>,
+    pub output_format: String,
+    pub revised_prompt: Option<String>,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "generated-image metadata stays explicit at provider call sites"
+)]
+pub fn persist_generated_image(
+    image_bytes: &[u8],
+    provider: &str,
+    native_tool: &str,
+    id: &str,
+    status: Option<&str>,
+    output_format: &str,
+    revised_prompt: Option<&str>,
+    response_item: Value,
+) -> Result<PersistedGeneratedImage> {
+    let root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+    persist_generated_image_under(
+        &root,
+        image_bytes,
+        provider,
+        native_tool,
+        id,
+        status,
+        output_format,
+        revised_prompt,
+        response_item,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "generated-image metadata stays explicit at provider call sites"
+)]
+fn persist_generated_image_under(
+    root: &Path,
+    image_bytes: &[u8],
+    provider: &str,
+    native_tool: &str,
+    id: &str,
+    status: Option<&str>,
+    output_format: &str,
+    revised_prompt: Option<&str>,
+    response_item: Value,
+) -> Result<PersistedGeneratedImage> {
+    let safe_id: String = id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        .take(80)
+        .collect();
+    let safe_id = if safe_id.is_empty() {
+        "image".to_string()
+    } else {
+        safe_id
+    };
+    let (normalized_format, extension) = match output_format.trim().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => ("jpeg", "jpg"),
+        "webp" => ("webp", "webp"),
+        "gif" => ("gif", "gif"),
+        "bmp" => ("bmp", "bmp"),
+        _ => ("png", "png"),
+    };
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let dir = root.join(".jcode").join("generated-images");
+    std::fs::create_dir_all(&dir)?;
+
+    let path = dir.join(format!("{timestamp_ms}-{safe_id}.{extension}"));
+    std::fs::write(&path, image_bytes)?;
+
+    let metadata_path = path.with_extension("json");
+    let revised_prompt = revised_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "provider": provider,
+        "native_tool": native_tool,
+        "id": id,
+        "status": status,
+        "created_at_unix_ms": timestamp_ms,
+        "image_path": path.display().to_string(),
+        "output_format": normalized_format,
+        "byte_count": image_bytes.len(),
+        "revised_prompt": revised_prompt,
+        "response_item": response_item,
+    });
+    let metadata_path = match serde_json::to_vec_pretty(&metadata).ok().and_then(|bytes| {
+        std::fs::write(&metadata_path, bytes)
+            .ok()
+            .map(|_| metadata_path)
+    }) {
+        Some(path) => Some(path.display().to_string()),
+        None => {
+            jcode_logging::warn("Failed to save generated image metadata");
+            None
+        }
+    };
+
+    Ok(PersistedGeneratedImage {
+        id: id.to_string(),
+        path: path.display().to_string(),
+        metadata_path,
+        output_format: normalized_format.to_string(),
+        revised_prompt,
+    })
+}
 
 pub fn generated_image_side_panel_page_id(id: &str) -> String {
     let safe: String = id
@@ -223,6 +342,14 @@ fn read_generated_image_metadata_summary(path: &str) -> Option<GeneratedImageMet
         .into_iter()
         .flat_map(|item| {
             [
+                ("model", "Model"),
+                ("aspect_ratio", "Aspect ratio"),
+                ("width", "Width"),
+                ("height", "Height"),
+                ("response_format", "Response format"),
+                ("seed", "Seed"),
+                ("n", "Count"),
+                ("prompt_optimizer", "Prompt optimizer"),
                 ("size", "Size"),
                 ("quality", "Quality"),
                 ("background", "Background"),
@@ -366,5 +493,46 @@ mod tests {
         assert_eq!(info.title(), "Image · wide.png · 4×2");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_generated_image_writes_shared_metadata_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "jcode-generated-image-persistence-test-{}",
+            std::process::id()
+        ));
+        let persisted = persist_generated_image_under(
+            &root,
+            b"not-a-real-png",
+            "minimax",
+            "image_generation",
+            "img_123",
+            Some("completed"),
+            "png",
+            None,
+            serde_json::json!({
+                "model": "image-01",
+                "aspect_ratio": "1:1",
+                "response_format": "base64",
+                "n": 1,
+            }),
+        )
+        .expect("persist generated image");
+
+        assert!(Path::new(&persisted.path).is_file());
+        assert_eq!(persisted.output_format, "png");
+        let metadata_path = persisted.metadata_path.expect("metadata path");
+        let metadata: Value = serde_json::from_slice(
+            &std::fs::read(metadata_path).expect("read generated image metadata"),
+        )
+        .expect("parse generated image metadata");
+        assert_eq!(metadata["provider"], serde_json::json!("minimax"));
+        assert_eq!(
+            metadata["native_tool"],
+            serde_json::json!("image_generation")
+        );
+        assert_eq!(metadata["response_item"]["model"], "image-01");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

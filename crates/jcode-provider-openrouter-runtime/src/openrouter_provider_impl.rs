@@ -93,8 +93,13 @@ impl Provider for OpenRouterProvider {
             allow_image_input,
         );
 
-        // Build tools in OpenAI format
-        let api_tools: Vec<Value> = tools
+        // Build tools in OpenAI format. MiniMax exposes image generation on a
+        // separate native endpoint, so its direct profile gets one reserved
+        // function that this runtime executes and converts into GeneratedImage
+        // events before the application tool registry sees it.
+        let minimax_image_generation_enabled =
+            super::minimax_image::should_enable(self.profile_id.as_deref(), tools);
+        let mut api_tools: Vec<Value> = tools
             .iter()
             .map(|t| {
                 serde_json::json!({
@@ -111,6 +116,9 @@ impl Provider for OpenRouterProvider {
                 })
             })
             .collect();
+        if minimax_image_generation_enabled {
+            api_tools.push(super::minimax_image::tool_definition());
+        }
 
         // Build request
         let mut request = serde_json::json!({
@@ -299,17 +307,43 @@ impl Provider for OpenRouterProvider {
             {
                 return;
             }
-            run_stream_with_retries(
-                client,
-                api_base,
-                auth,
-                send_openrouter_headers,
-                request_for_retries,
-                tx,
-                provider_pin,
-                model_for_stream,
-            )
-            .await;
+            if minimax_image_generation_enabled {
+                let image_client = client.clone();
+                let image_api_base = api_base.clone();
+                let image_auth = auth.clone();
+                let (provider_tx, provider_rx) = mpsc::channel::<Result<StreamEvent>>(100);
+                let _ = tokio::join!(
+                    run_stream_with_retries(
+                        client,
+                        api_base,
+                        auth,
+                        send_openrouter_headers,
+                        request_for_retries,
+                        provider_tx,
+                        provider_pin,
+                        model_for_stream,
+                    ),
+                    super::minimax_image::forward_events(
+                        provider_rx,
+                        tx,
+                        image_client,
+                        image_api_base,
+                        image_auth,
+                    )
+                );
+            } else {
+                run_stream_with_retries(
+                    client,
+                    api_base,
+                    auth,
+                    send_openrouter_headers,
+                    request_for_retries,
+                    tx,
+                    provider_pin,
+                    model_for_stream,
+                )
+                .await;
+            }
         });
 
         Ok(Box::pin(ReceiverStream::new(rx)))
