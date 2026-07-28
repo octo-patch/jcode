@@ -10,11 +10,16 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(unix)]
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::process::{Command as StdCommand, Stdio};
+#[cfg(unix)]
+use std::process::Command as StdCommand;
+use std::process::Stdio;
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
@@ -24,9 +29,9 @@ const STDIN_POLL_INTERVAL_MS: u64 = 500;
 const STDIN_INITIAL_DELAY_MS: u64 = 300;
 const PROGRESS_MARKER_PREFIX: &str = "JCODE_PROGRESS ";
 const CHECKPOINT_MARKER_PREFIX: &str = "JCODE_CHECKPOINT ";
-const BACKGROUND_PROGRESS_GUIDANCE: &str = "For long-running background commands, prefer scripts or commands that periodically print progress updates. Best format: print lines starting with `JCODE_PROGRESS ` followed by JSON like {\"percent\":42,\"message\":\"Running\"} or {\"current\":120,\"total\":1000,\"unit\":\"batches\",\"message\":\"Epoch 2/5\",\"eta_seconds\":30}. Supported JSON fields are `percent`, `message`, `current`, `total`, `unit`, `eta_seconds`, and optional `kind`=`indeterminate` or `kind`=`checkpoint`. For milestone-style wakeups, print `JCODE_CHECKPOINT {\"message\":\"Unit tests passed\"}`. Generic fallback output that can be parsed includes `42%`, `3/10 tests`, `3 of 10 steps`, `1.5/3.0 GiB`, or phase lines like `Compiling ...`, `Downloading ...`, `Running ...`, and `Building ...`. If you are writing the script yourself, add these progress/checkpoint lines explicitly.";
-const BASH_TOOL_DESCRIPTION: &str = "Run a bash command. For long-running background commands, prefer scripts that emit progress/checkpoint lines. Print `JCODE_PROGRESS {json}` or `JCODE_CHECKPOINT {json}` lines for reliable reporting, or at least output parseable progress like `42%`, `3/10 tests`, `3 of 10 steps`, `1.5/3.0 GiB`, or `Running ...`.";
-const WINDOWS_SHELL_TOOL_DESCRIPTION: &str = "Run a shell command. For long-running background commands, prefer scripts that emit progress/checkpoint lines. Print `JCODE_PROGRESS {json}` or `JCODE_CHECKPOINT {json}` lines for reliable reporting, or at least output parseable progress like `42%`, `3/10 tests`, `3 of 10 steps`, `1.5/3.0 GiB`, or `Running ...`.";
+const BACKGROUND_PROGRESS_GUIDANCE: &str = "For long-running background commands, prefer scripts or commands that periodically print progress updates. Best format: print lines starting with `JCODE_PROGRESS ` followed by JSON like {\"percent\":42,\"message\":\"Running\"} or {\"current\":120,\"total\":1000,\"unit\":\"batches\",\"message\":\"Epoch 2/5\",\"eta_seconds\":30}. Supported JSON fields are `percent`, `message`, `current`, `total`, `unit`, `eta_seconds`, and optional `kind`=`indeterminate` or `kind`=`checkpoint`. For milestone-style wakeups, print `JCODE_CHECKPOINT {\"message\":\"Unit tests passed\"}`. Generic fallback output that can be parsed includes `42%`, `3/10 tests`, `3 of 10 steps`, `1.5/3.0 GiB`, or phase lines like `Compiling ...`, `Downloading ...`, `Running ...`, and `Building ...`. If you are writing the script yourself, add these progress/checkpoint lines explicitly. Put large temporary files, worktrees, and virtual environments under `$JCODE_SCRATCH_DIR`, not `/tmp`, because `/tmp` may be RAM-backed.";
+const BASH_TOOL_DESCRIPTION: &str = "Run a bash command. For long-running background commands, prefer scripts that emit progress/checkpoint lines. Print `JCODE_PROGRESS {json}` or `JCODE_CHECKPOINT {json}` lines for reliable reporting, or at least output parseable progress like `42%`, `3/10 tests`, `3 of 10 steps`, `1.5/3.0 GiB`, or `Running ...`. Put large temporary files and worktrees under `$JCODE_SCRATCH_DIR`, not `/tmp`, because `/tmp` may be RAM-backed.";
+const WINDOWS_SHELL_TOOL_DESCRIPTION: &str = "Run a Windows cmd.exe command. The tool keeps the compatibility name `bash`, but commands must use cmd.exe syntax and quoting, not Bash syntax. Invoke PowerShell explicitly when PowerShell syntax is needed. For long-running background commands, prefer scripts that emit progress/checkpoint lines. Print `JCODE_PROGRESS {json}` or `JCODE_CHECKPOINT {json}` lines for reliable reporting, or at least output parseable progress like `42%`, `3/10 tests`, `3 of 10 steps`, `1.5/3.0 GiB`, or `Running ...`.";
 
 /// Build a clear timeout message. The `timeout` param is in milliseconds, which
 /// agents frequently mistake for seconds (e.g. passing 1000 thinking it means
@@ -188,7 +193,7 @@ fn parse_progress_marker_with_checkpoint(line: &str) -> Option<(BackgroundTaskPr
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn parse_progress_marker(line: &str) -> Option<BackgroundTaskProgress> {
     parse_progress_marker_with_checkpoint(line).map(|(progress, _)| progress)
 }
@@ -444,17 +449,75 @@ async fn handle_background_output_line(
     file.flush().await.ok();
 }
 
+#[cfg(not(windows))]
+fn tool_scratch_dir() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("JCODE_SCRATCH_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            crate::storage::jcode_dir()
+                .ok()
+                .map(|dir| dir.join("scratch"))
+        })?;
+    crate::storage::ensure_dir(&dir).ok()?;
+    Some(dir)
+}
+
+#[cfg(not(windows))]
+fn configure_tool_scratch(command: &mut TokioCommand) {
+    if let Some(dir) = tool_scratch_dir() {
+        command.env("TMPDIR", &dir).env("JCODE_SCRATCH_DIR", dir);
+    }
+}
+
+#[cfg(unix)]
+struct ProcessGroupKillGuard {
+    pid: Option<u32>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupKillGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupKillGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            let _ = crate::platform::signal_detached_process_group(pid, libc::SIGKILL);
+        }
+    }
+}
+
 fn build_shell_command(cmd_str: &str) -> TokioCommand {
     #[cfg(windows)]
     {
         let mut cmd = TokioCommand::new("cmd.exe");
-        cmd.arg("/C").arg(cmd_str);
+        // cmd.exe does not use the standard C runtime argument-decoding rules.
+        // Passing the command through `arg` makes Rust escape nested quotes for
+        // CommandLineToArgvW, which can corrupt commands such as:
+        //
+        //     gh issue create --title "text with spaces"
+        //
+        // Tokio's `raw_arg` is specifically provided for `cmd.exe /C`. Wrap the
+        // full command in the outer quotes expected by cmd so its inner quotes
+        // reach child programs intact. `/D` disables AutoRun hooks and `/S`
+        // selects the documented quote handling used with this form.
+        cmd.args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{cmd_str}\""));
         cmd
     }
     #[cfg(not(windows))]
     {
         let mut cmd = TokioCommand::new("bash");
         cmd.arg("-c").arg(cmd_str);
+        configure_tool_scratch(&mut cmd);
         cmd
     }
 }
@@ -467,6 +530,9 @@ fn build_detached_shell_wrapper(command: &str) -> StdCommand {
             r#"eval "$JCODE_RELOAD_DETACH_COMMAND"; status=$?; printf '\n--- Command finished with exit code: %s ---\n' "$status"; exit "$status""#,
         )
         .env("JCODE_RELOAD_DETACH_COMMAND", command);
+    if let Some(dir) = tool_scratch_dir() {
+        cmd.env("TMPDIR", &dir).env("JCODE_SCRATCH_DIR", dir);
+    }
     cmd
 }
 
@@ -489,7 +555,7 @@ fn format_command_output(mut output: String, exit_code: Option<i32>) -> String {
 
 #[cfg(test)]
 mod utf8_truncation_tests {
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     use super::build_shell_command;
     use super::format_command_output;
 
@@ -515,6 +581,57 @@ mod utf8_truncation_tests {
             "unexpected stdout: {}",
             stdout
         );
+
+        let probe_path = std::env::temp_dir().join(format!(
+            "jcode-cmd-quoting-probe-{}.cmd",
+            std::process::id()
+        ));
+        std::fs::write(
+            &probe_path,
+            concat!(
+                "@echo off\r\n",
+                "if \"%~1\"==\"text with spaces\" if \"%~2\"==\"\" (\r\n",
+                "  echo quoted-argument-ok\r\n",
+                "  exit /b 0\r\n",
+                ")\r\n",
+                "echo first=[%~1] second=[%~2]\r\n",
+                "exit /b 1\r\n",
+            ),
+        )
+        .expect("write cmd quoting probe");
+
+        let quoted_command = format!("call \"{}\" \"text with spaces\"", probe_path.display());
+        let quoted_output = build_shell_command(&quoted_command)
+            .output()
+            .await
+            .expect("run cmd quoting probe");
+        let _ = std::fs::remove_file(&probe_path);
+        let quoted_stdout = String::from_utf8_lossy(&quoted_output.stdout);
+        let quoted_stderr = String::from_utf8_lossy(&quoted_output.stderr);
+        assert!(
+            quoted_output.status.success(),
+            "quoted argument should remain one child-process argument; stdout={quoted_stdout:?} stderr={quoted_stderr:?}"
+        );
+        assert!(
+            quoted_stdout.contains("quoted-argument-ok"),
+            "unexpected quoted-command stdout: {quoted_stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_shell_command_uses_disk_backed_scratch_directory() {
+        let expected = super::tool_scratch_dir().expect("jcode scratch directory");
+        let output = build_shell_command("printf '%s\\n%s\\n' \"$TMPDIR\" \"$JCODE_SCRATCH_DIR\"")
+            .output()
+            .await
+            .expect("run bash command");
+        assert!(output.status.success(), "bash command should succeed");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 scratch paths");
+        let paths = stdout.lines().collect::<Vec<_>>();
+        let expected = expected.to_string_lossy().into_owned();
+        assert_eq!(paths, vec![expected.as_str(), expected.as_str()]);
+        assert!(std::path::Path::new(&expected).is_dir());
     }
 }
 
@@ -539,12 +656,18 @@ struct BashInput {
     notify: bool,
     #[serde(default)]
     wake: bool,
+    /// Set only when re-issuing a call the gate refused (#604).
+    #[serde(default)]
+    justification: Option<String>,
 }
 
 fn default_true() -> bool {
     true
 }
 
+#[path = "bash_destructive_gate.rs"]
+mod destructive_gate;
+use destructive_gate::destructive_command_refusal;
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &str {
@@ -560,43 +683,21 @@ impl Tool for BashTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        let cmd_desc = if cfg!(windows) {
-            "The shell command to execute (via cmd.exe). If you write a long-running script or loop for run_in_background=true, make it print progress lines. Preferred format: `JCODE_PROGRESS {json}`."
-        } else {
-            "The bash command to execute. If you write a long-running script or loop for run_in_background=true, make it print progress lines. Preferred format: `JCODE_PROGRESS {json}`."
-        };
-        json!({
-            "type": "object",
-            "required": ["command"],
-            "properties": {
-                "intent": super::intent_schema_property(),
-                "command": {
-                    "type": "string",
-                    "description": cmd_desc
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in MILLISECONDS (not seconds). Kills the command when exceeded and reports exit 124. e.g. 1000 = 1s, 600000 = 10min. Omit to run with no timeout; do NOT pass small values like 1000 for long jobs such as builds or test suites."
-                },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": format!("Run in background. {}", BACKGROUND_PROGRESS_GUIDANCE)
-                },
-                "notify": {
-                    "type": "boolean",
-                    "description": "Notify on completion."
-                },
-                "wake": {
-                    "type": "boolean",
-                    "description": "Wake on completion."
-                }
-            }
-        })
+        destructive_gate::bash_parameters_schema()
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let mut params: BashInput = serde_json::from_value(input)?;
         let run_in_background = params.run_in_background.unwrap_or(false);
+
+        // Destructive-command gate (#604), before background dispatch.
+        if let Some(refusal) = destructive_command_refusal(
+            &params.command,
+            params.justification.as_deref(),
+            ctx.working_dir.clone(),
+        ) {
+            return Err(anyhow::anyhow!(refusal));
+        }
 
         if run_in_background {
             return self.execute_background(params, ctx).await;
@@ -1029,6 +1130,8 @@ impl BashTool {
                     let mut child = cmd
                         .spawn()
                         .map_err(|e| anyhow::anyhow!("Failed to spawn command: {}", e))?;
+                    #[cfg(unix)]
+                    let mut process_group_guard = ProcessGroupKillGuard::new(child.id());
 
                     // Stream output to file
                     let mut file = tokio::fs::File::create(&output_path)
@@ -1102,6 +1205,8 @@ impl BashTool {
 
                     if timed_out {
                         let _ = child.wait().await;
+                        #[cfg(unix)]
+                        process_group_guard.disarm();
                         let msg = timeout_message(timeout_ms.unwrap_or_default());
                         let timeout_line = format!("\n--- {} ---\n", msg);
                         file.write_all(timeout_line.as_bytes()).await.ok();
@@ -1109,6 +1214,8 @@ impl BashTool {
                     }
 
                     let status = child.wait().await?;
+                    #[cfg(unix)]
+                    process_group_guard.disarm();
                     let exit_code = status.code();
 
                     // Write final status line

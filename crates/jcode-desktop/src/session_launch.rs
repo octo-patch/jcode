@@ -9,9 +9,7 @@ use std::time::Duration;
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DESKTOP_SESSION_WORKER_LIMIT: usize = 12;
-
 static DESKTOP_SESSION_WORKER_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 struct DesktopSessionWorkerPermit<'a> {
     counter: &'a AtomicUsize,
 }
@@ -64,9 +62,11 @@ fn spawn_bounded_desktop_session_worker(
 }
 
 mod events;
+#[cfg(unix)]
 mod server_io;
 mod terminal;
 
+#[cfg(unix)]
 use server_io::{
     DrainOutcome, connect_server_with_retry, connect_server_with_retry_path, drain_session_events,
     ensure_server_running, establish_session_id, read_control_response, read_model_catalog,
@@ -247,6 +247,15 @@ pub enum DesktopSessionEvent {
     },
     TextDelta(String),
     TextReplace(String),
+    /// Streaming reasoning/thinking delta. Rendered live so the user sees work
+    /// in progress instead of a silent gap before the final response.
+    ReasoningDelta(String),
+    /// Reasoning finished for the current step, with wall-clock duration when
+    /// known. Stored in milliseconds so the event stays `Eq`/hashable like the
+    /// rest of the desktop event stream.
+    ReasoningDone {
+        duration_ms: Option<u64>,
+    },
     ToolStarted {
         id: Option<String>,
         name: String,
@@ -364,6 +373,20 @@ pub fn launch_resume_session(session_id: &str, title: &str) -> Result<()> {
 pub fn launch_new_session() -> Result<()> {
     let candidates = terminal_candidates("jcode · new session", &["--fresh-spawn"]);
     launch_first_available_terminal(candidates, "jcode")
+}
+
+pub fn launch_selfdev_session() -> Result<()> {
+    let candidates = terminal_candidates("jcode · self-dev", &["self-dev"]);
+    launch_first_available_terminal(candidates, "jcode self-dev")
+}
+
+pub fn launch_home_session() -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let candidates =
+        terminal::terminal_candidates_in_dir("jcode · home", &["--fresh-spawn"], home.as_path());
+    launch_first_available_terminal(candidates, "jcode in home directory")
 }
 
 pub fn send_message_to_session(session_id: &str, _title: &str, message: &str) -> Result<()> {
@@ -1175,6 +1198,8 @@ fn desktop_session_event_kind(event: &DesktopSessionEvent) -> &'static str {
         DesktopSessionEvent::SessionRenamed { .. } => "session_renamed",
         DesktopSessionEvent::TextDelta(_) => "text_delta",
         DesktopSessionEvent::TextReplace(_) => "text_replace",
+        DesktopSessionEvent::ReasoningDelta(_) => "reasoning_delta",
+        DesktopSessionEvent::ReasoningDone { .. } => "reasoning_done",
         DesktopSessionEvent::ToolStarted { .. } => "tool_started",
         DesktopSessionEvent::ToolExecuting { .. } => "tool_executing",
         DesktopSessionEvent::ToolInput { .. } => "tool_input",

@@ -78,6 +78,11 @@ pub(crate) fn handle_auth_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if trimmed == "/subscribe" {
+        app.show_subscribe_pitch();
+        return true;
+    }
+
     if let Some(parsed) = parse_account_command(trimmed) {
         match parsed {
             Ok(command) => execute_account_command_local(app, command),
@@ -202,6 +207,9 @@ fn parse_account_command(trimmed: &str) -> Option<Result<AccountCommand, String>
             "login" => AccountCommand::Login {
                 provider_id: provider.id.to_string(),
             },
+            "status" if provider.id == "jcode" => AccountCommand::JcodeStatus,
+            "manage" if provider.id == "jcode" => AccountCommand::JcodeManage,
+            "logout" if provider.id == "jcode" => AccountCommand::JcodeLogout,
             "add" => AccountCommand::Add {
                 provider_id: provider.id.to_string(),
                 label: (!value.is_empty()).then(|| value.to_string()),
@@ -241,7 +249,7 @@ fn parse_account_command(trimmed: &str) -> Option<Result<AccountCommand, String>
             "effort" if provider.id == "openai" => {
                 if value.is_empty() {
                     return Some(Err(
-                        "Usage: /account openai effort <none|low|medium|high|xhigh|clear>"
+                        "Usage: /account openai effort <none|minimal|low|medium|high|xhigh|max|clear>"
                             .to_string(),
                     ));
                 }
@@ -317,7 +325,47 @@ fn parse_account_command(trimmed: &str) -> Option<Result<AccountCommand, String>
     }))
 }
 
-fn execute_account_command_local(app: &mut App, command: AccountCommand) {
+/// Translate typed account-picker commands directly into [`AccountCommand`]s.
+///
+/// This is the typed bridge for picker actions: it avoids rendering the
+/// action into a `/account ...` string and re-parsing it through the slash
+/// command grammar (which broke for labels containing spaces and coupled
+/// picker behavior to the CLI grammar). `SubmitInput` items still carry
+/// free-form command strings and are not handled here.
+pub(crate) fn account_command_from_picker(
+    command: &crate::tui::account_picker::AccountPickerCommand,
+) -> Option<AccountCommand> {
+    use crate::tui::account_picker::{AccountPickerCommand, AccountProviderKind};
+
+    fn provider_id(provider: &AccountProviderKind) -> String {
+        match provider {
+            AccountProviderKind::Anthropic => "claude".to_string(),
+            AccountProviderKind::OpenAi => "openai".to_string(),
+        }
+    }
+
+    match command {
+        AccountPickerCommand::Switch { provider, label } => Some(AccountCommand::Switch {
+            provider_id: provider_id(provider),
+            label: label.clone(),
+        }),
+        AccountPickerCommand::Login { provider, label } => Some(AccountCommand::Add {
+            provider_id: provider_id(provider),
+            label: Some(label.clone()),
+        }),
+        AccountPickerCommand::Remove { provider, label } => Some(AccountCommand::Remove {
+            provider_id: provider_id(provider),
+            label: label.clone(),
+        }),
+        AccountPickerCommand::SubmitInput(_)
+        | AccountPickerCommand::OpenAccountCenter { .. }
+        | AccountPickerCommand::OpenAddReplaceFlow { .. }
+        | AccountPickerCommand::PromptValue { .. }
+        | AccountPickerCommand::PromptNew { .. } => None,
+    }
+}
+
+pub(crate) fn execute_account_command_local(app: &mut App, command: AccountCommand) {
     match command {
         AccountCommand::OpenOverlay { provider_filter } => {
             if app.should_open_inline_account_picker(provider_filter.as_deref()) {
@@ -341,6 +389,9 @@ fn execute_account_command_local(app: &mut App, command: AccountCommand) {
                 ))),
             }
         }
+        AccountCommand::JcodeStatus => app.show_jcode_subscription_status(),
+        AccountCommand::JcodeManage => app.open_jcode_account_management(),
+        AccountCommand::JcodeLogout => app.start_jcode_account_logout(),
         AccountCommand::Add { provider_id, label } => {
             execute_account_add_local(app, &provider_id, label.as_deref())
         }
@@ -390,7 +441,7 @@ fn execute_account_command_local(app: &mut App, command: AccountCommand) {
     }
 }
 
-async fn execute_account_command_remote(
+pub(crate) async fn execute_account_command_remote(
     app: &mut App,
     command: AccountCommand,
     remote: &mut crate::tui::backend::RemoteConnection,
@@ -591,9 +642,16 @@ fn save_default_provider_setting(app: &mut App, provider: Option<&str>) {
         None => None,
         Some("auto") => None,
         Some("claude" | "openai" | "copilot" | "gemini" | "openrouter") => normalized,
+        // Accept the dual-auth credential spellings too (`anthropic-api`,
+        // `claude-api`, `openai-api`, `claude-oauth`, ...). These are the same
+        // values the model picker's "set default" path writes, and startup now
+        // honors them as a routing + OAuth-vs-API decision. Rejecting them here
+        // was itself an inconsistency: the picker could save a default the
+        // `/account` command refused to set.
+        Some(other) if jcode_provider_core::AuthRoute::parse(other).is_some() => normalized,
         Some(other) => {
             app.push_display_message(DisplayMessage::error(format!(
-                "Unsupported default provider {}. Use claude, openai, copilot, gemini, openrouter, or auto.",
+                "Unsupported default provider {}. Use claude, openai, anthropic-api, openai-api, copilot, gemini, openrouter, or auto.",
                 other
             )));
             return;
@@ -658,10 +716,14 @@ fn save_openai_transport_setting_local(app: &mut App, value: Option<&str>) {
 
 fn save_openai_effort_setting_local(app: &mut App, value: Option<&str>) {
     if let Some(value) = value
-        && !matches!(value, "none" | "low" | "medium" | "high" | "xhigh")
+        && !matches!(
+            value,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        )
     {
         app.push_display_message(DisplayMessage::error(
-            "OpenAI effort must be one of none, low, medium, high, or xhigh.".to_string(),
+            "OpenAI effort must be one of none, minimal, low, medium, high, xhigh, or max."
+                .to_string(),
         ));
         return;
     }
@@ -685,12 +747,14 @@ fn save_openai_effort_setting_local(app: &mut App, value: Option<&str>) {
 }
 
 pub(crate) fn save_openai_fast_setting_local(app: &mut App, enabled: bool) {
-    let value = if enabled { Some("priority") } else { None };
-    match crate::config::Config::set_openai_service_tier(value) {
+    // Persist an explicit "off" instead of clearing the key. `None` serializes
+    // by removing `openai_service_tier` from config.toml entirely, which made
+    // "/fast default off" look like it never saved anything (issue #506). The
+    // OpenAI runtime already treats "off" as disabling the tier.
+    let value = if enabled { "priority" } else { "off" };
+    match crate::config::Config::set_openai_service_tier(Some(value)) {
         Ok(()) => {
-            let _ = app
-                .provider
-                .set_service_tier(if enabled { "priority" } else { "off" });
+            let _ = app.provider.set_service_tier(value);
             let label = if enabled { "on" } else { "off" };
             app.set_status_notice(format!("Fast mode: {}", label));
             app.push_display_message(DisplayMessage::system(format!(
@@ -925,7 +989,10 @@ fn render_provider_settings_markdown(app: &App, provider_id: &str) -> String {
                 }
             ));
             lines.push("  - /account openai transport <auto|https|websocket>".to_string());
-            lines.push("  - /account openai effort <none|low|medium|high|xhigh|clear>".to_string());
+            lines.push(
+                "  - /account openai effort <none|minimal|low|medium|high|xhigh|max|clear>"
+                    .to_string(),
+            );
             lines.push("  - /account openai fast <on|off>".to_string());
         }
         "copilot" => {
@@ -1097,6 +1164,26 @@ mod tests {
         assert!(matches!(
             parse_account_command("/account openai doctor"),
             Some(Ok(AccountCommand::Doctor { provider_id: Some(provider_id) })) if provider_id == "openai"
+        ));
+    }
+
+    #[test]
+    fn parse_native_jcode_account_actions() {
+        assert!(matches!(
+            parse_account_command("/account jcode login"),
+            Some(Ok(AccountCommand::Login { provider_id })) if provider_id == "jcode"
+        ));
+        assert!(matches!(
+            parse_account_command("/account jcode status"),
+            Some(Ok(AccountCommand::JcodeStatus))
+        ));
+        assert!(matches!(
+            parse_account_command("/account jcode manage"),
+            Some(Ok(AccountCommand::JcodeManage))
+        ));
+        assert!(matches!(
+            parse_account_command("/account jcode logout"),
+            Some(Ok(AccountCommand::JcodeLogout))
         ));
     }
 

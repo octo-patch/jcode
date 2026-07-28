@@ -10,7 +10,7 @@ pub(super) fn render_model_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
 
     let mut lines: Vec<Line> = Vec::new();
 
-    let short_name = shorten_model_name(model);
+    let short_name = crate::tui::session_facts::pretty_model(model);
     let max_len = inner.width.saturating_sub(2) as usize;
 
     let mut spans = vec![
@@ -59,13 +59,25 @@ pub(super) fn render_model_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
         .filter(|s| !s.is_empty())
     {
         let display = home_relative_dir(dir);
-        lines.push(Line::from(vec![
+        let mut dir_spans = vec![
             Span::styled(" ", Style::default().fg(rgb(140, 180, 255))),
             Span::styled(
                 truncate_smart(&display, max_len.saturating_sub(2)),
                 Style::default().fg(rgb(140, 140, 150)),
             ),
-        ]));
+        ];
+        if let Some(branch) = data
+            .git_info
+            .as_ref()
+            .map(|g| g.branch.trim())
+            .filter(|b| !b.is_empty())
+        {
+            dir_spans.push(Span::styled(
+                format!("  {}", truncate_chars(branch, 24)),
+                Style::default().fg(rgb(150, 170, 140)),
+            ));
+        }
+        lines.push(Line::from(dir_spans));
     }
 
     if let Some(provider) = data
@@ -161,7 +173,7 @@ pub(super) fn render_model_info(data: &InfoWidgetData, inner: Rect) -> Vec<Line<
         return Vec::new();
     };
 
-    let short_name = shorten_model_name(model);
+    let short_name = crate::tui::session_facts::pretty_model(model);
     let max_len = inner.width.saturating_sub(2) as usize;
 
     let mut spans = vec![Span::styled(
@@ -269,7 +281,8 @@ pub(super) fn render_model_info(data: &InfoWidgetData, inner: Rect) -> Vec<Line<
     lines
 }
 
-pub(super) fn shorten_model_name(model: &str) -> String {
+#[allow(dead_code)] // Retained for status-bar model rendering; currently unused after a layout change.
+pub(crate) fn shorten_model_name(model: &str) -> String {
     if model.contains("claude") {
         if model.contains("opus-4-5") || model.contains("opus-4.5") {
             return "opus-4.5".to_string();
@@ -336,11 +349,14 @@ fn short_reasoning_effort(effort: &str) -> Option<&str> {
         return None;
     }
     Some(match effort {
+        "max" => "max",
         "xhigh" => "xhi",
         "high" => "hi",
         "medium" => "med",
         "low" => "lo",
         "none" => "∅",
+        "swarm" => "swarm",
+        "swarm-deep" => "swarm+",
         other => other,
     })
 }
@@ -359,17 +375,7 @@ fn short_service_tier(service_tier: &str) -> Option<&str> {
 
 /// Render a directory path home-relative (e.g. `/home/me/x` -> `~/x`).
 fn home_relative_dir(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return "/".to_string();
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy();
-        if !home.is_empty() && (trimmed == home || trimmed.starts_with(&format!("{home}/"))) {
-            return format!("~{}", &trimmed[home.len()..]);
-        }
-    }
-    trimmed.to_string()
+    crate::tui::session_facts::dir_label(path)
 }
 
 #[cfg(test)]
@@ -380,6 +386,8 @@ mod tests {
     fn data() -> InfoWidgetData {
         InfoWidgetData {
             todos: Vec::new(),
+            todo_goals: Vec::new(),
+            todos_are_swarm_plan: false,
             context_info: None,
             context_info_stale: false,
             queue_mode: None,

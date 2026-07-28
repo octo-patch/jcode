@@ -86,6 +86,19 @@ fn test_disconnected_ctrl_enter_queues_for_reconnect() {
 }
 
 #[test]
+fn test_disconnected_cmd_enter_queues_for_reconnect() {
+    let mut app = create_test_app();
+
+    remote::handle_disconnected_key(&mut app, KeyCode::Char('h'), KeyModifiers::empty()).unwrap();
+    remote::handle_disconnected_key(&mut app, KeyCode::Char('i'), KeyModifiers::empty()).unwrap();
+    remote::handle_disconnected_key(&mut app, KeyCode::Enter, KeyModifiers::SUPER).unwrap();
+
+    assert!(app.input.is_empty());
+    assert_eq!(app.queued_messages().len(), 1);
+    assert_eq!(app.queued_messages()[0], "hi");
+}
+
+#[test]
 fn test_disconnected_key_handler_restart_runs_locally() {
     let mut app = create_test_app();
     app.input = "/restart".to_string();
@@ -121,6 +134,9 @@ fn test_disconnected_key_handler_runs_effort_locally() {
 fn test_disconnected_key_handler_runs_model_picker_locally() {
     let mut app = create_test_app();
     configure_test_remote_models(&mut app);
+    // OpenAI models are effort-expanded into one entry per reasoning effort,
+    // and the "current" entry only matches when the session's effort matches.
+    app.remote_reasoning_effort = Some("high".to_string());
     app.input = "/model".to_string();
     app.cursor_pos = app.input.len();
 
@@ -133,7 +149,9 @@ fn test_disconnected_key_handler_runs_model_picker_locally() {
         .as_ref()
         .expect("model picker should open");
     assert!(!picker.entries.is_empty());
-    assert_eq!(picker.entries[picker.selected].name, "gpt-5.3-codex");
+    let selected = &picker.entries[picker.selected];
+    assert_eq!(selected.name, "gpt-5.3-codex (high)");
+    assert!(selected.is_current, "current model should be preselected");
 }
 
 #[test]
@@ -309,3 +327,24 @@ fn test_remote_ctrl_enter_queues_while_processing() {
     assert_eq!(app.queued_messages().len(), 1);
     assert_eq!(app.queued_messages()[0], "hi");
 }
+
+#[test]
+fn test_remote_cmd_enter_queues_while_processing() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    app.is_processing = true;
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    rt.block_on(app.handle_remote_key(KeyCode::Char('h'), KeyModifiers::empty(), &mut remote))
+        .unwrap();
+    rt.block_on(app.handle_remote_key(KeyCode::Char('i'), KeyModifiers::empty(), &mut remote))
+        .unwrap();
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::SUPER, &mut remote))
+        .unwrap();
+
+    assert!(app.input().is_empty());
+    assert_eq!(app.queued_messages().len(), 1);
+    assert_eq!(app.queued_messages()[0], "hi");
+}
+

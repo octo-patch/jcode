@@ -1,9 +1,34 @@
 use super::*;
 
+/// Total per-request timeout for model catalog fetches. The shared HTTP
+/// client only sets a connect timeout, so without this a hung catalog request
+/// keeps the scope's refresh marked in-flight and the picker stays stale.
+const CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// HTTP status carried inside model catalog fetch errors so callers can
+/// distinguish auth rejections (401/403) from transient failures and recover
+/// by force-refreshing OAuth tokens, mirroring the chat request path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCatalogHttpStatus(pub u16);
+
+impl std::fmt::Display for ModelCatalogHttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP status {}", self.0)
+    }
+}
+
+impl std::error::Error for ModelCatalogHttpStatus {}
+
+fn catalog_status_error(status: reqwest::StatusCode, context: String) -> anyhow::Error {
+    anyhow::Error::new(ModelCatalogHttpStatus(status.as_u16())).context(context)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OpenAIModelCatalog {
     pub available_models: Vec<String>,
     pub context_limits: HashMap<String, usize>,
+    /// Ordered reasoning-effort values advertised by each Codex model.
+    pub reasoning_efforts: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -64,6 +89,7 @@ pub(crate) fn parse_openai_model_catalog(data: &serde_json::Value) -> OpenAIMode
 
     let mut available: HashSet<String> = HashSet::new();
     let mut limits: HashMap<String, usize> = HashMap::new();
+    let mut reasoning_efforts: HashMap<String, Vec<String>> = HashMap::new();
 
     for model in models.into_iter().flatten() {
         let Some(slug) = model
@@ -87,7 +113,34 @@ pub(crate) fn parse_openai_model_catalog(data: &serde_json::Value) -> OpenAIMode
             .or_else(|| model.get("context_length"))
             .and_then(|c| c.as_u64())
         {
-            limits.insert(slug, ctx as usize);
+            limits.insert(slug.clone(), ctx as usize);
+        }
+
+        if let Some(values) = model
+            .get("supported_reasoning_levels")
+            .or_else(|| model.get("supported_reasoning_efforts"))
+            .and_then(|value| value.as_array())
+        {
+            let mut efforts = Vec::new();
+            for value in values {
+                let raw = value.as_str().or_else(|| {
+                    value
+                        .get("reasoning_effort")
+                        .or_else(|| value.get("effort"))
+                        .or_else(|| value.get("value"))
+                        .and_then(|value| value.as_str())
+                });
+                let Some(effort) = raw.and_then(jcode_provider_core::canonical_reasoning_effort)
+                else {
+                    continue;
+                };
+                if !efforts.iter().any(|existing| existing == effort) {
+                    efforts.push(effort.to_string());
+                }
+            }
+            if !efforts.is_empty() {
+                reasoning_efforts.insert(slug, efforts);
+            }
         }
     }
 
@@ -97,6 +150,7 @@ pub(crate) fn parse_openai_model_catalog(data: &serde_json::Value) -> OpenAIMode
     OpenAIModelCatalog {
         available_models,
         context_limits: limits,
+        reasoning_efforts,
     }
 }
 
@@ -108,11 +162,15 @@ pub async fn fetch_openai_model_catalog(access_token: &str) -> Result<OpenAIMode
     let resp = client
         .get("https://chatgpt.com/backend-api/codex/models?client_version=1.0.0")
         .header("Authorization", format!("Bearer {}", access_token))
+        .timeout(CATALOG_REQUEST_TIMEOUT)
         .send()
         .await?;
 
     if !resp.status().is_success() {
-        anyhow::bail!("Failed to fetch model context limits: {}", resp.status());
+        return Err(catalog_status_error(
+            resp.status(),
+            format!("Failed to fetch model context limits: {}", resp.status()),
+        ));
     }
 
     let data: serde_json::Value = resp.json().await?;
@@ -178,7 +236,10 @@ where
     let mut after_id: Option<String> = None;
 
     loop {
-        let resp = build_request(&client, after_id.as_deref()).send().await?;
+        let resp = build_request(&client, after_id.as_deref())
+            .timeout(CATALOG_REQUEST_TIMEOUT)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch Anthropic model catalog: {}", resp.status());
         }
@@ -226,17 +287,28 @@ pub async fn fetch_openai_api_key_model_catalog(api_key: &str) -> Result<OpenAIM
     note_openai_model_catalog_refresh_attempt();
 
     let client = shared_http_client();
+    // Honor the same API-base override as the Responses request path so a
+    // custom/proxied endpoint is probed for models instead of the real
+    // api.openai.com (issue #343).
+    let models_url = format!(
+        "{}/models",
+        crate::provider::openai::resolve_api_base().trim_end_matches('/')
+    );
     let resp = client
-        .get("https://api.openai.com/v1/models")
+        .get(&models_url)
         .header("Authorization", format!("Bearer {}", api_key))
+        .timeout(CATALOG_REQUEST_TIMEOUT)
         .send()
         .await?;
 
     if !resp.status().is_success() {
-        anyhow::bail!(
-            "Failed to fetch OpenAI platform model catalog: {}",
-            resp.status()
-        );
+        return Err(catalog_status_error(
+            resp.status(),
+            format!(
+                "Failed to fetch OpenAI platform model catalog: {}",
+                resp.status()
+            ),
+        ));
     }
 
     let data: serde_json::Value = resp.json().await?;
@@ -257,7 +329,50 @@ pub async fn fetch_openai_api_key_model_catalog(api_key: &str) -> Result<OpenAIM
     Ok(OpenAIModelCatalog {
         available_models,
         context_limits: HashMap::new(),
+        reasoning_efforts: HashMap::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_catalog_parses_string_and_object_reasoning_efforts() {
+        let catalog = parse_openai_model_catalog(&serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6",
+                    "supported_reasoning_levels": [
+                        { "reasoning_effort": "minimal" },
+                        { "reasoning_effort": "high" },
+                        { "reasoning_effort": "max" }
+                    ]
+                },
+                {
+                    "slug": "gpt-5.4",
+                    "supported_reasoning_efforts": ["none", "low", "xhigh"]
+                }
+            ]
+        }));
+
+        assert_eq!(
+            catalog.reasoning_efforts.get("gpt-5.6"),
+            Some(&vec![
+                "minimal".to_string(),
+                "high".to_string(),
+                "max".to_string()
+            ])
+        );
+        assert_eq!(
+            catalog.reasoning_efforts.get("gpt-5.4"),
+            Some(&vec![
+                "none".to_string(),
+                "low".to_string(),
+                "xhigh".to_string()
+            ])
+        );
+    }
 }
 
 /// Fetch context window sizes from the Codex backend API.
@@ -266,4 +381,26 @@ pub async fn fetch_openai_context_limits(access_token: &str) -> Result<HashMap<S
     Ok(fetch_openai_model_catalog(access_token)
         .await?
         .context_limits)
+}
+
+#[cfg(test)]
+mod status_error_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_status_error_round_trips_through_anyhow_downcast() {
+        let err = catalog_status_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Failed to fetch model context limits: 401 Unauthorized".to_string(),
+        );
+        let status = err
+            .downcast_ref::<ModelCatalogHttpStatus>()
+            .expect("status must survive the context wrapper");
+        assert_eq!(status.0, 401);
+        // The human-readable context must stay the outermost message.
+        assert!(
+            err.to_string()
+                .contains("Failed to fetch model context limits")
+        );
+    }
 }

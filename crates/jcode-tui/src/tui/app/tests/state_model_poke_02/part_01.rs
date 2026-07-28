@@ -208,25 +208,41 @@ fn test_mouse_scroll_events_are_classified_as_scroll_only() {
 
 #[test]
 fn test_handterm_native_scroll_command_updates_chat_offset() {
-    let mut app = create_test_app();
-    let (_scroll_app, mut terminal) = create_scroll_test_app(50, 12, 0, 24);
+    // Use an app with real scrollable content and draw it, so the renderer
+    // records a non-zero max scroll. Since the phantom-offset fix,
+    // scroll_down treats a rendered max of 0 (e.g. an undrawn or empty
+    // transcript) as "already at the bottom" and snaps back to follow mode.
+    let (mut app, mut terminal) = create_scroll_test_app(50, 12, 0, 24);
+    app.auto_scroll_paused = true;
+    app.scroll_offset = 6;
     terminal
         .draw(|f| crate::tui::ui::draw(f, &app))
         .expect("draw failed");
     crate::tui::ui::record_layout_snapshot(Rect::new(0, 0, 50, 12), None, None, None);
+    assert!(
+        crate::tui::ui::last_max_scroll() > 7,
+        "scroll test content should exceed the viewport"
+    );
 
-    app.auto_scroll_paused = true;
-    app.scroll_offset = 6;
     app.apply_handterm_native_scroll(super::handterm_native_scroll::HostToApp::Scroll {
         pane: super::handterm_native_scroll::PaneKind::Chat,
         delta: -2,
     });
+    assert_eq!(app.scroll_offset, 5, "the first row should render immediately");
+    assert_eq!(app.mouse_scroll_queue, -1, "the second row should remain queued");
+    app.progress_mouse_scroll_animation();
     assert_eq!(app.scroll_offset, 4);
 
     app.apply_handterm_native_scroll(super::handterm_native_scroll::HostToApp::Scroll {
         pane: super::handterm_native_scroll::PaneKind::Chat,
         delta: 3,
     });
+    assert_eq!(app.scroll_offset, 5, "the first row should render immediately");
+    assert_eq!(app.mouse_scroll_queue, 2, "later rows should animate on ticks");
+    app.progress_mouse_scroll_animation();
+    assert_eq!(app.scroll_offset, 6, "the queued rows should be revealed separately");
+    assert_eq!(app.mouse_scroll_queue, 1);
+    app.progress_mouse_scroll_animation();
     assert_eq!(app.scroll_offset, 7);
 }
 
@@ -237,6 +253,7 @@ fn test_handterm_native_scroll_client_roundtrips_over_socket() {
     use std::os::unix::net::UnixListener;
 
     let _lock = crate::storage::lock_test_env();
+    let _render_lock = scroll_render_test_lock();
     let dir = tempfile::tempdir().expect("tempdir");
     let socket_path = dir.path().join("handterm-scroll.sock");
     let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
@@ -279,6 +296,9 @@ fn test_handterm_native_scroll_client_roundtrips_over_socket() {
         .expect("scroll command should arrive");
 
     app.apply_handterm_native_scroll(command);
+    assert_eq!(app.scroll_offset, 5);
+    assert_eq!(app.mouse_scroll_queue, -1);
+    app.progress_mouse_scroll_animation();
     assert_eq!(app.scroll_offset, 4);
 
     unsafe {
@@ -608,6 +628,19 @@ fn command_cell_fg(
     terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
     command: &str,
 ) -> Option<ratatui::style::Color> {
+    command_cell_at(terminal, command, 0).map(|cell| cell.fg)
+}
+
+/// Find the rendered suggestion row for `command` in the terminal buffer and
+/// return the cell at `offset` characters into the command (0 is the leading
+/// '/'). Suggestion rows render as `{command}  {description}`, which
+/// distinguishes them from the echoed input line that can also contain the
+/// typed command text.
+fn command_cell_at(
+    terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    command: &str,
+    offset: u16,
+) -> Option<ratatui::buffer::Cell> {
     let buf = terminal.backend().buffer();
     for y in 0..buf.area.height {
         let mut line = String::new();
@@ -615,10 +648,59 @@ fn command_cell_fg(
             line.push_str(buf[(x, y)].symbol());
         }
         if let Some(x) = line.find(command) {
-            return Some(buf[(x as u16, y)].fg);
+            let after = &line[x + command.len()..];
+            let is_suggestion_row = after
+                .strip_prefix("  ")
+                .is_some_and(|desc| desc.starts_with(|c: char| !c.is_whitespace()));
+            if is_suggestion_row {
+                return Some(buf[(x as u16 + offset, y)].clone());
+            }
         }
     }
     None
+}
+
+/// Expected fg for characters of a suggestion command that the fuzzy matcher
+/// did NOT align with the typed query (dimmed toward black).
+fn unmatched_command_fg(base: ratatui::style::Color) -> ratatui::style::Color {
+    crate::tui::ui::input_ui::dim_command_color(Some(base))
+}
+
+/// Expected fg for characters of a suggestion command that the fuzzy matcher
+/// aligned with the typed query (brightened toward white, rendered bold).
+fn matched_command_fg(base: ratatui::style::Color) -> ratatui::style::Color {
+    crate::tui::ui::input_ui::brighten_command_color(Some(base))
+}
+
+/// Assert the fuzzy-match recoloring of one rendered suggestion command:
+/// the leading '/' is never part of the highlight, so it must be dimmed,
+/// while the first command character (matched by the query) must be the
+/// brightened base color and bold.
+#[track_caller]
+fn assert_command_match_recolored(
+    terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    command: &str,
+    base: ratatui::style::Color,
+) {
+    let slash = command_cell_at(terminal, command, 0).expect("command not rendered");
+    assert_eq!(
+        slash.fg,
+        unmatched_command_fg(base),
+        "leading '/' of {command} should be dimmed base color"
+    );
+    let matched = command_cell_at(terminal, command, 1).expect("command not rendered");
+    assert_eq!(
+        matched.fg,
+        matched_command_fg(base),
+        "matched char of {command} should be brightened base color"
+    );
+    assert!(
+        matched
+            .style()
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "matched char of {command} should be bold"
+    );
 }
 
 #[test]
@@ -632,29 +714,20 @@ fn test_command_suggestion_render_highlights_selected_row_by_color() {
     let first = suggestions[0].0.clone();
     let second = suggestions[1].0.clone();
 
+    let selected_base = crate::tui::color_support::rgb(255, 213, 128);
+    let unselected_base = crate::tui::color_support::rgb(128, 203, 196);
+
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
         .expect("failed to create test terminal");
     render_and_snap(&app, &mut terminal);
-    assert_eq!(
-        command_cell_fg(&terminal, &first),
-        Some(crate::tui::color_support::rgb(255, 213, 128))
-    );
-    assert_eq!(
-        command_cell_fg(&terminal, &second),
-        Some(crate::tui::color_support::rgb(128, 203, 196))
-    );
+    assert_command_match_recolored(&terminal, &first, selected_base);
+    assert_command_match_recolored(&terminal, &second, unselected_base);
 
     app.handle_key(KeyCode::Down, KeyModifiers::empty())
         .unwrap();
     render_and_snap(&app, &mut terminal);
-    assert_eq!(
-        command_cell_fg(&terminal, &first),
-        Some(crate::tui::color_support::rgb(128, 203, 196))
-    );
-    assert_eq!(
-        command_cell_fg(&terminal, &second),
-        Some(crate::tui::color_support::rgb(255, 213, 128))
-    );
+    assert_command_match_recolored(&terminal, &first, unselected_base);
+    assert_command_match_recolored(&terminal, &second, selected_base);
 }
 
 #[test]
@@ -670,9 +743,12 @@ fn test_single_command_suggestion_uses_selected_color_only() {
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
         .expect("failed to create test terminal");
     render_and_snap(&app, &mut terminal);
-    assert_eq!(
-        command_cell_fg(&terminal, &command),
-        Some(crate::tui::color_support::rgb(255, 213, 128))
+    // A single suggestion still uses the selected-row base color; the fuzzy
+    // match recoloring dims the '/' and brightens matched characters of it.
+    assert_command_match_recolored(
+        &terminal,
+        &command,
+        crate::tui::color_support::rgb(255, 213, 128),
     );
 }
 
@@ -749,6 +825,7 @@ fn test_registered_command_suggestions_include_aliases_and_hide_secret_commands(
     let suggestions = app.get_suggestions_for("/");
     let commands: Vec<&str> = suggestions.iter().map(|(cmd, _)| cmd.as_str()).collect();
 
+    assert_eq!(commands.iter().filter(|cmd| **cmd == "/cancel").count(), 1);
     assert!(commands.contains(&"/models"));
     assert!(commands.contains(&"/sessions"));
     assert!(commands.contains(&"/dictation"));
@@ -757,6 +834,16 @@ fn test_registered_command_suggestions_include_aliases_and_hide_secret_commands(
     assert!(!commands.contains(&"/z"));
     assert!(!commands.contains(&"/zz"));
     assert!(!commands.contains(&"/zzz"));
+}
+
+#[test]
+fn test_cancel_command_is_available_for_prefix_autocomplete() {
+    let app = create_test_app();
+    let suggestions = app.get_suggestions_for("/can");
+
+    assert!(suggestions.iter().any(|(cmd, help)| {
+        cmd == "/cancel" && *help == "Cancel the current prompt or operation"
+    }));
 }
 
 #[test]
@@ -782,7 +869,25 @@ fn test_top_level_command_suggestions_include_config_and_subscription() {
 
 #[test]
 fn test_top_level_command_suggestions_include_project_local_skills() {
-    let app = create_test_app();
+    let mut app = create_test_app();
+
+    // Hermetic project-local skill: the suggestion list must surface skills
+    // found under <working_dir>/.jcode/skills, independent of the skills
+    // installed on the machine running the tests.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp
+        .path()
+        .join(".jcode")
+        .join("skills")
+        .join("optimization");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: optimization\ndescription: Project-local test skill\n---\n# Optimization\n",
+    )
+    .expect("write SKILL.md");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+    app.refresh_skills_snapshot();
 
     let suggestions = app.get_suggestions_for("/optim");
 
@@ -910,6 +1015,7 @@ fn test_context_command_reports_session_context_snapshot() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "one".to_string(),
                 content: "Inspect context summary".to_string(),
                 status: "pending".to_string(),
@@ -918,6 +1024,7 @@ fn test_context_command_reports_session_context_snapshot() {
                 assigned_to: None,
                 confidence: Some(77),
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1166,6 +1273,17 @@ fn test_agents_command_opens_agent_picker() {
         entry.action,
         crate::tui::PickerAction::AgentTarget(crate::tui::AgentModelTarget::Swarm)
     )));
+    let swarm_entry = picker
+        .entries
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry.action,
+                crate::tui::PickerAction::AgentTarget(crate::tui::AgentModelTarget::Swarm)
+            )
+        })
+        .expect("swarm entry");
+    assert!(swarm_entry.options[0].detail.contains("/swarm-prompt"));
 }
 
 #[test]
@@ -1173,6 +1291,24 @@ fn test_agents_command_suggestions_include_targets() {
     let app = create_test_app();
     let suggestions = app.get_suggestions_for("/agents re");
     assert!(suggestions.iter().any(|(cmd, _)| cmd == "/agents review"));
+}
+
+#[test]
+fn test_swarm_prompt_command_is_discoverable_in_suggestions_and_help() {
+    let app = create_test_app();
+    let suggestions = app.get_suggestions_for("/swarm-pro");
+    assert!(
+        suggestions
+            .iter()
+            .any(|(command, _)| command == "/swarm-prompt")
+    );
+
+    let help = app
+        .command_help("swarm-prompt")
+        .expect("/swarm-prompt should have detailed help");
+    assert!(help.contains("/swarm-prompt"));
+    assert!(help.contains(".jcode/swarm-prompt.md"));
+    assert!(help.contains("Restart or reload Jcode"));
 }
 
 #[test]

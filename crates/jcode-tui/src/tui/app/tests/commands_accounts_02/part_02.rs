@@ -36,7 +36,7 @@ fn test_refactor_command_starts_refactor_loop() {
         &msg.content[0],
         ContentBlock::Text { text, .. }
             if text.contains("You are entering refactor mode for this repository")
-                && text.contains("use the `subagent` tool exactly once")
+                && text.contains("use the `swarm` tool with `action=spawn` exactly once")
     ));
 
     let display = app
@@ -47,7 +47,7 @@ fn test_refactor_command_starts_refactor_loop() {
 }
 
 #[test]
-fn test_plan_command_is_plan_only_and_writes_to_side_panel() {
+fn test_plan_command_is_plan_only_and_presents_plan_card() {
     let mut app = create_test_app();
     app.input = "/plan add a compact message mode".to_string();
     app.submit_input();
@@ -62,7 +62,7 @@ fn test_plan_command_is_plan_only_and_writes_to_side_panel() {
         ContentBlock::Text { text, .. }
             if text.contains("You are entering planning mode")
                 && text.contains("Do NOT implement anything yet")
-                && text.contains("`side_panel`")
+                && text.contains("```plan")
                 && text.contains("`todo`")
                 && text.contains("Goal: add a compact message mode")
     ));
@@ -127,6 +127,7 @@ fn test_refactor_status_summarizes_current_todos() {
             &app.session.id,
             &[
                 crate::todo::TodoItem {
+                    group: None,
                     id: "one".to_string(),
                     content: "Split giant module".to_string(),
                     status: "in_progress".to_string(),
@@ -135,8 +136,10 @@ fn test_refactor_status_summarizes_current_todos() {
                     assigned_to: None,
                     confidence: Some(76),
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
                 crate::todo::TodoItem {
+                    group: None,
                     id: "two".to_string(),
                     content: "Run review subagent".to_string(),
                     status: "completed".to_string(),
@@ -145,6 +148,7 @@ fn test_refactor_status_summarizes_current_todos() {
                     assigned_to: None,
                     confidence: None,
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
             ],
         )
@@ -177,6 +181,7 @@ fn test_refactor_resume_uses_saved_mode_and_current_todos() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "resume1".to_string(),
                 content: "Extract review prompt builder".to_string(),
                 status: "in_progress".to_string(),
@@ -185,6 +190,7 @@ fn test_refactor_resume_uses_saved_mode_and_current_todos() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -233,4 +239,32 @@ fn test_fix_resets_provider_session() {
     assert_eq!(msg.role, "system");
     assert!(msg.content.contains("Fix Results"));
     assert!(msg.content.contains("Reset provider session resume state"));
+}
+
+#[test]
+fn test_turn_error_restores_prompt_to_input() {
+    let mut app = create_test_app();
+    // Simulate a submitted prompt that started a turn.
+    app.last_submitted_input = Some("explain this bug".to_string());
+    app.input.clear();
+
+    app.handle_turn_error("Token refresh needed");
+
+    // The typed prompt should be restored to the input box so it is not lost.
+    assert_eq!(app.input, "explain this bug");
+    // And the saved copy is consumed once restored.
+    assert!(app.last_submitted_input.is_none());
+}
+
+#[test]
+fn test_turn_error_does_not_clobber_new_input() {
+    let mut app = create_test_app();
+    app.last_submitted_input = Some("old prompt".to_string());
+    // User already started typing a new prompt.
+    app.input = "new prompt".to_string();
+
+    app.handle_turn_error("Token refresh needed");
+
+    // We must not overwrite text the user already started.
+    assert_eq!(app.input, "new prompt");
 }

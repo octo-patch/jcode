@@ -44,6 +44,15 @@ fn spawn_jcode_server_with_diagnostics() -> Result<()> {
     let mut command = Command::new(jcode_bin());
     command
         .arg("serve")
+        // The desktop transcript renders live thinking, so default this server
+        // to `current` mode: without it the server never emits reasoning and
+        // the UI shows nothing until the final response. This is a default
+        // only; an explicit `display.reasoning_display` in config still wins,
+        // as does `/thinking` at runtime.
+        .env(
+            "JCODE_DEFAULT_REASONING_DISPLAY",
+            crate::desktop_config::DESKTOP_DEFAULT_REASONING_DISPLAY,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -769,15 +778,14 @@ fn validate_server_event_value(value: &Value, context: &str) -> Result<()> {
                 );
             }
         }
-        "reloading" => {
+        "reloading"
             if value
                 .get("new_socket")
-                .is_some_and(|new_socket| !new_socket.is_string())
-            {
-                anyhow::bail!(
-                    "jcode server sent reloading event with non-string new_socket while {context}"
-                );
-            }
+                .is_some_and(|new_socket| !new_socket.is_string()) =>
+        {
+            anyhow::bail!(
+                "jcode server sent reloading event with non-string new_socket while {context}"
+            );
         }
         _ => {}
     }

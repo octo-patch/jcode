@@ -94,12 +94,13 @@ impl Agent {
             name: tool_name,
             input: arguments,
             intent,
+            thought_signature: None,
         });
 
         true
     }
 
-    pub(super) fn should_continue_after_stop_reason(stop_reason: &str) -> bool {
+    pub(crate) fn should_continue_after_stop_reason(stop_reason: &str) -> bool {
         let reason = stop_reason.trim().to_ascii_lowercase();
         if reason.is_empty() {
             return false;
@@ -115,6 +116,54 @@ impl Agent {
             || reason.contains("length")
             || reason.contains("trunc")
             || reason.contains("commentary")
+    }
+
+    /// True when the provider's stop reason indicates a model-side
+    /// guardrail/safety stop (e.g. Anthropic `refusal`), as opposed to a
+    /// normal end-of-turn or truncation.
+    pub(crate) fn is_guardrail_stop_reason(stop_reason: Option<&str>) -> bool {
+        let Some(reason) = stop_reason else {
+            return false;
+        };
+        let reason = reason.trim().to_ascii_lowercase();
+        matches!(reason.as_str(), "refusal" | "content_filter" | "safety")
+            || reason.contains("guardrail")
+            || reason.contains("policy_violation")
+    }
+
+    /// Builds the user-facing notice for a turn that ended with no visible
+    /// assistant output (no text, no tool calls). Returns `None` when the turn
+    /// looks normal and no notice should be surfaced.
+    pub(crate) fn provider_guardrail_notice(
+        stop_reason: Option<&str>,
+        visible_text_empty: bool,
+        had_reasoning: bool,
+    ) -> Option<String> {
+        let guardrail = Self::is_guardrail_stop_reason(stop_reason);
+        if !guardrail && !visible_text_empty {
+            return None;
+        }
+        let reason_label = stop_reason
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("unknown");
+        if guardrail {
+            return Some(format!(
+                "Provider guardrail stopped the response (stop_reason: {}). The model declined to answer this request. Rephrasing, narrowing the request, or providing more context may help.",
+                reason_label
+            ));
+        }
+        // Empty visible output with a non-guardrail stop reason: still surface,
+        // since the user otherwise sees nothing at all.
+        let reasoning_hint = if had_reasoning {
+            " after producing only internal reasoning"
+        } else {
+            ""
+        };
+        Some(format!(
+            "The model ended its turn without any visible output{} (stop_reason: {}). This is usually a provider-side guardrail or filter silently dropping the response. Rephrasing the request may help.",
+            reasoning_hint, reason_label
+        ))
     }
     fn continuation_prompt_for_stop_reason(stop_reason: &str) -> String {
         format!(
@@ -159,6 +208,55 @@ impl Agent {
             Role::User,
             vec![ContentBlock::Text {
                 text: Self::continuation_prompt_for_stop_reason(stop_reason),
+                cache_control: None,
+            }],
+        );
+        self.session.save()?;
+        Ok(true)
+    }
+
+    /// True when the provider said it stopped to call a tool but no tool call
+    /// survived parsing.
+    ///
+    /// `stop_reason: tool_use` with zero tool calls is a contradiction: the
+    /// model intended to act and the harness has nothing to run. Breaking out
+    /// of the turn there strands the agent mid-task, which on a benchmark run
+    /// looks like an ordinary "the agent stopped early" failure and silently
+    /// discards all of its uncommitted work. Treat it like any other
+    /// incomplete response and ask for a continuation instead.
+    pub(crate) fn is_stranded_tool_use_stop(stop_reason: Option<&str>) -> bool {
+        stop_reason
+            .map(str::trim)
+            .map(|reason| reason.eq_ignore_ascii_case("tool_use"))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn maybe_continue_stranded_tool_use(
+        &mut self,
+        stop_reason: Option<&str>,
+        attempts: &mut u32,
+    ) -> Result<bool> {
+        if !Self::is_stranded_tool_use_stop(stop_reason) {
+            return Ok(false);
+        }
+        if *attempts >= Self::MAX_INCOMPLETE_CONTINUATION_ATTEMPTS {
+            logging::warn(&format!(
+                "Provider reported stop_reason='tool_use' with no parsed tool call after {} continuation attempts; ending turn",
+                attempts
+            ));
+            return Ok(false);
+        }
+        *attempts += 1;
+        logging::warn(&format!(
+            "Provider reported stop_reason='tool_use' but no tool call was parsed; requesting continuation (attempt {}/{})",
+            attempts,
+            Self::MAX_INCOMPLETE_CONTINUATION_ATTEMPTS
+        ));
+        self.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "[System reminder: your previous response ended with stop_reason \"tool_use\" but no tool call arrived. Nothing was executed. Re-issue the tool call you intended, do not repeat completed work, and continue the task.]"
+                    .to_string(),
                 cache_control: None,
             }],
         );

@@ -24,6 +24,21 @@ pub(crate) struct FramePerfStats {
     pub full_prep_last_prepared_bytes: usize,
     pub full_prep_last_total_wrapped_lines: usize,
     pub full_prep_last_section_count: usize,
+    /// Wall time inside the `prepare_ms` span spent in `restage_requested_payloads`
+    /// (image restaging), which runs before any cache lookup.
+    pub prep_restage_ms: f64,
+    /// Wall time computing the transcript mermaid aspect ratio, which probes
+    /// terminal font geometry.
+    pub prep_aspect_ms: f64,
+    /// Total wall time in `prepare_at()` calls, including cache hits. The
+    /// difference between this and `full_prep_build_ms` is cache-lookup and
+    /// clone overhead.
+    pub prep_prepare_at_ms: f64,
+    /// Number of `prepare_at()` invocations this frame. Two means the
+    /// scrollbar hysteresis had to wrap the transcript at both widths.
+    pub prep_prepare_at_calls: usize,
+    /// Wall time in `overflows()` checks between prepare calls.
+    pub prep_overflow_ms: f64,
     pub body_requests: usize,
     pub body_hits: usize,
     pub body_oversized_hits: usize,
@@ -148,12 +163,114 @@ pub(crate) fn frame_input_attribution_snapshot() -> FrameInputAttribution {
 }
 
 pub(crate) fn record_draw_call_attribution(sample: DrawCallAttribution) {
+    {
+        let mut history = draw_call_history()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        history.push_back(sample.clone());
+        while history.len() > DRAW_CALL_HISTORY_MAX_SAMPLES {
+            history.pop_front();
+        }
+    }
     if sample.total_ms < SLOW_DRAW_ATTRIBUTION_THRESHOLD_MS {
         return;
     }
     if let Ok(payload) = serde_json::to_string(&sample) {
         crate::logging::warn(&format!("TUI_DRAW_CALL {}", payload));
     }
+}
+
+const DRAW_CALL_HISTORY_MAX_SAMPLES: usize = 240;
+
+static DRAW_CALL_HISTORY: OnceLock<Mutex<VecDeque<DrawCallAttribution>>> = OnceLock::new();
+
+fn draw_call_history() -> &'static Mutex<VecDeque<DrawCallAttribution>> {
+    DRAW_CALL_HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * pct).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Rolling summary + recent samples of every `terminal.draw` call. Unlike the
+/// slow-frame history this covers *all* draws, so it attributes steady-state
+/// streaming render cost (issue #392): how long the render-into-buffer pass
+/// takes, how much of the terminal actually changed per frame, and the
+/// effective draw rate.
+pub(crate) fn debug_draw_call_history(limit: usize) -> serde_json::Value {
+    let history = draw_call_history()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let samples: Vec<&DrawCallAttribution> = history.iter().collect();
+    if samples.is_empty() {
+        return serde_json::json!({
+            "buffered_samples": 0,
+            "idle_animation": crate::tui::ui::idle_animation_debug_json(),
+            "summary": serde_json::Value::Null,
+            "samples": [],
+        });
+    }
+
+    let mut render_ms: Vec<f64> = samples.iter().map(|s| s.render_ms).collect();
+    let mut total_ms: Vec<f64> = samples.iter().map(|s| s.total_ms).collect();
+    render_ms.sort_by(|a, b| a.total_cmp(b));
+    total_ms.sort_by(|a, b| a.total_cmp(b));
+
+    let changed_ratios: Vec<f64> = samples
+        .iter()
+        .filter_map(|s| match (s.changed_cells, s.total_cells) {
+            (Some(changed), Some(total)) if total > 0 => Some(changed as f64 / total as f64),
+            _ => None,
+        })
+        .collect();
+    let avg_changed_ratio = if changed_ratios.is_empty() {
+        None
+    } else {
+        Some(changed_ratios.iter().sum::<f64>() / changed_ratios.len() as f64)
+    };
+
+    let window_ms = samples
+        .last()
+        .map(|last| last.timestamp_ms)
+        .zip(samples.first().map(|first| first.timestamp_ms))
+        .map(|(last, first)| last.saturating_sub(first))
+        .unwrap_or(0);
+    let draws_per_second = if window_ms > 0 && samples.len() > 1 {
+        Some((samples.len() as f64 - 1.0) * 1000.0 / window_ms as f64)
+    } else {
+        None
+    };
+
+    let take = limit.clamp(1, DRAW_CALL_HISTORY_MAX_SAMPLES);
+    let recent: Vec<&DrawCallAttribution> =
+        samples.iter().rev().take(take).rev().copied().collect();
+
+    serde_json::json!({
+        "buffered_samples": samples.len(),
+        "window_ms": window_ms,
+        "idle_animation": crate::tui::ui::idle_animation_debug_json(),
+        "summary": {
+            "draws_per_second": draws_per_second,
+            "render_ms": {
+                "avg": render_ms.iter().sum::<f64>() / render_ms.len() as f64,
+                "p50": percentile(&render_ms, 0.50),
+                "p95": percentile(&render_ms, 0.95),
+                "max": percentile(&render_ms, 1.0),
+            },
+            "total_ms": {
+                "avg": total_ms.iter().sum::<f64>() / total_ms.len() as f64,
+                "p50": percentile(&total_ms, 0.50),
+                "p95": percentile(&total_ms, 0.95),
+                "max": percentile(&total_ms, 1.0),
+            },
+            "avg_changed_cell_ratio": avg_changed_ratio,
+        },
+        "samples": recent,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -330,6 +447,25 @@ pub(super) fn note_full_prep_cache_lookup(elapsed: Duration) {
     with_frame_perf_stats_mut(|stats| stats.full_prep_cache_lookup_ms += duration_ms(elapsed));
 }
 
+pub(super) fn note_prep_restage(elapsed: Duration) {
+    with_frame_perf_stats_mut(|stats| stats.prep_restage_ms += duration_ms(elapsed));
+}
+
+pub(super) fn note_prep_aspect(elapsed: Duration) {
+    with_frame_perf_stats_mut(|stats| stats.prep_aspect_ms += duration_ms(elapsed));
+}
+
+pub(super) fn note_prep_prepare_at(elapsed: Duration) {
+    with_frame_perf_stats_mut(|stats| {
+        stats.prep_prepare_at_ms += duration_ms(elapsed);
+        stats.prep_prepare_at_calls += 1;
+    });
+}
+
+pub(super) fn note_prep_overflow(elapsed: Duration) {
+    with_frame_perf_stats_mut(|stats| stats.prep_overflow_ms += duration_ms(elapsed));
+}
+
 pub(super) fn note_full_prep_cache_hit(kind: CacheEntryKind, prepared: &PreparedChatFrame) {
     with_frame_perf_stats_mut(|stats| {
         stats.full_prep_hits += 1;
@@ -414,7 +550,7 @@ pub(super) fn note_body_built(
     with_frame_perf_stats_mut(|stats| {
         let elapsed_ms = duration_ms(elapsed);
         stats.body_build_ms += elapsed_ms;
-        if build_path == "incremental" {
+        if build_path == "incremental" || build_path == "prefix_reuse" {
             stats.body_incremental_build_ms += elapsed_ms;
         }
         stats.body_last_path = build_path.to_string();
@@ -520,7 +656,14 @@ pub(super) fn viewport_stability_hash(
     visible_user_indices.hash(&mut hasher);
     for line in visible_lines {
         line.alignment.hash(&mut hasher);
-        line_plain_text(line).hash(&mut hasher);
+        // Hash the line's plain text without materializing it: writing each
+        // span's bytes followed by the 0xff terminator matches `str::hash` of
+        // the concatenated content exactly, so hash values are unchanged while
+        // skipping a String allocation per visible line per frame.
+        for span in &line.spans {
+            hasher.write(span.content.as_bytes());
+        }
+        hasher.write_u8(0xff);
     }
     hasher.finish()
 }
@@ -1146,4 +1289,84 @@ pub(crate) fn clear_flicker_frame_history_for_tests() {
     history.events.clear();
     history.last_log_at_ms = None;
     set_last_chat_scrollbar_visible(false);
+}
+
+#[cfg(test)]
+mod draw_call_tests {
+    use super::*;
+
+    fn sample(timestamp_ms: u64, render_ms: f64, changed: Option<usize>) -> DrawCallAttribution {
+        DrawCallAttribution {
+            timestamp_ms,
+            total_ms: render_ms + 1.0,
+            render_ms,
+            backend_flush_ms: 1.0,
+            changed_cells: changed,
+            total_cells: Some(1000),
+            force_full_redraw: false,
+            input: FrameInputAttribution::default(),
+        }
+    }
+
+    fn clear_draw_call_history() {
+        draw_call_history()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    #[test]
+    fn draw_call_history_records_all_draws_and_summarizes() {
+        // Single test covers both summary math and the ring-buffer bound so we
+        // never race two tests on the shared static history.
+        clear_draw_call_history();
+        record_draw_call_attribution(sample(1_000, 2.0, Some(50)));
+        record_draw_call_attribution(sample(1_033, 4.0, Some(150)));
+        record_draw_call_attribution(sample(1_066, 6.0, Some(250)));
+
+        let payload = debug_draw_call_history(8);
+        assert_eq!(payload["buffered_samples"], 3);
+        assert_eq!(payload["window_ms"], 66);
+        // (3 - 1) draws / 66ms window ~= 30.3 draws/sec
+        let dps = payload["summary"]["draws_per_second"].as_f64().unwrap();
+        assert!((dps - 30.30).abs() < 0.5, "draws_per_second = {dps}");
+        let avg_render = payload["summary"]["render_ms"]["avg"].as_f64().unwrap();
+        assert!((avg_render - 4.0).abs() < 1e-9);
+        // (50 + 150 + 250) / 3 / 1000 = 0.15
+        let ratio = payload["summary"]["avg_changed_cell_ratio"]
+            .as_f64()
+            .unwrap();
+        assert!((ratio - 0.15).abs() < 1e-9, "ratio = {ratio}");
+        assert_eq!(payload["samples"].as_array().unwrap().len(), 3);
+
+        // The ring buffer stays bounded.
+        clear_draw_call_history();
+        for i in 0..(DRAW_CALL_HISTORY_MAX_SAMPLES + 10) {
+            record_draw_call_attribution(sample(i as u64, 1.0, None));
+        }
+        let payload = debug_draw_call_history(DRAW_CALL_HISTORY_MAX_SAMPLES);
+        assert_eq!(payload["buffered_samples"], DRAW_CALL_HISTORY_MAX_SAMPLES);
+        clear_draw_call_history();
+    }
+
+    #[test]
+    fn stability_hash_span_iteration_matches_plain_text_hash() {
+        use ratatui::text::{Line, Span};
+        // The span-iteration hash must equal what hashing the concatenated
+        // plain text produced before the optimization, so historical hash
+        // comparisons (flicker detection) stay stable across span splits.
+        let split = vec![
+            Line::from(vec![Span::raw("hello "), Span::raw("world")]),
+            Line::from("second line"),
+        ];
+        let merged = vec![Line::from("hello world"), Line::from("second line")];
+        let a = viewport_stability_hash(&split, &[1], 80, 2);
+        let b = viewport_stability_hash(&merged, &[1], 80, 2);
+        assert_eq!(a, b);
+
+        // Differing content must still differ.
+        let other = vec![Line::from("hello world!"), Line::from("second line")];
+        let c = viewport_stability_hash(&other, &[1], 80, 2);
+        assert_ne!(a, c);
+    }
 }

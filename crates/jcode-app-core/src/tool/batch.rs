@@ -19,12 +19,13 @@ pub(crate) fn generic_batch_schema() -> Value {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["tool"],
+                    "required": ["tool", "intent"],
                     "properties": {
                         "tool": {
                             "type": "string",
                             "description": "Tool name."
-                        }
+                        },
+                        "intent": super::intent_schema_property()
                     },
                     "additionalProperties": true
                 },
@@ -48,6 +49,7 @@ fn ordered_batch_subcalls(
                 name: tool_name.clone(),
                 input: parameters.clone(),
                 intent: ToolCall::intent_from_input(parameters),
+                thought_signature: None,
             });
             let state = if running.contains_key(i) {
                 BatchSubcallState::Running
@@ -124,6 +126,21 @@ fn normalize_batch_input(mut input: Value) -> Value {
                     }
                 }
 
+                // Canonical batch calls may keep the display intent beside
+                // `parameters`. Forward it into the effective tool input so
+                // live progress events and the nested tool execution retain it.
+                let top_level_intent = obj
+                    .get("intent")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|intent| !intent.is_empty())
+                    .map(ToString::to_string);
+                if let Some(intent) = top_level_intent
+                    && let Some(params) = obj.get_mut("parameters").and_then(Value::as_object_mut)
+                {
+                    params.insert("intent".to_string(), Value::String(intent));
+                }
+
                 if !obj.contains_key("parameters") && obj.contains_key("tool") {
                     let tool_name = obj.get("tool").cloned();
                     let mut params = serde_json::Map::new();
@@ -177,7 +194,7 @@ impl Tool for BatchTool {
 
         // Check for disallowed tools
         for tc in &params.tool_calls {
-            if tc.tool == "batch" {
+            if Registry::resolve_tool_name(&tc.tool) == "batch" {
                 return Err(anyhow::anyhow!("Cannot batch the 'batch' tool"));
             }
         }
@@ -191,6 +208,7 @@ impl Tool for BatchTool {
             .enumerate()
             .map(|(i, tc)| {
                 let (tool_name, parameters) = tc.resolved_parameters();
+                let tool_name = Registry::resolve_tool_name(&tool_name).to_string();
                 (i, tool_name, parameters)
             })
             .collect();
@@ -205,6 +223,7 @@ impl Tool for BatchTool {
                         name: tool_name.clone(),
                         input: parameters.clone(),
                         intent: ToolCall::intent_from_input(parameters),
+                        thought_signature: None,
                     },
                 )
             })

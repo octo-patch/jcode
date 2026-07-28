@@ -99,7 +99,7 @@ fn session_picker_enter_queues_current_terminal_resume_and_closes_overlay() {
 
     assert!(app.session_picker_overlay.is_none());
     assert_eq!(
-        crate::tui::workspace_client::take_pending_resume_session().as_deref(),
+        app.workspace_client.take_pending_resume_session().as_deref(),
         Some("session_here_123")
     );
 }
@@ -116,6 +116,24 @@ fn slash_resume_opens_session_picker_overlay_locally() {
     assert!(app.session_picker_overlay.is_some());
     assert_eq!(app.session_picker_mode, SessionPickerMode::Resume);
     assert!(app.pending_session_picker_load.is_some());
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn slash_command_submit_retains_pending_images() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = runtime.enter();
+    let mut app = create_test_app();
+
+    app.pending_images
+        .push(("image/png".to_string(), "aGVsbG8=".to_string()));
+    app.input = "/help".to_string();
+    app.submit_input();
+
+    // Slash commands are handled locally and must not consume attached images;
+    // the images stay pending and go out with the next real prompt submission.
+    assert_eq!(app.pending_images.len(), 1);
+    assert_eq!(app.pending_images[0].0, "image/png");
     assert!(app.input.is_empty());
 }
 
@@ -150,14 +168,50 @@ fn slash_session_alias_opens_session_picker_overlay_locally() {
 }
 
 #[test]
+fn slash_active_opens_active_sessions_picker_locally() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = runtime.enter();
+    let mut app = create_test_app();
+
+    app.input = "/active".to_string();
+    app.submit_input();
+
+    assert!(app.session_picker_overlay.is_some());
+    assert_eq!(app.session_picker_mode, SessionPickerMode::ActiveSessions);
+    assert!(app.pending_session_picker_load.is_some());
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn left_arrow_on_empty_input_is_a_noop_unless_opted_in() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = runtime.enter();
+    let mut app = create_test_app();
+
+    // Default config: the active sessions manager gesture is opt-in, so Left
+    // on an empty input must not open any overlay.
+    assert!(!app.maybe_open_active_sessions_on_left());
+    assert!(app.session_picker_overlay.is_none());
+
+    // With text in the input the gesture never fires regardless of config.
+    app.input = "hello".to_string();
+    app.cursor_pos = 0;
+    assert!(!app.maybe_open_active_sessions_on_left());
+    assert!(app.session_picker_overlay.is_none());
+}
+
+#[test]
 fn test_resize_redraw_is_debounced() {
     let mut app = create_test_app();
 
     assert!(app.should_redraw_after_resize());
     assert!(!app.should_redraw_after_resize());
+    assert!(app.resize_redraw_pending);
 
     app.last_resize_redraw = Some(Instant::now() - Duration::from_millis(40));
-    assert!(app.should_redraw_after_resize());
+    assert!(app.flush_pending_resize_redraw());
+    assert!(!app.resize_redraw_pending);
+    assert!(!app.flush_pending_resize_redraw());
 }
 
 #[test]
@@ -307,6 +361,119 @@ fn slash_provider_test_coverage_overlay_scrolls_with_mouse_wheel() {
 }
 
 #[test]
+fn session_picker_preview_wheel_uses_shared_scroll_momentum() {
+    use crate::tui::session_picker::{PreviewMessage, SessionInfo, SessionSource};
+    // Build a session whose preview overflows a small pane so it can scroll.
+    let mut messages = Vec::new();
+    for i in 0..40 {
+        messages.push(PreviewMessage {
+            role: "user".to_string(),
+            content: format!("prompt line {i}"),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+        messages.push(PreviewMessage {
+            role: "assistant".to_string(),
+            content: format!("assistant reply {i}"),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+    }
+    let session = SessionInfo {
+        id: "session_scroll".to_string(),
+        parent_id: None,
+        short_name: "scroll".to_string(),
+        icon: "s".to_string(),
+        title: "Scroll".to_string(),
+        message_count: messages.len(),
+        user_message_count: 40,
+        assistant_message_count: 40,
+        created_at: chrono::Utc::now(),
+        last_message_time: chrono::Utc::now(),
+        last_active_at: None,
+        working_dir: None,
+        model: None,
+        provider_key: None,
+        is_canary: false,
+        is_debug: false,
+        saved: false,
+        save_label: None,
+        status: crate::session::SessionStatus::Closed,
+        needs_catchup: false,
+        estimated_tokens: 0,
+        first_user_prompt: Some("prompt line 0".to_string()),
+        messages_preview: messages,
+        search_index: "scroll".to_string(),
+        server_name: None,
+        server_icon: None,
+        source: SessionSource::Jcode,
+        resume_target: crate::tui::session_picker::ResumeTarget::JcodeSession {
+            session_id: "session_scroll".to_string(),
+        },
+        external_path: None,
+    };
+
+    let mut picker = crate::tui::session_picker::SessionPicker::new(vec![session]);
+    // Render once so the preview pane area + max scroll are populated, and the
+    // auto-scroll-to-bottom completes (so a wheel up has room to move). Wheel
+    // routing is coordinate-based, so pane focus does not matter here.
+    let backend = ratatui::backend::TestBackend::new(120, 20);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("render picker");
+
+    let mut app = create_test_app();
+    app.session_picker_mode = SessionPickerMode::Resume;
+    app.session_picker_overlay = Some(RefCell::new(picker));
+
+    let scroll_before = app
+        .session_picker_overlay
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .preview_scroll_offset_for_test();
+    assert!(
+        scroll_before > 0,
+        "long preview should auto-scroll to the bottom on first render"
+    );
+
+    // A wheel up over the preview pane (right ~60% of width) routes through the
+    // shared mouse-scroll momentum (enqueue + drain) instead of an instant jump,
+    // and actually moves the preview offset.
+    let scroll_only = app.handle_mouse_event(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollUp,
+        column: 90,
+        row: 10,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    });
+    assert!(
+        scroll_only,
+        "preview wheel should be classified as scroll-only"
+    );
+    // Drain any remaining queued momentum so the move completes.
+    for _ in 0..32 {
+        app.progress_mouse_scroll_animation();
+    }
+    let scroll_after = app
+        .session_picker_overlay
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .preview_scroll_offset_for_test();
+    assert!(
+        scroll_after < scroll_before,
+        "wheel up should scroll the preview toward the top (before={scroll_before}, after={scroll_after})"
+    );
+    assert!(
+        !app.has_pending_mouse_scroll_animation(),
+        "momentum queue should drain to empty"
+    );
+}
+
+#[test]
 fn test_help_topic_shows_btw_command_details() {
     let mut app = create_test_app();
     app.input = "/help btw".to_string();
@@ -318,7 +485,22 @@ fn test_help_topic_shows_btw_command_details() {
         .expect("missing help response");
     assert_eq!(msg.role, "system");
     assert!(msg.content.contains("/btw <question>"));
-    assert!(msg.content.contains("side panel"));
+    assert!(msg.content.contains("Forks (splits) the session"));
+}
+
+#[test]
+fn test_help_topic_shows_fork_command_details() {
+    let mut app = create_test_app();
+    app.input = "/help fork".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("/fork <prompt>"));
+    assert!(msg.content.contains("Alias for /fork"));
 }
 
 #[test]
@@ -367,6 +549,181 @@ fn test_commit_command_starts_synthetic_user_turn() {
         .expect("missing launch notice");
     assert_eq!(notice.role, "system");
     assert!(notice.content.contains("Starting logical commits"));
+}
+
+#[test]
+fn test_commit_push_command_starts_synthetic_user_turn() {
+    let mut app = create_test_app();
+    app.input = "/commit-push".to_string();
+    app.submit_input();
+
+    assert!(app.is_processing);
+    assert!(app.pending_turn);
+    let notice = app
+        .display_messages()
+        .last()
+        .expect("missing launch notice");
+    assert_eq!(notice.role, "system");
+    assert!(notice.content.contains("Starting logical commits + push"));
+}
+
+#[test]
+fn test_help_topic_shows_commit_push_command_details() {
+    let mut app = create_test_app();
+    app.input = "/help commit-push".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("/commit-push"));
+    assert!(msg.content.contains("push"));
+}
+
+#[test]
+fn test_fast_release_command_starts_synthetic_user_turn() {
+    let mut app = create_test_app();
+    app.input = "/fast-release".to_string();
+    app.submit_input();
+
+    assert!(app.is_processing);
+    assert!(app.pending_turn);
+    let notice = app
+        .display_messages()
+        .last()
+        .expect("missing launch notice");
+    assert_eq!(notice.role, "system");
+    assert!(notice
+        .content
+        .contains("Starting logical commits + push + fast local release"));
+}
+
+#[test]
+fn test_triage_command_starts_synthetic_user_turn() {
+    let mut app = create_test_app();
+    app.input = "/triage".to_string();
+    app.submit_input();
+
+    assert!(app.is_processing);
+    assert!(app.pending_turn);
+    let notice = app
+        .display_messages()
+        .last()
+        .expect("missing launch notice");
+    assert_eq!(notice.role, "system");
+    assert!(notice.content.contains("Starting GitHub issue triage"));
+}
+
+#[test]
+fn test_triage_command_includes_focus_in_prompt() {
+    let prompt = crate::tui::app::commands::build_triage_prompt(" only crash reports");
+    assert!(prompt.contains("Triage the open GitHub issues"));
+    assert!(prompt.contains("Additional focus from the user: only crash reports"));
+}
+
+#[test]
+fn test_cut_release_alias_starts_fast_release_turn() {
+    let mut app = create_test_app();
+    app.input = "/cut-release".to_string();
+    app.submit_input();
+
+    assert!(app.is_processing);
+    assert!(app.pending_turn);
+    let notice = app
+        .display_messages()
+        .last()
+        .expect("missing launch notice");
+    assert!(notice.content.contains("fast local release"));
+}
+
+#[test]
+fn test_fast_release_prompt_uses_selfdev_cache() {
+    let fast_prompt = super::commands::build_fast_release_prompt();
+    assert!(fast_prompt.contains("quick-release.sh --prepare-fast"));
+    assert!(fast_prompt.contains("quick-release.sh --fast-local"));
+    assert!(fast_prompt.contains("warm target/selfdev cache"));
+    assert!(fast_prompt.contains("Do not run the separate local macOS cross-build"));
+    let prepare = fast_prompt.find("--prepare-fast").unwrap();
+    let bump = fast_prompt.find("Bump the version").unwrap();
+    assert!(prepare < bump);
+}
+
+#[test]
+fn test_remote_release_command_uses_tag_only_ci_path() {
+    let mut app = create_test_app();
+    app.input = "/remote-release".to_string();
+    app.submit_input();
+
+    assert!(app.is_processing);
+    assert!(app.pending_turn);
+    let notice = app
+        .display_messages()
+        .last()
+        .expect("missing launch notice");
+    assert_eq!(notice.role, "system");
+    assert!(notice
+        .content
+        .contains("Starting logical commits + push + remote release"));
+
+    let prompt = super::commands::build_remote_release_prompt();
+    assert!(prompt.contains("quick-release.sh --remote"));
+    assert!(prompt.contains("without any local build"));
+    assert!(prompt.contains("publication gated"));
+}
+
+#[test]
+fn test_commit_push_release_alias_starts_synthetic_user_turn() {
+    let mut app = create_test_app();
+    app.input = "/commit-push-release".to_string();
+    app.submit_input();
+
+    assert!(app.is_processing);
+    assert!(app.pending_turn);
+    let notice = app
+        .display_messages()
+        .last()
+        .expect("missing launch notice");
+    assert_eq!(notice.role, "system");
+    assert!(notice
+        .content
+        .contains("Starting logical commits + push + fast local release"));
+}
+
+#[test]
+fn test_help_topic_shows_cut_release_command_details() {
+    let mut app = create_test_app();
+    app.input = "/help cut-release".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("/fast-release"));
+    assert!(msg.content.contains("--prepare-fast"));
+    assert!(msg.content.contains("--fast-local"));
+    assert!(msg.content.contains("target/selfdev"));
+    assert!(msg.content.contains("compatibility alias"));
+}
+
+#[test]
+fn test_help_topic_shows_remote_release_command_details() {
+    let mut app = create_test_app();
+    app.input = "/help remote-release".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("/remote-release"));
+    assert!(msg.content.contains("--remote"));
+    assert!(msg.content.contains("without running any local build"));
+    assert!(msg.content.contains("remains a draft"));
 }
 
 #[test]
@@ -632,7 +989,7 @@ fn test_goals_command_opens_overview_in_side_panel() {
         .display_messages()
         .last()
         .expect("missing goals message");
-    assert!(msg.content.contains("Opened goals overview"));
+    assert!(msg.content.contains("Opened initiatives overview"));
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
@@ -749,7 +1106,7 @@ fn test_btw_command_requires_question() {
 }
 
 #[test]
-fn test_btw_command_prepares_side_panel_and_hidden_turn() {
+fn test_btw_command_forks_session_with_question() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let prev_home = std::env::var_os("JCODE_HOME");
@@ -759,24 +1116,26 @@ fn test_btw_command_prepares_side_panel_and_hidden_turn() {
     app.input = "/btw what did we decide about config?".to_string();
     app.submit_input();
 
-    assert_eq!(app.side_panel.focused_page_id.as_deref(), Some("btw"));
-    let page = app.side_panel.focused_page().expect("missing btw page");
-    assert_eq!(page.title, "/btw");
-    assert!(page.content.contains("## Question"));
-    assert!(page.content.contains("what did we decide about config?"));
-    assert!(page.content.contains("Thinking…"));
-    assert_eq!(app.hidden_queued_system_messages.len(), 1);
-    assert!(
-        app.hidden_queued_system_messages[0].contains("Question: what did we decide about config?")
-    );
-    assert!(app.pending_queued_dispatch);
-
+    // Terminal spawning is disabled under cfg(test), so the fork reports the
+    // created session with a manual resume hint.
     let msg = app
         .display_messages()
         .last()
-        .expect("missing btw status message");
+        .expect("missing btw fork message");
     assert_eq!(msg.role, "system");
-    assert!(msg.content.contains("Running /btw"));
+    assert!(msg.content.contains("created for the next prompt"));
+    let session_id = msg
+        .content
+        .split("jcode --resume ")
+        .nth(1)
+        .expect("missing resume hint")
+        .trim()
+        .to_string();
+    let restored =
+        App::restore_input_for_reload(&session_id).expect("forked session should stage question");
+    assert_eq!(restored.input, "what did we decide about config?");
+    assert!(restored.submit_on_restore);
+    assert!(restored.pending_images.is_empty());
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
@@ -786,27 +1145,94 @@ fn test_btw_command_prepares_side_panel_and_hidden_turn() {
 }
 
 #[test]
-fn test_btw_command_in_remote_mode_queues_followup_instead_of_erroring() {
+fn test_fork_command_with_prompt_forks_session() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let prev_home = std::env::var_os("JCODE_HOME");
     crate::env::set_var("JCODE_HOME", temp.path());
 
     let mut app = create_test_app();
-    app.is_remote = true;
-    app.remote_session_id = Some("ses_remote_btw".to_string());
-    app.input = "/btw what are we doing?".to_string();
+    app.input = "/fork try the other approach".to_string();
     app.submit_input();
 
-    assert_eq!(app.side_panel.focused_page_id.as_deref(), Some("btw"));
-    assert_eq!(app.hidden_queued_system_messages.len(), 1);
-    assert!(app.pending_queued_dispatch);
     let msg = app
         .display_messages()
         .last()
-        .expect("missing remote btw message");
+        .expect("missing fork message");
     assert_eq!(msg.role, "system");
-    assert!(msg.content.contains("Running /btw"));
+    assert!(msg.content.contains("created for the next prompt"));
+    let session_id = msg
+        .content
+        .split("jcode --resume ")
+        .nth(1)
+        .expect("missing resume hint")
+        .trim()
+        .to_string();
+    let restored =
+        App::restore_input_for_reload(&session_id).expect("forked session should stage prompt");
+    assert_eq!(restored.input, "try the other approach");
+    assert!(restored.submit_on_restore);
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn test_fork_command_without_prompt_forks_idle_session() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let mut app = create_test_app();
+    app.input = "/fork".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing fork message");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("✂ Fork →"));
+    let session_id = msg
+        .content
+        .split("jcode --resume ")
+        .nth(1)
+        .expect("missing resume hint")
+        .trim()
+        .to_string();
+    assert!(
+        App::restore_input_for_reload(&session_id).is_none(),
+        "idle fork should not stage a startup submission"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn test_split_command_local_is_alias_for_fork() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let mut app = create_test_app();
+    app.input = "/split".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing split message");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("✂ Fork →"));
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
@@ -974,7 +1400,7 @@ fn test_splitview_mirrors_chat_and_streaming_text() {
         DisplayMessage::assistant("We decided to ship it.".to_string()),
     ];
     app.bump_display_messages_version();
-    app.streaming_text = "Working on the follow-up now...".to_string();
+    app.streaming.streaming_text = "Working on the follow-up now...".to_string();
     app.set_split_view_enabled(true, true);
 
     let page = app
@@ -1047,8 +1473,7 @@ fn test_observe_updates_latest_tool_context_only() {
         id: "tool_1".to_string(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs", "start_line": 1, "end_line": 10}),
-        intent: None,
-    };
+        intent: None, thought_signature: None, };
     app.observe_tool_call(&tool_call);
 
     let page = app.side_panel.focused_page().expect("missing observe page");
@@ -1087,8 +1512,7 @@ fn test_observe_ignores_noise_tools_and_preserves_latest_useful_context() {
         id: "tool_read".to_string(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs"}),
-        intent: None,
-    };
+        intent: None, thought_signature: None, };
     app.observe_tool_result(&read_tool, "fn main() {}", false, Some("read"));
     let before = app
         .side_panel
@@ -1101,8 +1525,7 @@ fn test_observe_ignores_noise_tools_and_preserves_latest_useful_context() {
         id: "tool_side_panel".to_string(),
         name: "side_panel".to_string(),
         input: serde_json::json!({"action": "write", "page_id": "plan"}),
-        intent: None,
-    };
+        intent: None, thought_signature: None, };
     app.observe_tool_call(&noise_tool);
     app.observe_tool_result(&noise_tool, "ok", false, Some("side_panel"));
 

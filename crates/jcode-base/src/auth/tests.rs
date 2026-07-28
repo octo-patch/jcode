@@ -455,7 +455,8 @@ fn auth_status_check_fast_ignores_expired_full_cache() {
         ))
         .expect("stale cache timestamp");
 
-    *AUTH_STATUS_CACHE.write().expect("auth cache lock") = Some((stale_status, stale_when));
+    *AUTH_STATUS_CACHE.write().expect("auth cache lock") =
+        Some((stale_status, stale_when, auth_cache_home_key()));
     *AUTH_STATUS_FAST_CACHE
         .write()
         .expect("fast auth cache lock") = None;
@@ -780,4 +781,125 @@ fn configured_api_key_source_rejects_invalid_values() {
     } else {
         crate::env::remove_var(file_var);
     }
+}
+
+#[test]
+fn anthropic_api_provider_reports_api_key_independently_of_oauth() {
+    // Regression: the `anthropic-api` (API-key) login provider used to share the
+    // OAuth/subscription credential's availability via `auth_state_key::Anthropic`.
+    // That made it claim "available / OAuth + API key" even with zero API key
+    // configured, then fail at request time (API-key mode never falls back to
+    // OAuth). It must report purely on the presence of an Anthropic API key.
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("create temp dir");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    std::fs::create_dir_all(&home).expect("create temp home");
+    std::fs::create_dir_all(&xdg).expect("create temp xdg config");
+    let saved = ["JCODE_HOME", "XDG_CONFIG_HOME", "HOME", "ANTHROPIC_API_KEY"]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+
+    crate::env::set_var("JCODE_HOME", temp.path().join("jcode-home"));
+    crate::env::set_var("XDG_CONFIG_HOME", &xdg);
+    crate::env::set_var("HOME", &home);
+    crate::env::remove_var("ANTHROPIC_API_KEY");
+    AuthStatus::invalidate_cache();
+
+    // No API key anywhere: the API-key provider must be NotConfigured, even if
+    // OAuth credentials happen to exist for the separate `claude` provider.
+    let status = AuthStatus::check_fast();
+    let api = status.assessment_for_provider(crate::provider_catalog::ANTHROPIC_API_LOGIN_PROVIDER);
+    assert_eq!(
+        api.state,
+        AuthState::NotConfigured,
+        "anthropic-api must not borrow OAuth availability"
+    );
+    assert_eq!(api.method_detail, "not configured");
+
+    // With an API key present (env here; config-file path is covered separately),
+    // the API-key provider becomes available and names ANTHROPIC_API_KEY honestly.
+    crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-api-test-key");
+    AuthStatus::invalidate_cache();
+    let status = AuthStatus::check_fast();
+    let api = status.assessment_for_provider(crate::provider_catalog::ANTHROPIC_API_LOGIN_PROVIDER);
+    assert_eq!(api.state, AuthState::Available);
+    assert!(
+        api.method_detail.contains("ANTHROPIC_API_KEY"),
+        "method detail should name the API key env: {}",
+        api.method_detail
+    );
+
+    for (key, value) in saved {
+        restore_env_var(key, value);
+    }
+    AuthStatus::invalidate_cache();
+}
+
+#[test]
+fn claude_oauth_provider_reports_oauth_independently_of_api_key() {
+    // Mirror of the regression above: the `claude` (OAuth/subscription) login
+    // provider must report on OAuth credentials alone. An ANTHROPIC_API_KEY
+    // used to leak into `auth_state_key::Anthropic`, making the OAuth row claim
+    // "available / OAuth + API key" with zero OAuth accounts -- contradicting
+    // the separate `anthropic-api` row and the header's active-route tag.
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("create temp dir");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    std::fs::create_dir_all(&home).expect("create temp home");
+    std::fs::create_dir_all(&xdg).expect("create temp xdg config");
+    let saved = ["JCODE_HOME", "XDG_CONFIG_HOME", "HOME", "ANTHROPIC_API_KEY"]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+
+    crate::env::set_var("JCODE_HOME", temp.path().join("jcode-home"));
+    crate::env::set_var("XDG_CONFIG_HOME", &xdg);
+    crate::env::set_var("HOME", &home);
+    // API key present, no OAuth anywhere: the OAuth provider must stay
+    // NotConfigured and must not describe the API key as its method.
+    crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-api-test-key");
+    AuthStatus::invalidate_cache();
+
+    let status = AuthStatus::check_fast();
+    let oauth = status.assessment_for_provider(crate::provider_catalog::CLAUDE_LOGIN_PROVIDER);
+    assert_eq!(
+        oauth.state,
+        AuthState::NotConfigured,
+        "claude (OAuth) must not borrow API-key availability"
+    );
+    assert_eq!(oauth.method_detail, "not configured");
+    assert!(
+        !oauth.credential_source_detail.contains("ANTHROPIC_API_KEY"),
+        "OAuth row must not attribute the API key as its source: {}",
+        oauth.credential_source_detail
+    );
+
+    // The API-key row still owns that credential.
+    let api = status.assessment_for_provider(crate::provider_catalog::ANTHROPIC_API_LOGIN_PROVIDER);
+    assert_eq!(api.state, AuthState::Available);
+
+    for (key, value) in saved {
+        restore_env_var(key, value);
+    }
+    AuthStatus::invalidate_cache();
+}
+
+/// Test binaries must never open real browser windows: login/onboarding flows
+/// are exercised heavily by unit tests, and each ungated `open::that` pops an
+/// OAuth page on the developer's desktop. `running_in_test_harness` detects
+/// the `target/**/deps/` test-binary path, and `browser_suppressed` must honor
+/// it even without --no-browser or NO_BROWSER/JCODE_NO_BROWSER.
+#[test]
+fn browser_suppressed_inside_test_harness_without_env_overrides() {
+    assert!(
+        super::running_in_test_harness(),
+        "test binary should be detected as a test harness (exe under target/**/deps/)"
+    );
+    assert!(
+        super::browser_suppressed(false),
+        "browser opens must be suppressed in test binaries even without --no-browser/env vars"
+    );
 }

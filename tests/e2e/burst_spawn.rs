@@ -42,9 +42,15 @@ async fn burst_attach_resumed_client(
     let mut history_message_count = 0usize;
     let mut provider_model = None;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Hosted CI runners intermittently stall a single socket read past 1s when
+    // many burst clients contend for the runtime. Tolerate per-read timeouts and
+    // only bound the total attach wait, mirroring the deflake applied elsewhere.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        let event = timeout(Duration::from_secs(1), client.read_event()).await??;
+        let event = match timeout(Duration::from_secs(1), client.read_event()).await {
+            Ok(result) => result?,
+            Err(_) => continue,
+        };
         event_count += 1;
         match event {
             ServerEvent::Ack { .. } => ack_count += 1,
@@ -118,9 +124,15 @@ async fn burst_attach_resumed_client_with_options(
     let mut history_message_count = 0usize;
     let mut provider_model = None;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Hosted CI runners intermittently stall a single socket read past 1s when
+    // many burst clients contend for the runtime. Tolerate per-read timeouts and
+    // only bound the total attach wait, mirroring the deflake applied elsewhere.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        let event = timeout(Duration::from_secs(1), client.read_event()).await??;
+        let event = match timeout(Duration::from_secs(1), client.read_event()).await {
+            Ok(result) => result?,
+            Err(_) => continue,
+        };
         event_count += 1;
         match event {
             ServerEvent::Ack { .. } => ack_count += 1,
@@ -256,7 +268,33 @@ async fn run_burst_resume_attach_stress(burst_size: usize) -> Result<()> {
     let wall_elapsed = wall_start.elapsed();
     let cpu_elapsed = current_process_cpu_time()?.saturating_sub(cpu_start);
 
-    let client_map = debug_run_command_json(debug_socket_path.clone(), "clients:map", None).await?;
+    // A client observes its own attach as done slightly before the server
+    // finishes marking the swarm member "ready" in `clients:map`. Poll until
+    // every mapped client reports ready (with a deadline) before asserting;
+    // a one-shot snapshot intermittently caught 19/20 ready on CI.
+    let client_map = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot =
+                debug_run_command_json(debug_socket_path.clone(), "clients:map", None).await?;
+            let ready = snapshot
+                .get("clients")
+                .and_then(|value| value.as_array())
+                .map(|clients| {
+                    clients
+                        .iter()
+                        .filter(|client| {
+                            client.get("status").and_then(|value| value.as_str()) == Some("ready")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if ready == burst_size || Instant::now() >= deadline {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
     let info = debug_run_command_json(debug_socket_path.clone(), "server:info", None).await?;
 
     let clients = client_map
@@ -420,9 +458,35 @@ async fn burst_retry_takeover_without_local_history_keeps_existing_live_clients_
         live_clients.push((session_id, client));
     }
 
-    let initial_client_map =
-        debug_run_command_json(debug_socket_path.clone(), "clients:map", None).await?;
-    let initial_session_to_client = client_id_map(&initial_client_map)?;
+    // A client is `Done` (from its own perspective) slightly before the server
+    // finishes registering it in `clients:map`. Wait until all live clients are
+    // registered AND the map is stable across two reads before snapshotting it;
+    // otherwise a retry burst can race a not-yet-settled live registration and
+    // legitimately-but-nondeterministically take it over, flaking the assertion
+    // below. (Was an intermittent CI failure under load.)
+    wait_for_debug_client_count(
+        &debug_socket_path,
+        live_session_count,
+        Duration::from_secs(10),
+    )
+    .await?;
+    let initial_session_to_client = {
+        let mut previous: Option<std::collections::HashMap<String, String>> = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = client_id_map(
+                &debug_run_command_json(debug_socket_path.clone(), "clients:map", None).await?,
+            )?;
+            if snapshot.len() == live_session_count && previous.as_ref() == Some(&snapshot) {
+                break snapshot;
+            }
+            if Instant::now() >= deadline {
+                break snapshot;
+            }
+            previous = Some(snapshot);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
 
     let retry_results = join_all(live_session_ids.iter().map(|session_id| {
         let socket_path = socket_path.clone();
@@ -451,11 +515,43 @@ async fn burst_retry_takeover_without_local_history_keeps_existing_live_clients_
         }
     }
 
-    let final_client_map =
-        debug_run_command_json(debug_socket_path.clone(), "clients:map", None).await?;
-    let final_session_to_client = client_id_map(&final_client_map)?;
+    // Each retry attaches as a short-lived observer and then drops, so after
+    // the burst the server asynchronously drains those extra connections. The
+    // invariant we actually care about is that none of the *original* live
+    // client connections were superseded. Wait for the connection set to settle
+    // back to exactly the live clients, then compare the set of live client ids.
+    // (Comparing a session->client_id map directly is ill-defined here because
+    // multiple connections can momentarily share a session id and the lossy map
+    // collapses them, which flaked under CI load.)
+    let initial_client_ids: std::collections::BTreeSet<String> =
+        initial_session_to_client.values().cloned().collect();
+    wait_for_debug_client_count(
+        &debug_socket_path,
+        live_session_count,
+        Duration::from_secs(15),
+    )
+    .await?;
+    let final_client_ids = {
+        let mut previous: Option<std::collections::BTreeSet<String>> = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot: std::collections::BTreeSet<String> = client_id_map(
+                &debug_run_command_json(debug_socket_path.clone(), "clients:map", None).await?,
+            )?
+            .into_values()
+            .collect();
+            if snapshot.len() == live_session_count && previous.as_ref() == Some(&snapshot) {
+                break snapshot;
+            }
+            if Instant::now() >= deadline {
+                break snapshot;
+            }
+            previous = Some(snapshot);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
     assert_eq!(
-        final_session_to_client, initial_session_to_client,
+        final_client_ids, initial_client_ids,
         "existing live client connections should not be replaced during burst retries"
     );
 

@@ -233,6 +233,62 @@ fn desktop_session_events_convert_to_worker_wire_events() {
 }
 
 #[test]
+fn worker_wire_round_trip_preserves_live_progress_events() {
+    // Worker-hosted sessions render from the wire enum, so anything that falls
+    // through to RawJson is invisible in the UI. Reasoning, tool-arg streaming,
+    // and the prepare/execute distinction all have to survive the round trip.
+    let events = vec![
+        session_launch::DesktopSessionEvent::ReasoningDelta("weighing options".to_string()),
+        session_launch::DesktopSessionEvent::ReasoningDone {
+            duration_ms: Some(1500),
+        },
+        session_launch::DesktopSessionEvent::ToolStarted {
+            id: Some("tool-a".to_string()),
+            name: "bash".to_string(),
+        },
+        session_launch::DesktopSessionEvent::ToolInput {
+            id: Some("tool-a".to_string()),
+            delta: "{\"intent\": \"run tests\"".to_string(),
+        },
+        session_launch::DesktopSessionEvent::ToolExecuting {
+            id: Some("tool-a".to_string()),
+            name: "bash".to_string(),
+        },
+    ];
+
+    for event in events {
+        let wire = desktop_session_event_to_wire(&event);
+        assert!(
+            !matches!(wire, DesktopSessionEventWire::RawJson { .. }),
+            "{event:?} must have a typed wire form, otherwise the worker path drops it"
+        );
+        assert_eq!(
+            desktop_wire_session_event_to_runtime_event(wire),
+            Some(event.clone()),
+            "{event:?} should round trip through the worker wire unchanged"
+        );
+    }
+}
+
+#[test]
+fn worker_hosted_reasoning_reaches_the_transcript() {
+    let mut app = SingleSessionApp::new(None);
+    let wire = desktop_session_event_to_wire(&session_launch::DesktopSessionEvent::ReasoningDelta(
+        "inspecting the bridge".to_string(),
+    ));
+    let event = desktop_wire_session_event_to_runtime_event(wire)
+        .expect("reasoning must survive the worker wire");
+    app.apply_session_event(event);
+
+    let body = app.body_lines();
+    assert!(
+        body.iter()
+            .any(|line| line.contains("inspecting the bridge")),
+        "worker-hosted sessions should show thinking live too, got {body:?}"
+    );
+}
+
+#[test]
 fn desktop_app_worker_relaunch_replaces_existing_process_role() {
     let relaunch = DesktopRelaunch {
         binary: PathBuf::from("/tmp/jcode-desktop"),
@@ -591,22 +647,54 @@ fn desktop_reload_window_placement_rejects_invalid_values() {
 }
 
 #[test]
+fn desktop_reload_window_placement_roundtrips_through_handoff_file() -> Result<()> {
+    let dir = unique_desktop_test_dir("desktop-reload-placement")?;
+    let placement_file = dir.join("placement");
+    let placement = DesktopReloadWindowPlacement {
+        position: Some(PhysicalPosition::new(320, 180)),
+        inner_size: PhysicalSize::new(1440, 900),
+    };
+
+    write_desktop_reload_window_placement(&placement_file, placement)?;
+
+    assert_eq!(
+        read_desktop_reload_window_placement(&placement_file),
+        Some(placement)
+    );
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
 fn desktop_reload_handoff_watcher_releases_ready_child() -> Result<()> {
     let dir = desktop_reload_handoff_temp_dir();
     std::fs::create_dir_all(&dir)?;
     let ready_file = dir.join("ready");
     let release_file = dir.join("release");
+    let placement_file = dir.join("placement");
     let watcher = DesktopReloadHandoffWatcher {
         ready_file: ready_file.clone(),
         release_file: release_file.clone(),
+        placement_file,
         spawned_at: Instant::now(),
     };
 
     assert_eq!(watcher.poll()?, DesktopReloadHandoffPoll::Waiting);
     std::fs::write(&ready_file, b"ready")?;
+    let final_placement = DesktopReloadWindowPlacement {
+        position: Some(PhysicalPosition::new(640, 360)),
+        inner_size: PhysicalSize::new(1600, 1000),
+    };
 
-    assert_eq!(watcher.poll()?, DesktopReloadHandoffPoll::Ready);
+    assert_eq!(
+        watcher.poll_with_placement(Some(final_placement))?,
+        DesktopReloadHandoffPoll::Ready
+    );
     assert!(release_file.exists());
+    assert_eq!(
+        read_desktop_reload_window_placement(&watcher.placement_file),
+        Some(final_placement)
+    );
 
     watcher.cleanup();
     assert!(!dir.exists());
@@ -699,6 +787,249 @@ fn desktop_background_wake_only_tracks_active_frame_animation() {
     );
     assert_eq!(desktop_background_wake(now, true, false), None);
     assert_eq!(desktop_background_wake(now, false, true), None);
+}
+
+#[test]
+fn automatic_redraw_requires_a_visible_renderable_surface_and_elapsed_timeout() {
+    let now = Instant::now();
+    let timeout_deadline = now + SURFACE_TIMEOUT_BACKOFF_MIN;
+
+    assert!(desktop_automatic_redraw_allowed(now, true, false, None));
+    assert!(!desktop_automatic_redraw_allowed(now, false, false, None));
+    assert!(!desktop_automatic_redraw_allowed(now, true, true, None));
+    assert!(!desktop_automatic_redraw_allowed(
+        now,
+        true,
+        false,
+        Some(timeout_deadline),
+    ));
+    assert!(desktop_automatic_redraw_allowed(
+        timeout_deadline,
+        true,
+        false,
+        Some(timeout_deadline),
+    ));
+}
+
+#[test]
+fn surface_timeout_wake_parks_while_unrenderable_or_occluded() {
+    let redraw_at = Instant::now() + SURFACE_TIMEOUT_BACKOFF_MIN;
+
+    assert_eq!(
+        desktop_surface_timeout_wake(true, false, Some(redraw_at)),
+        Some(redraw_at)
+    );
+    assert_eq!(
+        desktop_surface_timeout_wake(false, false, Some(redraw_at)),
+        None
+    );
+    assert_eq!(
+        desktop_surface_timeout_wake(true, true, Some(redraw_at)),
+        None
+    );
+    assert_eq!(desktop_surface_timeout_wake(true, false, None), None);
+}
+
+#[test]
+fn automatic_redraw_state_defers_and_coalesces_until_rendering_is_allowed() {
+    let mut redraw = AutomaticRedrawState::default();
+
+    assert!(!redraw.schedule(false));
+    assert!(redraw.pending);
+    assert!(!redraw.request_outstanding);
+    assert!(!redraw.request_pending(false));
+
+    assert!(redraw.request_pending(true));
+    assert!(redraw.request_outstanding);
+    assert!(
+        !redraw.schedule(true),
+        "an outstanding redraw must coalesce"
+    );
+
+    redraw.park();
+    assert!(redraw.pending, "parking must preserve pending work");
+    assert!(
+        !redraw.request_outstanding,
+        "parking must forget a request the platform may drop"
+    );
+    assert!(redraw.request_pending(true));
+
+    redraw.begin_redraw(false);
+    assert!(redraw.pending, "a gated redraw must preserve pending work");
+    assert!(!redraw.request_outstanding);
+    assert!(redraw.request_pending(true));
+
+    redraw.begin_redraw(true);
+    assert!(!redraw.pending, "a renderable frame consumes pending work");
+    assert!(!redraw.request_outstanding);
+    assert!(!redraw.request_pending(true));
+}
+
+#[test]
+fn surface_timeout_gate_defers_every_automatic_request_until_deadline() {
+    let now = Instant::now();
+    let redraw_at = now + SURFACE_TIMEOUT_BACKOFF_MIN;
+    let mut redraw = AutomaticRedrawState::default();
+
+    let allowed_before_deadline =
+        desktop_automatic_redraw_allowed(now, true, false, Some(redraw_at));
+    assert!(!redraw.schedule(allowed_before_deadline));
+    assert!(redraw.pending);
+
+    let allowed_at_deadline =
+        desktop_automatic_redraw_allowed(redraw_at, true, false, Some(redraw_at));
+    assert!(redraw.request_pending(allowed_at_deadline));
+}
+
+#[test]
+fn pending_backend_redraw_survives_zero_size_until_a_renderable_frame() {
+    let requested_at = Instant::now();
+    let mut pending = Some(requested_at);
+
+    assert_eq!(
+        consume_pending_backend_redraw_for_render(false, &mut pending),
+        None
+    );
+    assert_eq!(pending, Some(requested_at));
+    assert_eq!(
+        consume_pending_backend_redraw_for_render(true, &mut pending),
+        Some(requested_at)
+    );
+    assert_eq!(pending, None);
+}
+
+#[test]
+fn next_animation_redraw_paces_frame_scroll_and_space_hold_at_sixteen_ms() {
+    let now = Instant::now();
+    let expected = Some(now + DESKTOP_ANIMATION_FRAME_INTERVAL);
+
+    assert_eq!(
+        next_animation_redraw_at(now, true, false, false, true),
+        expected
+    );
+    assert_eq!(
+        next_animation_redraw_at(now, false, true, false, true),
+        expected
+    );
+    assert_eq!(
+        next_animation_redraw_at(now, false, false, true, true),
+        expected
+    );
+    // Once the animation settles, no further redraw is scheduled and the loop
+    // can park on ControlFlow::Wait.
+    assert_eq!(
+        next_animation_redraw_at(now, false, false, false, true),
+        None
+    );
+    // Occlusion and surface timeout gating suppress every automatic animation
+    // source until automatic redraws become eligible again.
+    assert_eq!(next_animation_redraw_at(now, true, true, true, false), None);
+    // The pacing interval must be positive; a zero interval would reintroduce
+    // the busy-spin it exists to prevent.
+    assert_eq!(DESKTOP_ANIMATION_FRAME_INTERVAL, Duration::from_millis(16));
+    assert!(DESKTOP_ANIMATION_FRAME_INTERVAL > Duration::ZERO);
+}
+
+#[test]
+fn hero_reveal_worker_count_falls_back_to_serial_for_small_images() {
+    // Tiny images should not pay thread-spawn overhead.
+    assert_eq!(hero_reveal_worker_count(0), 1);
+    assert_eq!(hero_reveal_worker_count(1024), 1);
+    // Large images should use more than one worker when parallelism is available.
+    let big = hero_reveal_worker_count(8 * 1024 * 1024);
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    assert!(big >= 1);
+    assert!(big <= available.max(1));
+}
+
+#[test]
+fn fill_hero_reveal_values_matches_serial_reference() {
+    let width = 64_u32;
+    let height = 48_u32;
+    let alpha_bounds = HeroMaskPixelBounds {
+        min_x: 4,
+        min_y: 4,
+        max_x: width - 4,
+        max_y: height - 4,
+    };
+    // A handful of normalized stroke segments tracing a rough path.
+    let segments = vec![
+        WelcomeHeroStrokeSegment {
+            start: [0.1, 0.2],
+            end: [0.4, 0.5],
+            start_progress: 0.0,
+            end_progress: 0.4,
+        },
+        WelcomeHeroStrokeSegment {
+            start: [0.4, 0.5],
+            end: [0.8, 0.3],
+            start_progress: 0.4,
+            end_progress: 0.8,
+        },
+        WelcomeHeroStrokeSegment {
+            start: [0.8, 0.3],
+            end: [0.9, 0.9],
+            start_progress: 0.8,
+            end_progress: 1.0,
+        },
+    ];
+    // Mark a checkerboard of lit pixels so both branches exercise lit/unlit.
+    let mut glyph_rgba = vec![0_u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            if (x + y) % 3 == 0 {
+                let index = ((y * width + x) * 4) as usize;
+                glyph_rgba[index] = 200;
+            }
+        }
+    }
+    let brush_delay_px = (alpha_bounds.height() * 0.10).max(5.0);
+
+    // Serial reference computed directly here.
+    let mut expected = vec![1.0_f32; (width * height) as usize];
+    let mut expected_min = f32::INFINITY;
+    let mut expected_max = 0.0_f32;
+    for y in 0..height {
+        for x in 0..width {
+            let pixel_index = (y * width + x) as usize;
+            if glyph_rgba[pixel_index * 4] <= 2 {
+                continue;
+            }
+            let (path_progress, distance) = nearest_hero_stroke_progress(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                alpha_bounds,
+                &segments,
+            );
+            let width_delay = (distance / brush_delay_px).min(1.0) * 0.045;
+            let value = (path_progress + width_delay).clamp(0.0, 1.0);
+            expected[pixel_index] = value;
+            expected_min = expected_min.min(value);
+            expected_max = expected_max.max(value);
+        }
+    }
+
+    // The parallel implementation must produce bit-identical output regardless
+    // of how many worker threads it chose.
+    let mut actual = vec![1.0_f32; (width * height) as usize];
+    let (actual_min, actual_max) = fill_hero_reveal_values(
+        &mut actual,
+        width,
+        height,
+        &glyph_rgba,
+        alpha_bounds,
+        &segments,
+        brush_delay_px,
+    );
+
+    assert_eq!(
+        actual, expected,
+        "parallel hero reveal fill must match serial"
+    );
+    assert_eq!(actual_min.to_bits(), expected_min.to_bits());
+    assert_eq!(actual_max.to_bits(), expected_max.to_bits());
 }
 
 #[test]
@@ -1814,16 +2145,18 @@ fn single_session_vertices_do_not_draw_input_underline() {
 }
 
 #[test]
-fn single_session_vertices_draw_composer_chrome_and_submit_affordance() {
+fn single_session_vertices_draw_borderless_composer_and_submit_affordance() {
     let size = PhysicalSize::new(900, 700);
     let empty_app = SingleSessionApp::new(None);
     let empty_vertices = build_single_session_vertices(&empty_app, size, 0.0, 0);
 
-    assert!(vertices_have_color(
+    const REMOVED_COMPOSER_CARD_BACKGROUND_COLOR: [f32; 4] = [0.990, 0.994, 1.000, 0.420];
+
+    assert!(!vertices_have_color(
         &empty_vertices,
-        COMPOSER_CARD_BACKGROUND_COLOR
+        REMOVED_COMPOSER_CARD_BACKGROUND_COLOR
     ));
-    assert!(vertices_have_rgb(
+    assert!(!vertices_have_rgb(
         &empty_vertices,
         COMPOSER_FOCUS_RING_COLOR
     ));
@@ -1840,9 +2173,9 @@ fn single_session_vertices_draw_composer_chrome_and_submit_affordance() {
     typed_app.handle_key(KeyInput::Character("ship it".to_string()));
     let typed_vertices = build_single_session_vertices(&typed_app, size, 0.0, 0);
 
-    assert!(vertices_have_color(
+    assert!(!vertices_have_color(
         &typed_vertices,
-        COMPOSER_CARD_BACKGROUND_COLOR
+        REMOVED_COMPOSER_CARD_BACKGROUND_COLOR
     ));
     assert!(vertices_have_color(
         &typed_vertices,
@@ -1991,9 +2324,9 @@ fn single_session_active_work_uses_streaming_activity_cue_geometry() {
     let idle = build_single_session_vertices(&app, PhysicalSize::new(900, 700), 0.0, 0);
     assert!(!vertices_have_rgb(&idle, NATIVE_SPINNER_HEAD_COLOR));
 
-    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
-        "streaming".to_string(),
-    ));
+    // Pre-token: the activity pill (with pulsing dots) shows while waiting for
+    // the first streamed token.
+    app.is_processing = true;
     let tick_zero = build_single_session_vertices(&app, PhysicalSize::new(900, 700), 0.0, 0);
     let tick_one = build_single_session_vertices(&app, PhysicalSize::new(900, 700), 0.0, 1);
 
@@ -2036,6 +2369,21 @@ fn single_session_active_work_uses_streaming_activity_cue_geometry() {
     assert!(
         (26.0..=34.1).contains(&pill_width),
         "activity cue pill should stay compact, got {pill_bounds:?}"
+    );
+
+    // Once text streams, the pill yields to the tail cursor at the end of the
+    // revealed text.
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "streaming".to_string(),
+    ));
+    let streaming = build_single_session_vertices(&app, PhysicalSize::new(900, 700), 0.0, 0);
+    assert!(
+        !vertices_have_color(&streaming, STREAMING_ACTIVITY_PILL_COLOR),
+        "activity pill should hide once tokens stream"
+    );
+    assert!(
+        vertices_have_rgb(&streaming, STREAMING_TAIL_CURSOR_COLOR),
+        "streaming tail cursor should render at the end of the streamed text"
     );
 }
 
@@ -2093,9 +2441,7 @@ fn single_session_motion_geometry_survives_resize_and_text_scale_changes() {
     }
 
     let mut activity_app = SingleSessionApp::new(None);
-    activity_app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
-        "streaming answer".to_string(),
-    ));
+    activity_app.is_processing = true;
     assert_case(
         "activity cue",
         activity_app,
@@ -2110,10 +2456,7 @@ fn single_session_motion_geometry_survives_resize_and_text_scale_changes() {
     assert_case(
         "composer attachments",
         attachments_app,
-        &[
-            COMPOSER_CARD_BACKGROUND_COLOR,
-            ATTACHMENT_CHIP_BACKGROUND_COLOR,
-        ],
+        &[ATTACHMENT_CHIP_BACKGROUND_COLOR],
     );
 
     let mut stdin_app = SingleSessionApp::new(None);
@@ -3205,7 +3548,8 @@ fn single_session_status_slash_opens_inline_session_info() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(info.contains("fresh / not started"));
-    assert!(info.contains("tokens"));
+    assert!(info.contains("status"));
+    assert!(info.contains("model"));
 }
 
 #[test]
@@ -4191,6 +4535,10 @@ fn desktop_maps_terminal_editing_shortcuts_from_tui() {
         KeyInput::DeletePreviousWord
     );
     assert_eq!(
+        to_key_input(&Key::Named(NamedKey::Backspace), ModifiersState::SUPER),
+        KeyInput::DeletePreviousWord
+    );
+    assert_eq!(
         to_key_input(&Key::Named(NamedKey::ArrowUp), ModifiersState::CONTROL),
         KeyInput::RetrieveQueuedDraft
     );
@@ -4312,11 +4660,11 @@ fn desktop_maps_remaining_global_shortcuts() {
     );
     assert_eq!(
         to_key_input(&Key::Character("k".into()), ModifiersState::SUPER),
-        KeyInput::ScrollBodyLines(1)
+        KeyInput::JumpPrompt(-1)
     );
     assert_eq!(
         to_key_input(&Key::Character("j".into()), ModifiersState::SUPER),
-        KeyInput::ScrollBodyLines(-1)
+        KeyInput::JumpPrompt(1)
     );
     assert_eq!(
         to_key_input(&Key::Character("[".into()), ModifiersState::CONTROL),
@@ -4339,6 +4687,14 @@ fn desktop_maps_remaining_global_shortcuts() {
             ModifiersState::CONTROL | ModifiersState::SHIFT
         ),
         KeyInput::CopyTranscript
+    );
+    assert_eq!(
+        to_key_input(&Key::Character(";".into()), ModifiersState::SUPER),
+        KeyInput::SpawnSelfDevSession
+    );
+    assert_eq!(
+        to_key_input(&Key::Character("'".into()), ModifiersState::SUPER),
+        KeyInput::SpawnHomeSession
     );
     assert_eq!(
         to_key_input(&Key::Character("q".into()), ModifiersState::CONTROL),
@@ -6438,7 +6794,21 @@ fn single_session_hotkey_help_toggles_discoverable_shortcuts() {
         "jump between user prompts"
     ));
     assert!(help_has_shortcut(&help, "Ctrl+Home/End", "jump transcript"));
-    assert!(help_has_shortcut(&help, "Super+K/J", "scroll transcript"));
+    assert!(help_has_shortcut(
+        &help,
+        "Super+K/J",
+        "jump between user prompts"
+    ));
+    assert!(help_has_shortcut(
+        &help,
+        "Super+;",
+        "spawn a self-dev jcode session"
+    ));
+    assert!(help_has_shortcut(
+        &help,
+        "Super+'",
+        "spawn a jcode session in home"
+    ));
     assert!(help_has_shortcut(
         &help,
         "Ctrl+Shift+K",
@@ -6726,8 +7096,8 @@ fn single_session_model_picker_loads_filters_and_selects_model() {
     assert!(picker.contains("Current  Claude · claude-sonnet-4-5"));
     assert!(picker.contains("type to filter"));
     assert!(picker.contains("2 models"));
-    assert!(picker.contains("      claude-sonnet-4-5"));
-    assert!(picker.contains("      claude-opus-4-5"));
+    assert!(picker.contains("   claude-sonnet-4-5"));
+    assert!(picker.contains("   claude-opus-4-5"));
     assert!(picker.contains("Anthropic"));
     assert!(picker.contains("claude-oauth"));
 
@@ -6864,6 +7234,82 @@ fn single_session_model_picker_filter_supports_fuzzy_abbreviations() {
     assert!(picker.contains("filter \"g5c\""));
     assert!(picker.contains("gpt-5-codex"), "{picker}");
     assert!(!picker.contains("claude-opus-4-5"), "{picker}");
+}
+
+#[test]
+fn single_session_model_picker_filter_tolerates_transposed_typo() {
+    let mut app = SingleSessionApp::new(None);
+    assert_eq!(
+        app.handle_key(KeyInput::OpenModelPicker),
+        KeyOutcome::LoadModelCatalog
+    );
+    app.apply_session_event(session_launch::DesktopSessionEvent::ModelCatalog {
+        current_model: None,
+        provider_name: Some("OpenAI".to_string()),
+        models: vec![
+            session_launch::DesktopModelChoice {
+                model: "gpt-5-codex".to_string(),
+                provider: Some("openai".to_string()),
+                api_method: Some("responses".to_string()),
+                detail: Some("coding model".to_string()),
+                available: true,
+            },
+            session_launch::DesktopModelChoice {
+                model: "claude-opus-4-5".to_string(),
+                provider: Some("Anthropic".to_string()),
+                api_method: Some("claude-oauth".to_string()),
+                detail: Some("premium".to_string()),
+                available: true,
+            },
+        ],
+        reasoning_effort: None,
+        service_tier: None,
+        compaction_mode: None,
+    });
+
+    assert_eq!(
+        app.handle_key(KeyInput::Character("codxe".to_string())),
+        KeyOutcome::Redraw
+    );
+    assert_eq!(app.model_picker.filtered_indices(), &[0]);
+}
+
+#[test]
+fn single_session_model_picker_exact_match_outranks_longer_prefix() {
+    let mut app = SingleSessionApp::new(None);
+    assert_eq!(
+        app.handle_key(KeyInput::OpenModelPicker),
+        KeyOutcome::LoadModelCatalog
+    );
+    app.apply_session_event(session_launch::DesktopSessionEvent::ModelCatalog {
+        current_model: None,
+        provider_name: Some("OpenAI".to_string()),
+        models: vec![
+            session_launch::DesktopModelChoice {
+                model: "gpt-5.5".to_string(),
+                provider: Some("openai".to_string()),
+                api_method: Some("responses".to_string()),
+                detail: None,
+                available: true,
+            },
+            session_launch::DesktopModelChoice {
+                model: "gpt-5".to_string(),
+                provider: Some("openai".to_string()),
+                api_method: Some("responses".to_string()),
+                detail: None,
+                available: true,
+            },
+        ],
+        reasoning_effort: None,
+        service_tier: None,
+        compaction_mode: None,
+    });
+
+    assert_eq!(
+        app.handle_key(KeyInput::Character("gpt-5".to_string())),
+        KeyOutcome::Redraw
+    );
+    assert_eq!(app.model_picker.filtered_indices(), &[1, 0]);
 }
 
 #[test]
@@ -7330,6 +7776,25 @@ fn single_session_session_switcher_filter_supports_fuzzy_abbreviations() {
 }
 
 #[test]
+fn single_session_session_switcher_filter_tolerates_transposed_typo() {
+    let mut app = SingleSessionApp::new(None);
+    assert_eq!(
+        app.handle_key(KeyInput::OpenSessionSwitcher),
+        KeyOutcome::LoadSessionSwitcher
+    );
+    app.apply_session_switcher_cards(vec![
+        test_session_card("session_alpha", "alpha-notes", "active"),
+        test_session_card("session_ticket", "ticket-workspace", "closed"),
+    ]);
+
+    assert_eq!(
+        app.handle_key(KeyInput::Character("tikcet".to_string())),
+        KeyOutcome::Redraw
+    );
+    assert_eq!(app.session_switcher.filtered_indices(), &[1]);
+}
+
+#[test]
 fn single_session_session_switcher_filter_reports_visible_match_count() {
     let mut app = SingleSessionApp::new(None);
     assert_eq!(
@@ -7507,6 +7972,48 @@ fn single_session_resume_picker_accepts_vim_navigation_keys() {
     );
     assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
     assert_eq!(app.live_session_id.as_deref(), Some("session_beta"));
+}
+
+#[test]
+fn switcher_resume_defers_transcript_hydration_off_key_path() {
+    let mut app = SingleSessionApp::new(None);
+    assert_eq!(
+        app.handle_key(KeyInput::OpenSessionSwitcher),
+        KeyOutcome::LoadSessionSwitcher
+    );
+    app.apply_session_switcher_cards(vec![test_session_card("session_alpha", "alpha", "active")]);
+
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert_eq!(app.live_session_id.as_deref(), Some("session_alpha"));
+    assert_eq!(
+        app.take_pending_transcript_hydration().as_deref(),
+        Some("session_alpha"),
+        "switcher resume should queue hydration for the event loop instead of \
+         blocking the key handler on a disk parse"
+    );
+    assert_eq!(app.take_pending_transcript_hydration(), None);
+
+    // A hydrated transcript for the live session applies...
+    let applied = app.apply_hydrated_transcript(
+        "session_alpha",
+        Ok(Some(vec![session_data::SessionTranscriptMessage {
+            role: "user".to_string(),
+            content: "hydrated prompt".to_string(),
+        }])),
+    );
+    assert!(applied);
+    assert!(app.body_lines().join("\n").contains("hydrated prompt"));
+
+    // ...but a stale result for a different session is dropped.
+    let stale = app.apply_hydrated_transcript(
+        "session_other",
+        Ok(Some(vec![session_data::SessionTranscriptMessage {
+            role: "user".to_string(),
+            content: "stale prompt".to_string(),
+        }])),
+    );
+    assert!(!stale);
+    assert!(!app.body_lines().join("\n").contains("stale prompt"));
 }
 
 #[test]
@@ -8644,9 +9151,29 @@ fn headless_chat_smoke_message_parses_hidden_flag() {
 }
 
 #[test]
+fn desktop_user_facing_surfaces_are_marked_beta() {
+    // Window/status titles, help text, and in-app version labels must all
+    // carry the beta channel until the desktop app graduates.
+    assert!(DESKTOP_PRODUCT_NAME.contains("Beta"));
+    assert!(desktop_help_text().contains("Beta"));
+    assert!(SingleSessionApp::new(None).status_title().contains("Beta"));
+    assert!(
+        crate::single_session_render::desktop_header_version_label()
+            .starts_with(DESKTOP_RELEASE_CHANNEL)
+    );
+    assert!(
+        crate::single_session_render::fresh_welcome_version_label()
+            .starts_with(DESKTOP_RELEASE_CHANNEL)
+    );
+    let workspace = workspace::Workspace::fake();
+    assert!(workspace.status_title().contains("Beta"));
+}
+
+#[test]
 fn desktop_help_text_documents_desktop_options() {
     let help = desktop_help_text();
 
+    assert!(help.starts_with(DESKTOP_PRODUCT_NAME));
     assert!(help.contains("Usage:"));
     assert!(help.contains("--fullscreen"));
     assert!(help.contains("--workspace"));
@@ -9241,9 +9768,15 @@ fn fresh_welcome_model_picker_only_reserves_inline_lane() {
         inline_area.top,
         version_area.bounds.bottom
     );
+    // The welcome hero/version chrome is shifted up by the welcome timeline
+    // offset while an inline widget is open, so the unshifted
+    // handwritten_welcome_bounds cannot be compared against the inline area
+    // directly. The version label renders below the hero with the same
+    // offset applied, so staying below its bounds keeps the picker clear of
+    // the hero as well (asserted above against version_area).
     assert!(
-        inline_area.top > handwritten_welcome_bounds(size).1[1],
-        "fresh inline picker must not overlap the handwritten welcome hero"
+        inline_area.top >= version_area.bounds.bottom as f32,
+        "fresh inline picker must stay below the offset welcome chrome"
     );
     assert!(
         inline_area.bounds.bottom > inline_area.bounds.top,
@@ -9251,7 +9784,7 @@ fn fresh_welcome_model_picker_only_reserves_inline_lane() {
     );
 
     let vertices = build_single_session_vertices(&app, size, 0.0, 0);
-    let inline_card_vertices = positions_for_color(&vertices, [0.982, 0.990, 1.000, 0.82]);
+    let inline_card_vertices = positions_for_color(&vertices, MODEL_PICKER_CARD_BACKGROUND_COLOR);
     assert!(
         !inline_card_vertices.is_empty(),
         "inline picker should draw a rounded card background"
@@ -9293,7 +9826,7 @@ fn inline_widget_card_never_overlaps_body_clip_during_reveal() {
     for size in sizes {
         let body_base_bottom = single_session_body_bottom(size);
         for kind in kinds {
-            let visible_lines = kind.visible_line_limit().min(8).max(1);
+            let visible_lines = kind.visible_line_limit().clamp(1, 8);
             for activity_reserved_height in [0.0, 22.0] {
                 for reveal_progress in reveal_steps {
                     let Some((body_bottom, card_top)) =
@@ -9459,7 +9992,7 @@ fn long_transcript_keeps_welcome_visual_only() {
 fn single_session_without_session_is_native_fresh_draft() {
     let mut app = SingleSessionApp::new(None);
 
-    assert_eq!(app.status_title(), "Jcode · fresh session");
+    assert_eq!(app.status_title(), "Jcode Desktop (Beta) · fresh session");
     assert!(!app.status_title().contains("Enter send"));
     assert!(!app.status_title().contains("Ctrl+"));
     assert_eq!(

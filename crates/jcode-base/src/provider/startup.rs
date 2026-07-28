@@ -2,6 +2,7 @@ use super::*;
 
 impl MultiProvider {
     pub(super) fn spawn_post_auth_model_refresh(
+        &self,
         provider: Arc<dyn Provider>,
         provider_label: &'static str,
     ) {
@@ -14,24 +15,41 @@ impl MultiProvider {
             return;
         };
 
+        self.post_auth_refreshes_pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let pending = Arc::clone(&self.post_auth_refreshes_pending);
+
         handle.spawn(async move {
+            struct PendingGuard(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for PendingGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+            }
+            let _pending_guard = PendingGuard(pending);
+            let refresh_started = std::time::Instant::now();
             crate::logging::auth_event("post_auth_model_refresh_started", provider_label, &[]);
             provider.invalidate_credentials().await;
             match provider.prefetch_models().await {
                 Ok(()) => {
+                    let duration_ms = refresh_started.elapsed().as_millis().to_string();
                     crate::logging::auth_event(
                         "post_auth_model_refresh_completed",
                         provider_label,
-                        &[],
+                        &[("duration_ms", duration_ms.as_str())],
                     );
                     crate::bus::Bus::global().publish_models_updated();
                 }
                 Err(err) => {
                     let reason = err.to_string();
+                    let duration_ms = refresh_started.elapsed().as_millis().to_string();
                     crate::logging::auth_event(
                         "post_auth_model_refresh_failed",
                         provider_label,
-                        &[("reason", reason.as_str())],
+                        &[
+                            ("reason", reason.as_str()),
+                            ("duration_ms", duration_ms.as_str()),
+                        ],
                     );
                     crate::logging::info(&format!(
                         "Failed to refresh {} models after auth change: {}",
@@ -99,13 +117,13 @@ impl MultiProvider {
         let has_openai_creds = auth::codex::load_credentials().is_ok();
         let has_copilot_api = provider_state.auth_status().copilot_has_api_token;
         let has_antigravity_creds = auth::antigravity::load_tokens().is_ok();
-        let has_gemini_creds = auth::gemini::load_tokens().is_ok();
+        let has_gemini_creds = auth::gemini::load_tokens().is_ok() || auth::gemini::has_api_key();
         let has_cursor_creds = provider_state
             .auth_status()
             .assessment_for_provider(crate::provider_catalog::CURSOR_LOGIN_PROVIDER)
             .is_available();
         let has_bedrock_creds = bedrock::BedrockProvider::has_credentials();
-        let has_openrouter_creds = openrouter::OpenRouterProvider::has_credentials();
+        let has_openrouter_creds = openrouter::has_credentials();
 
         let use_claude_cli = std::env::var("JCODE_USE_CLAUDE_CLI")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -120,71 +138,56 @@ impl MultiProvider {
             crate::logging::info(
                 "Using deprecated Claude CLI provider (forced by JCODE_USE_CLAUDE_CLI=1)",
             );
-            Some(Arc::new(claude::ClaudeProvider::new()))
+            external::instantiate_expected_external_provider(external::CLAUDE_CLI_RUNTIME)
         } else {
             None
         };
 
         let anthropic = if has_claude_creds && !use_claude_cli {
-            Some(Arc::new(anthropic::AnthropicProvider::new()))
+            external::instantiate_expected_external_provider(external::ANTHROPIC_RUNTIME)
         } else {
             None
         };
 
         let openai = if has_openai_creds {
-            auth::codex::load_credentials()
-                .ok()
-                .map(openai::OpenAIProvider::new)
-                .map(Arc::new)
+            external::instantiate_expected_external_provider(external::OPENAI_RUNTIME)
         } else {
             None
         };
 
         let copilot_api = if has_copilot_api {
+            // The composition-root factory handles construction, tier-detection
+            // scheduling (eager vs non-interactive deferral), and init-done
+            // signaling; None means credentials were missing or invalid.
             let copilot_init_start = std::time::Instant::now();
-            match copilot::CopilotApiProvider::new() {
-                Ok(p) => {
-                    crate::logging::info(&format!(
-                        "Copilot API provider initialized (direct API) in {}ms",
-                        copilot_init_start.elapsed().as_millis()
-                    ));
-                    let provider = Arc::new(p);
-                    if should_eager_detect_copilot_tier() {
-                        let p_clone = provider.clone();
-                        tokio::spawn(async move {
-                            p_clone.detect_tier_and_set_default().await;
-                        });
-                    } else {
-                        crate::logging::info(
-                            "Deferring Copilot tier detection during non-interactive startup",
-                        );
-                        provider.complete_init_without_tier_detection();
-                    }
-                    Some(provider)
-                }
-                Err(e) => {
-                    crate::logging::info(&format!("Failed to initialize Copilot API: {}", e));
-                    None
-                }
+            let provider =
+                external::instantiate_expected_external_provider(external::COPILOT_RUNTIME);
+            match &provider {
+                Some(_) => crate::logging::info(&format!(
+                    "Copilot API provider initialized (direct API) in {}ms",
+                    copilot_init_start.elapsed().as_millis()
+                )),
+                None => crate::logging::info("Failed to initialize Copilot API (no credentials)"),
             }
+            provider
         } else {
             None
         };
 
         let antigravity_provider = if has_antigravity_creds {
-            Some(Arc::new(antigravity::AntigravityProvider::new()))
+            external::instantiate_expected_external_provider(external::ANTIGRAVITY_RUNTIME)
         } else {
             None
         };
 
         let gemini_provider = if has_gemini_creds {
-            Some(Arc::new(gemini::GeminiProvider::new()))
+            external::instantiate_expected_external_provider(external::GEMINI_RUNTIME)
         } else {
             None
         };
 
         let cursor_provider = if has_cursor_creds {
-            Some(Arc::new(cursor::CursorCliProvider::new()))
+            external::instantiate_expected_external_provider(external::CURSOR_RUNTIME)
         } else {
             None
         };
@@ -199,20 +202,19 @@ impl MultiProvider {
             let named_profile = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
                 .ok()
                 .or_else(|| default_named_provider_profile.clone());
-            let provider_result = if let Some(profile_name) = named_profile.as_deref() {
-                if let Some(profile) = cfg.providers.get(profile_name) {
-                    openrouter::OpenRouterProvider::new_named_openai_compatible(
-                        profile_name,
-                        profile,
-                    )
-                } else {
-                    openrouter::OpenRouterProvider::new()
-                }
-            } else {
-                openrouter::OpenRouterProvider::new()
-            };
-            match provider_result {
-                Ok(p) => Some(Arc::new(p)),
+            let spec = named_profile
+                .as_deref()
+                .and_then(|profile_name| {
+                    cfg.providers.get(profile_name).map(|profile| {
+                        external::OpenRouterRuntimeSpec::NamedProfile {
+                            name: profile_name.to_string(),
+                            config: profile.clone(),
+                        }
+                    })
+                })
+                .unwrap_or(external::OpenRouterRuntimeSpec::Default);
+            match external::instantiate_openrouter_runtime(spec) {
+                Ok(p) => Some(p),
                 Err(e) => {
                     crate::logging::info(&format!("Failed to initialize OpenRouter: {}", e));
                     None
@@ -245,25 +247,25 @@ impl MultiProvider {
             );
         }
 
-        let forced_provider = Self::forced_provider_from_env();
-        if let Some(forced) = forced_provider {
-            active = forced;
-            let is_configured = availability.is_configured(forced);
+        let initial_provider = Self::initial_provider_from_env();
+        if let Some(initial) = initial_provider {
+            active = initial;
+            let is_configured = availability.is_configured(initial);
             if is_configured {
-                let display = if matches!(forced, ActiveProvider::OpenRouter) {
+                let display = if matches!(initial, ActiveProvider::OpenRouter) {
                     crate::provider_catalog::active_openai_compatible_display_name()
-                        .unwrap_or_else(|| Self::provider_key(forced).to_string())
+                        .unwrap_or_else(|| Self::provider_key(initial).to_string())
                 } else {
-                    Self::provider_key(forced).to_string()
+                    Self::provider_key(initial).to_string()
                 };
                 crate::logging::info(&format!(
-                    "Using forced provider '{}' from CLI/environment",
+                    "Using initial provider '{}' from CLI/environment",
                     display
                 ));
             } else {
                 crate::logging::warn(&format!(
-                    "Forced provider '{}' is not configured; requests will fail until credentials are available",
-                    Self::provider_key(forced)
+                    "Initial provider '{}' is not configured; requests will fail until credentials are available or another model is selected",
+                    Self::provider_key(initial)
                 ));
             }
         } else if let Some(pref) = provider_state.default_provider_key() {
@@ -310,7 +312,9 @@ impl MultiProvider {
             active: RwLock::new(active),
             use_claude_cli,
             startup_notices: RwLock::new(Vec::new()),
-            forced_provider,
+            initial_provider,
+            routes_memo: Mutex::new(None),
+            post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         if let Some(model) = provider_state.default_model() {
@@ -441,7 +445,7 @@ impl MultiProvider {
     /// Create with explicit initial provider preference
     pub fn with_preference(prefer_openai: bool) -> Self {
         let provider = Self::new();
-        if provider.forced_provider.is_none()
+        if provider.initial_provider.is_none()
             && prefer_openai
             && provider.openai_provider().is_some()
         {
@@ -455,7 +459,7 @@ impl MultiProvider {
 
     pub fn with_preference_fast(prefer_openai: bool) -> Self {
         let provider = Self::new_fast();
-        if provider.forced_provider.is_none()
+        if provider.initial_provider.is_none()
             && prefer_openai
             && provider.openai_provider().is_some()
         {

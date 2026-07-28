@@ -30,6 +30,7 @@ fn member(session_id: &str, status: &str) -> SwarmMember {
         swarm_enabled: false,
         status: status.to_string(),
         detail: None,
+        task_label: None,
         friendly_name: None,
         report_back_to_session_id: None,
         latest_completion_report: None,
@@ -37,6 +38,10 @@ fn member(session_id: &str, status: &str) -> SwarmMember {
         joined_at: Instant::now(),
         last_status_change: Instant::now(),
         is_headless: false,
+        output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        runtime: crate::protocol::SwarmMemberRuntime::default(),
     }
 }
 
@@ -53,7 +58,7 @@ async fn receive_reload_signal_consumes_already_pending_value() {
 
     let signal = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        receive_reload_signal(&mut rx),
+        receive_reload_signal(&mut rx, &mut None),
     )
     .await
     .expect("pending signal should be observed immediately")
@@ -69,7 +74,7 @@ async fn receive_reload_signal_consumes_already_pending_value() {
 async fn receive_reload_signal_waits_for_future_value_when_initially_empty() {
     let (tx, mut rx) = watch::channel(None::<ReloadSignal>);
 
-    let waiter = tokio::spawn(async move { receive_reload_signal(&mut rx).await });
+    let waiter = tokio::spawn(async move { receive_reload_signal(&mut rx, &mut None).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     tx.send(Some(ReloadSignal {
@@ -574,5 +579,72 @@ async fn graceful_shutdown_sessions_times_out_and_proceeds() {
         started.elapsed() >= std::time::Duration::from_millis(50)
             && started.elapsed() < std::time::Duration::from_millis(250),
         "graceful shutdown should honor the timeout instead of waiting indefinitely"
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_sessions_times_out_on_partial_checkpoint() {
+    // One watched session checkpoints, the other never does. The wait must
+    // still terminate at the timeout instead of blocking on the laggard.
+    let sessions = Arc::new(RwLock::new(HashMap::new()));
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([
+        ("fast".to_string(), member("fast", "running")),
+        ("slow".to_string(), member("slow", "running")),
+    ])));
+    let fast_signal = InterruptSignal::new();
+    let slow_signal = InterruptSignal::new();
+    let shutdown_signals = Arc::new(RwLock::new(HashMap::from([
+        ("fast".to_string(), fast_signal.clone()),
+        ("slow".to_string(), slow_signal.clone()),
+    ])));
+    let (swarm_event_tx, _) = broadcast::channel(8);
+
+    let swarm_members_for_task = swarm_members.clone();
+    let swarm_event_tx_for_task = swarm_event_tx.clone();
+    let checkpoint_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        {
+            let mut members = swarm_members_for_task.write().await;
+            set_member_status(&mut members, "fast", "ready");
+        }
+        let _ = swarm_event_tx_for_task.send(SwarmEvent {
+            id: 1,
+            session_id: "fast".to_string(),
+            session_name: None,
+            swarm_id: None,
+            event: SwarmEventType::StatusChange {
+                old_status: "running".to_string(),
+                new_status: "ready".to_string(),
+            },
+            timestamp: Instant::now(),
+            absolute_time: std::time::SystemTime::now(),
+        });
+        // "slow" intentionally never leaves running.
+    });
+
+    let started = Instant::now();
+    graceful_shutdown_sessions_with_timeout(
+        "test-reload",
+        &sessions,
+        &swarm_members,
+        &shutdown_signals,
+        &swarm_event_tx,
+        std::time::Duration::from_millis(120),
+        None,
+    )
+    .await;
+    checkpoint_task.await.expect("checkpoint task");
+
+    assert!(fast_signal.is_set() && slow_signal.is_set());
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(120)
+            && started.elapsed() < std::time::Duration::from_millis(600),
+        "partial checkpoint must still honor the timeout, elapsed={:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        swarm_members.read().await.get("slow").expect("slow").status,
+        "running",
+        "the laggard session may remain running without blocking reload past the deadline"
     );
 }

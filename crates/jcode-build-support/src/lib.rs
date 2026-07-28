@@ -7,10 +7,10 @@ pub use paths::{
     SELFDEV_CARGO_PROFILE, binary_name, binary_stem, client_update_candidate,
     current_binary_build_time_string, current_binary_built_at, find_dev_binary,
     find_repo_in_ancestors, get_repo_dir, is_jcode_repo, launcher_binary_path, launcher_dir,
-    preferred_reload_candidate, release_binary_path, run_selfdev_build, selfdev_binary_path,
-    selfdev_build_command, selfdev_build_command_for_target, shared_server_update_candidate,
-    update_launcher_symlink_to_current, update_launcher_symlink_to_stable,
-    version_matches_installed_channel,
+    preferred_reload_candidate, release_binary_path, resolve_binary_payload, run_selfdev_build,
+    selfdev_binary_path, selfdev_build_command, selfdev_build_command_for_target,
+    shared_server_update_candidate, update_launcher_symlink_to_current,
+    update_launcher_symlink_to_stable, version_matches_installed_channel,
 };
 pub use source_state::{
     current_build_info, current_git_diff, current_git_hash, current_git_hash_full,
@@ -30,9 +30,11 @@ use anyhow::Result;
 use chrono::Utc;
 use jcode_storage as storage;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 pub use jcode_selfdev_types::{
@@ -763,6 +765,127 @@ pub fn advance_shared_server_if_tracking_stable(version: &str) -> Result<bool> {
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+/// Outcome of [`repair_stale_shared_server_channel`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedServerRepair {
+    /// The `shared-server` channel was repointed at the installed `stable`
+    /// release because stable was strictly newer on disk.
+    Repaired {
+        previous: Option<String>,
+        repaired_to: String,
+    },
+    /// Nothing to do: shared-server is already at/newer than stable, or there is
+    /// no usable stable target.
+    AlreadyCurrent,
+}
+
+/// Drag a *stale* `shared-server` channel forward to the installed `stable`
+/// release so a long-lived daemon can actually reload into a newer binary.
+///
+/// This is the client-side counterpart to [`advance_shared_server_if_tracking_stable`].
+/// Updates advance `stable` but only advance `shared-server` *during the install
+/// path*; a client that is already on the newest release (so `/update` is a
+/// no-op) never re-runs that install path, leaving a long-lived older daemon
+/// pinned to its old `shared-server` binary forever. A newer client that detects
+/// an older server calls this to repoint `shared-server` -> `stable` before
+/// asking the server to reload, so the forced reload has a strictly-newer target
+/// to exec into instead of re-execing the same old binary (the "current client,
+/// stale server" report).
+///
+/// Safety: we only repair when the `stable` binary is *strictly newer by mtime*
+/// than the current `shared-server` binary. That preserves a deliberately-pinned
+/// self-dev `shared-server` build whenever it is at least as fresh as stable (the
+/// case the pin exists to protect), and never downgrades the channel.
+pub fn repair_stale_shared_server_channel() -> Result<SharedServerRepair> {
+    let stable_version = read_stable_version()?;
+    let Some(stable_version) = stable_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(SharedServerRepair::AlreadyCurrent);
+    };
+
+    let stable_binary = stable_binary_path()?;
+    if !stable_binary.exists() {
+        return Ok(SharedServerRepair::AlreadyCurrent);
+    }
+
+    // If shared-server already resolves to the same version marker, there is
+    // nothing to repair.
+    let previous = read_shared_server_version()?;
+    if previous.as_deref().map(str::trim).filter(|s| !s.is_empty()) == Some(stable_version) {
+        return Ok(SharedServerRepair::AlreadyCurrent);
+    }
+    if previous
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|previous| !is_release_channel_marker(previous))
+    {
+        return Ok(SharedServerRepair::AlreadyCurrent);
+    }
+
+    // Only repair when stable is strictly newer than the current shared-server
+    // binary on disk. This never downgrades, and it preserves a self-dev pin
+    // that is fresher than stable.
+    let shared_binary = shared_server_binary_path()?;
+    if !shared_server_binary_is_strictly_older_than(&shared_binary, &stable_binary) {
+        return Ok(SharedServerRepair::AlreadyCurrent);
+    }
+
+    update_shared_server_symlink(stable_version)?;
+    Ok(SharedServerRepair::Repaired {
+        previous: previous
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        repaired_to: stable_version.to_string(),
+    })
+}
+
+fn is_release_channel_marker(marker: &str) -> bool {
+    let marker = marker.trim();
+    let marker = marker.strip_prefix('v').unwrap_or(marker);
+    marker.starts_with("main-")
+        || marker
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+/// True when `shared` exists and is strictly older (by mtime) than `stable`, or
+/// when `shared` is missing entirely (nothing to protect). Any mtime
+/// uncertainty on an existing shared binary is treated as "not older" so we
+/// never repair away an unverifiable (possibly newer) pinned build.
+///
+/// Both paths are resolved through [`resolve_binary_payload`] so release
+/// installs (wrapper script + `.bin` payload) compare the payloads that
+/// actually run instead of the tiny wrapper scripts, whose mtimes carry no
+/// version information.
+fn shared_server_binary_is_strictly_older_than(
+    shared: &std::path::Path,
+    stable: &std::path::Path,
+) -> bool {
+    let mtime = |p: &std::path::Path| {
+        std::fs::metadata(resolve_binary_payload(p))
+            .ok()
+            .and_then(|m| m.modified().ok())
+    };
+    let stable_mtime = match mtime(stable) {
+        Some(m) => m,
+        None => return false,
+    };
+    if !shared.exists() {
+        // No deliberate pin on disk; safe to point the channel at stable.
+        return true;
+    }
+    match mtime(shared) {
+        Some(shared_mtime) => shared_mtime < stable_mtime,
+        None => false,
     }
 }
 

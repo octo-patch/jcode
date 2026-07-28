@@ -15,9 +15,11 @@ mod memory_render;
 #[path = "info_widget_memory_utils.rs"]
 mod memory_utils;
 #[path = "info_widget_model.rs"]
-mod model;
+pub(crate) mod model;
 #[path = "info_widget_swarm_background.rs"]
 mod swarm_background;
+#[path = "info_widget_swarm_gallery.rs"]
+pub(crate) mod swarm_gallery;
 #[path = "info_widget_text.rs"]
 mod text;
 #[path = "info_widget_tips.rs"]
@@ -52,15 +54,13 @@ use unicode_width::UnicodeWidthStr;
 use git::{render_git_compact, render_git_widget};
 pub use graph::{GraphEdge, GraphNode, build_graph_topology, graph_node_score};
 pub(crate) use memory_utils::is_traceworthy_memory_event;
-use memory_utils::{
-    compact_memory_model_label, memory_active_summary, memory_last_trace_summary,
-    memory_state_detail,
-};
+use memory_utils::{memory_active_summary, memory_last_trace_summary, memory_state_detail};
 use model::{render_model_info, render_model_widget};
 use swarm_background::{render_background_compact, render_background_widget, render_swarm_widget};
 use text::{truncate_smart, truncate_with_ellipsis};
 pub(crate) use tips::occasional_status_tip;
 use tips::{render_tips_widget, tips_widget_height};
+pub(crate) use todos_render::swarm_plan_todos;
 use todos_render::{render_todos_compact, render_todos_expanded, render_todos_widget};
 #[cfg(test)]
 use usage_render::render_usage_pill;
@@ -85,7 +85,7 @@ pub enum WidgetKind {
     BackgroundTasks,
     /// Conversation context compaction status
     Compaction,
-    /// 5-hour/weekly subscription bars
+    /// Subscription quota bars
     UsageLimits,
     /// Session-level KV cache hit ratio
     KvCache,
@@ -261,6 +261,18 @@ pub struct SwarmInfo {
     pub session_names: Vec<String>,
     /// Swarm member lifecycle status updates
     pub members: Vec<SwarmMemberStatus>,
+    /// Agents this session manages (spawn-subtree filtered), shown in the
+    /// swarm dock widget. Empty = no dock.
+    pub managed_members: Vec<SwarmMemberStatus>,
+    /// Selected agent index in the dock (display order), mirrors the inline
+    /// swarm panel selection so both surfaces agree.
+    pub selected: usize,
+    /// Whether the swarm panel/dock has keyboard focus.
+    pub focused: bool,
+    /// Swarm plan progress (completed, running, total), when a plan is active.
+    pub plan_progress: Option<(u32, u32, u32)>,
+    /// Spinner frame for animating active agents' status glyphs.
+    pub spinner_frame: usize,
 }
 
 /// Background task status for the info widget
@@ -337,13 +349,17 @@ pub enum AuthMethod {
 pub struct UsageInfo {
     /// Which provider this usage is for
     pub provider: UsageProvider,
-    /// Five-hour window utilization (0.0-1.0) - for OAuth providers
+    /// Primary subscription window label. OpenAI reports this dynamically.
+    pub primary_limit_label: Option<String>,
+    /// Primary window utilization (0.0-1.0) - for OAuth providers
     pub five_hour: f32,
-    /// Five-hour reset timestamp (RFC3339), if known
+    /// Primary reset timestamp (RFC3339), if known
     pub five_hour_resets_at: Option<String>,
-    /// Seven-day window utilization (0.0-1.0) - for OAuth providers
+    /// Secondary subscription window label, when one exists.
+    pub secondary_limit_label: Option<String>,
+    /// Secondary window utilization (0.0-1.0) - for OAuth providers
     pub seven_day: f32,
-    /// Seven-day reset timestamp (RFC3339), if known
+    /// Secondary reset timestamp (RFC3339), if known
     pub seven_day_resets_at: Option<String>,
     /// Codex Spark window utilization (0.0-1.0), if available
     pub spark: Option<f32>,
@@ -351,10 +367,6 @@ pub struct UsageInfo {
     pub spark_resets_at: Option<String>,
     /// Total cost in USD - for API-key providers (OpenRouter, direct API key)
     pub total_cost: f32,
-    /// Estimated cost in USD for subscription/OAuth providers (e.g. Anthropic
-    /// Claude subscription) where the user is not billed per token but we can
-    /// still show the equivalent API spend. `None` when no estimate is known.
-    pub estimated_cost: Option<f32>,
     /// Input tokens used - for cost calculation
     pub input_tokens: u64,
     /// Output tokens used - for cost calculation
@@ -384,10 +396,32 @@ pub struct CacheHitInfo {
     pub last_reported_input_tokens: Option<u64>,
     /// Cached input tokens read on the latest completed request with cache telemetry.
     pub last_read_tokens: Option<u64>,
+    /// Tokens written/created in provider cache on the latest completed request.
+    pub last_creation_tokens: Option<u64>,
     /// Approximate reusable prefix tokens expected on the latest completed request.
     pub last_optimal_input_tokens: Option<u64>,
     /// Recent attributed misses with estimated cacheable tokens not read.
     pub miss_attributions: Vec<CacheMissAttribution>,
+}
+
+/// Effective prompt size to use as the denominator for cache-hit ratios.
+///
+/// Providers report `input_tokens` differently:
+/// - Anthropic/Claude (split accounting): `input` is the *uncached remainder*,
+///   while cache-read and cache-creation tokens are reported separately, so the
+///   true prompt size is `input + read + creation`.
+/// - OpenAI-style (subset accounting): cached tokens are already counted inside
+///   `input`, so the prompt size is just `input`.
+///
+/// We don't always know the provider at the point a ratio is computed, so we use
+/// the same heuristic the compaction path uses: treat accounting as split when a
+/// cache-creation count exists or when reported reads exceed the bare input.
+pub fn effective_prompt_tokens(input: u64, read: u64, creation: u64) -> u64 {
+    if creation > 0 || read > input {
+        input.saturating_add(read).saturating_add(creation)
+    } else {
+        input
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,14 +433,27 @@ pub struct CacheMissAttribution {
 }
 
 impl CacheHitInfo {
+    /// Effective total prompt tokens across the session (read denominator).
+    fn effective_reported_tokens(&self) -> u64 {
+        effective_prompt_tokens(
+            self.reported_input_tokens,
+            self.read_tokens,
+            self.creation_tokens,
+        )
+    }
+
+    /// Fraction of the session's prompt tokens that were served from cache.
     pub fn hit_ratio(&self) -> Option<f32> {
-        if self.reported_input_tokens == 0 {
+        let denominator = self.effective_reported_tokens();
+        if denominator == 0 {
             None
         } else {
-            Some((self.read_tokens as f32 / self.reported_input_tokens as f32).clamp(0.0, 1.0))
+            Some((self.read_tokens as f32 / denominator as f32).clamp(0.0, 1.0))
         }
     }
 
+    /// Fraction of the previously-cacheable prompt that was actually reused
+    /// (read_tokens vs. the prior request's full prompt).
     pub fn optimal_ratio(&self) -> Option<f32> {
         if self.optimal_input_tokens == 0 {
             None
@@ -417,10 +464,15 @@ impl CacheHitInfo {
 
     pub fn last_ratio(&self) -> Option<f32> {
         let input = self.last_reported_input_tokens?;
-        if input == 0 {
+        let denominator = effective_prompt_tokens(
+            input,
+            self.last_read_tokens.unwrap_or(0),
+            self.last_creation_tokens.unwrap_or(0),
+        );
+        if denominator == 0 {
             None
         } else {
-            Some((self.last_read_tokens.unwrap_or(0) as f32 / input as f32).clamp(0.0, 1.0))
+            Some((self.last_read_tokens.unwrap_or(0) as f32 / denominator as f32).clamp(0.0, 1.0))
         }
     }
 
@@ -460,6 +512,9 @@ pub struct MemoryInfo {
     pub by_category: HashMap<String, usize>,
     /// Whether sidecar is available
     pub sidecar_available: bool,
+    /// Whether the memory feature is disabled for this session.
+    /// When true, stored counts are still shown but recall/extraction are off.
+    pub disabled: bool,
     /// Selected sidecar model/backend label for memory work
     pub sidecar_model: Option<String>,
     /// Current memory activity
@@ -468,6 +523,25 @@ pub struct MemoryInfo {
     pub graph_nodes: Vec<GraphNode>,
     /// Directed edges into graph_nodes
     pub graph_edges: Vec<GraphEdge>,
+}
+
+impl MemoryInfo {
+    pub(crate) fn should_render(&self) -> bool {
+        !self.disabled && (self.total_count > 0 || self.activity.is_some())
+    }
+
+    pub(crate) fn should_show_activity(&self) -> bool {
+        self.activity.as_ref().is_some_and(|activity| {
+            activity.is_processing()
+                || (matches!(activity.state, MemoryState::Idle)
+                    && activity
+                        .pipeline
+                        .as_ref()
+                        .map(PipelineState::is_complete)
+                        .unwrap_or(false)
+                    && activity.state_since.elapsed() <= Duration::from_secs(5))
+        })
+    }
 }
 
 pub use jcode_tui_mermaid::DiagramInfo;
@@ -516,6 +590,16 @@ const PAGE_SWITCH_SECONDS: u64 = 30;
 #[derive(Debug, Default, Clone)]
 pub struct InfoWidgetData {
     pub todos: Vec<TodoItem>,
+    /// Goal-level assessments (hill-climbability and objective)
+    /// keyed by todo group (`group: None` covers the ungrouped list). Empty
+    /// when the session has no recorded goals or `todos` is a swarm-plan
+    /// projection.
+    pub todo_goals: Vec<crate::todo::TodoGoal>,
+    /// True when `todos` is actually a projection of the shared swarm plan
+    /// (task DAG) rather than this session's private todo list. The widget
+    /// renders a "Plan" header instead of "Todos" so the two are not
+    /// conflated.
+    pub todos_are_swarm_plan: bool,
     pub context_info: Option<ContextInfo>,
     /// True when context state is being updated and no authoritative snapshot is available.
     pub context_info_stale: bool,
@@ -581,10 +665,7 @@ pub struct CompactionInfo {
 
 impl InfoWidgetData {
     fn widget_disabled(kind: WidgetKind) -> bool {
-        matches!(
-            kind,
-            WidgetKind::SwarmStatus | WidgetKind::AmbientMode | WidgetKind::Tips
-        )
+        matches!(kind, WidgetKind::AmbientMode | WidgetKind::Tips)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -672,9 +753,13 @@ impl InfoWidgetData {
             WidgetKind::MemoryActivity => self
                 .memory_info
                 .as_ref()
-                .map(|m| m.total_count > 0 || m.activity.is_some() || m.sidecar_model.is_some())
+                .map(MemoryInfo::should_render)
                 .unwrap_or(false),
-            WidgetKind::SwarmStatus => false,
+            WidgetKind::SwarmStatus => self
+                .swarm_info
+                .as_ref()
+                .map(|s| !s.managed_members.is_empty())
+                .unwrap_or(false),
             WidgetKind::BackgroundTasks => self
                 .background_info
                 .as_ref()
@@ -743,6 +828,17 @@ impl InfoWidgetData {
                     kind.priority()
                 }
             }
+            WidgetKind::SwarmStatus => {
+                // A session actively managing agents wants them visible: the
+                // dock is the cockpit for the swarm, so rank it just under
+                // todos while any managed agent is still live.
+                let managing = self
+                    .swarm_info
+                    .as_ref()
+                    .map(|s| !s.managed_members.is_empty())
+                    .unwrap_or(false);
+                if managing { 3 } else { kind.priority() }
+            }
             _ => kind.priority(),
         }
     }
@@ -776,6 +872,20 @@ struct WidgetsState {
     widget_states: HashMap<WidgetKind, SingleWidgetState>,
     /// Current placements (updated each frame)
     placements: Vec<WidgetPlacement>,
+    /// Persistent widget anchors (HUD slot memory, including hidden-in-place ones)
+    anchors: Vec<super::info_widget_layout::WidgetAnchor>,
+    /// Settlement tracker: which transcript lines' negative space has stopped
+    /// changing and may therefore host a *new* resident widget.
+    settlement: super::info_widget_settle::SettlementTracker,
+    /// Content width the current anchors were computed at. A width change means
+    /// every transcript line re-wrapped, so anchors (keyed by absolute line) are
+    /// meaningless and must be flushed for one clean global re-layout.
+    anchors_area_width: u16,
+    /// When the SwarmStatus dock was last engaged (placed or anchored). Lets the
+    /// inline swarm strip keep standing down through brief dock dropouts instead
+    /// of popping back for a few frames (which resizes the bottom chrome and
+    /// bounces the transcript).
+    swarm_dock_last_engaged: Option<Instant>,
 }
 
 impl Default for WidgetsState {
@@ -784,6 +894,10 @@ impl Default for WidgetsState {
             enabled: true,
             widget_states: HashMap::new(),
             placements: Vec::new(),
+            anchors: Vec::new(),
+            settlement: super::info_widget_settle::SettlementTracker::default(),
+            anchors_area_width: 0,
+            swarm_dock_last_engaged: None,
         }
     }
 }
@@ -815,6 +929,42 @@ pub fn is_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Intersect the dock-gating `reliable` margin profile with the settlement
+/// profile, so a *new* resident widget can only be placed next to transcript
+/// lines whose negative space has stopped changing (never the streaming tail or
+/// a re-rendering region). Also flushes all anchors when the content width
+/// changes: a re-wrap moves every transcript line, so line-keyed anchors are
+/// meaningless and one clean global re-layout is better than widgets drawn over
+/// reflowed text.
+pub fn apply_settlement(margins: &mut Margins, area_width: u16) {
+    let mut guard = get_or_init_state();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    if state.anchors_area_width != area_width {
+        state.anchors.clear();
+        state.settlement.reset();
+        state.anchors_area_width = area_width;
+    }
+    let settled = state.settlement.observe(margins, area_width);
+    intersect_widths(&mut margins.right_reliable, &settled.right);
+    if margins.centered {
+        intersect_widths(&mut margins.left_reliable, &settled.left);
+    }
+}
+
+/// Per-row minimum of `dst` and `src`. If `dst` is empty (no look-ahead
+/// profile), it becomes `src` so settlement still gates docking on its own.
+fn intersect_widths(dst: &mut Vec<u16>, src: &[u16]) {
+    if dst.is_empty() {
+        *dst = src.to_vec();
+        return;
+    }
+    for (row, d) in dst.iter_mut().enumerate() {
+        *d = (*d).min(src.get(row).copied().unwrap_or(0));
+    }
+}
+
 /// Calculate widget placements for multiple widgets
 /// Returns a list of placements for widgets that fit
 pub fn calculate_placements(
@@ -828,15 +978,96 @@ pub fn calculate_placements(
         None => return Vec::new(),
     };
 
-    let placements = super::info_widget_layout::calculate_placements(
+    let outcome = super::info_widget_layout::calculate_placements_anchored(
         messages_area,
         margins,
         data,
         state.enabled,
-        &state.placements,
+        &state.anchors,
     );
-    state.placements = placements.clone();
-    placements
+    state.anchors = outcome.anchors;
+    state.placements = outcome.visible.clone();
+    if swarm_dock_engaged(state) {
+        state.swarm_dock_last_engaged = Some(Instant::now());
+    }
+    outcome.visible
+}
+
+/// How long the inline swarm strip keeps standing down after the SwarmStatus
+/// dock disengages. The dock's placement naturally churns while content
+/// streams past it (hidden-in-place blinks, anchor abandonment, re-homing a
+/// few frames later). Each strip appearance adds a row to the bottom chrome
+/// and shoves the whole transcript up, so reacting instantly turns that churn
+/// into visible up/down flicker. Standing down through a short linger converts
+/// the churn into "strip stays hidden"; a genuine dock removal only delays the
+/// strip's return by this much, once.
+const SWARM_STRIP_STAND_DOWN_LINGER: Duration = Duration::from_millis(2000);
+
+/// Whether the SwarmStatus dock widget is engaged: either actually placed, or
+/// hidden-in-place behind a live anchor (a wide transcript line is momentarily
+/// covering its slot and it will pop back into the same spot).
+fn swarm_dock_engaged(state: &WidgetsState) -> bool {
+    state.enabled
+        && (state
+            .placements
+            .iter()
+            .any(|p| p.kind == WidgetKind::SwarmStatus)
+            || state
+                .anchors
+                .iter()
+                .any(|a| a.placement.kind == WidgetKind::SwarmStatus))
+}
+
+/// Whether the inline swarm strip (above the status line) should stand down
+/// because the SwarmStatus dock widget (margin HUD) is showing - or was very
+/// recently showing - the same agents.
+///
+/// The strip is built before widget placement runs each frame, so this checks
+/// the previous frame's state, like [`widget_visible_facts`]. Engagement
+/// includes hidden-in-place anchors, and disengagement is debounced by
+/// [`SWARM_STRIP_STAND_DOWN_LINGER`]: both exist so the dock's frame-to-frame
+/// placement churn cannot toggle the strip row on and off, which resizes the
+/// bottom chrome and makes the whole transcript jump up and down (flicker).
+/// One frame of overlap when the dock first appears is visually harmless.
+pub(crate) fn swarm_strip_stands_down_for_dock() -> bool {
+    let guard = get_or_init_state();
+    let Some(state) = guard.as_ref() else {
+        return false;
+    };
+    if swarm_dock_engaged(state) {
+        return true;
+    }
+    state
+        .swarm_dock_last_engaged
+        .is_some_and(|at| at.elapsed() < SWARM_STRIP_STAND_DOWN_LINGER)
+}
+
+/// Forget the per-frame placement/anchor state because the widget render pass
+/// was skipped this frame (idle donut takeover, or no widget data at all).
+/// Without this, `state.placements` keeps reporting widgets from the last
+/// widget-bearing frame: the swarm strip would stand down for a dock that is
+/// no longer drawn, leaving the managed agents visible nowhere.
+pub(crate) fn note_widget_pass_skipped() {
+    let mut guard = get_or_init_state();
+    if let Some(state) = guard.as_mut() {
+        state.placements.clear();
+        state.anchors.clear();
+        state.swarm_dock_last_engaged = None;
+    }
+}
+
+/// Clear the remembered per-frame widget placements (and anchors). Tests that
+/// assert on placement-dependent behavior (e.g. the swarm strip standing down
+/// while the dock is visible) call this so state from earlier tests in the
+/// same process cannot leak into their frame.
+#[cfg(test)]
+pub(crate) fn clear_widget_placements_for_tests() {
+    let mut guard = get_or_init_state();
+    if let Some(state) = guard.as_mut() {
+        state.placements.clear();
+        state.anchors.clear();
+        state.swarm_dock_last_engaged = None;
+    }
 }
 
 /// Calculate the height needed for a specific widget type
@@ -910,19 +1141,12 @@ pub(crate) fn calculate_widget_height(
             let Some(info) = &data.swarm_info else {
                 return 0;
             };
-            if info.subagent_status.is_none()
-                && info.session_count <= 1
-                && info.client_count.is_none()
-                && info.members.is_empty()
-            {
+            if info.managed_members.is_empty() {
                 return 0;
             }
-            let mut h = 1u16; // Stats line
-            if info.subagent_status.is_some() {
-                h += 1;
-            }
-            h += info.session_names.len().min(3) as u16;
-            h
+            // Compact: agents/nodes summary line + optional plan bar.
+            let bar = u16::from(info.plan_progress.is_some());
+            (1 + bar).min(max_height.saturating_sub(border_height))
         }
         WidgetKind::BackgroundTasks => {
             if data
@@ -1077,6 +1301,7 @@ pub fn calculate_layout(
         right_widths: free_widths.to_vec(),
         left_widths: Vec::new(),
         centered: false,
+        ..Default::default()
     };
     let placements = calculate_placements(messages_area, &margins, data);
     placements.first().map(|p| p.rect)
@@ -1526,7 +1751,7 @@ fn render_kv_cache_summary_line(cache: &CacheHitInfo) -> Line<'static> {
 
     if let Some(warm_pct) = warm_pct {
         spans.push(Span::styled(
-            "warm ",
+            "yield ",
             Style::default().fg(rgb(140, 140, 150)),
         ));
         spans.push(Span::styled(
@@ -1535,7 +1760,7 @@ fn render_kv_cache_summary_line(cache: &CacheHitInfo) -> Line<'static> {
         ));
     } else {
         spans.push(Span::styled(
-            "warming",
+            "priming",
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     }
@@ -1554,17 +1779,12 @@ fn render_kv_cache_summary_line(cache: &CacheHitInfo) -> Line<'static> {
 
     spans.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 90))));
     spans.push(Span::styled(
-        "all ",
+        "session ",
         Style::default().fg(rgb(140, 140, 150)),
     ));
     spans.push(Span::styled(
         format!("{}%", lifetime_pct),
         Style::default().fg(color).bold(),
-    ));
-
-    spans.push(Span::styled(
-        " lifetime",
-        Style::default().fg(rgb(100, 100, 110)),
     ));
 
     Line::from(spans)

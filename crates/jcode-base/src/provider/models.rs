@@ -10,15 +10,16 @@ use anyhow::Result;
 #[cfg(test)]
 pub(crate) use catalog::parse_anthropic_model_catalog;
 pub use catalog::{
-    AnthropicModelCatalog, OpenAIModelCatalog, fetch_anthropic_model_catalog,
-    fetch_anthropic_model_catalog_oauth, fetch_openai_api_key_model_catalog,
-    fetch_openai_context_limits, fetch_openai_model_catalog,
+    AnthropicModelCatalog, ModelCatalogHttpStatus, OpenAIModelCatalog,
+    fetch_anthropic_model_catalog, fetch_anthropic_model_catalog_oauth,
+    fetch_openai_api_key_model_catalog, fetch_openai_context_limits, fetch_openai_model_catalog,
 };
 use catalog_service::{ModelCatalogService, RuntimeModelUnavailability};
 use jcode_provider_core::{
-    ALL_CLAUDE_MODELS, ALL_OPENAI_MODELS, ModelCapabilities, ModelRoute,
-    context_limit_for_model_with_provider_and_cache, core_provider_for_model_with_hint,
-    provider_key_from_hint, shared_http_client,
+    ALL_CLAUDE_MODELS, ALL_OPENAI_MODELS, CHATGPT_WEB_MODEL, ModelCapabilities,
+    OPENAI_API_ONLY_PRO_MODELS, context_limit_for_model_with_provider_and_cache,
+    core_provider_for_model_with_hint, is_openai_api_only_pro_model, provider_key_from_hint,
+    shared_http_client,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -39,38 +40,44 @@ struct PersistedModelCatalogScope {
     models: Vec<String>,
     #[serde(default)]
     context_limits: HashMap<String, usize>,
+    #[serde(default)]
+    reasoning_efforts: HashMap<String, Vec<String>>,
     observed_at_unix_secs: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn filtered_display_models(models: impl IntoIterator<Item = String>) -> Vec<String> {
     models
         .into_iter()
         .filter(|model| {
             !crate::subscription_catalog::is_runtime_mode_enabled()
-                || crate::subscription_catalog::is_curated_model(model)
+                || crate::subscription_catalog::is_model_allowed_for_current_tier(model)
         })
         .collect()
 }
 
-pub(crate) fn filtered_model_routes(routes: Vec<ModelRoute>) -> Vec<ModelRoute> {
-    if !crate::subscription_catalog::is_runtime_mode_enabled() {
-        return routes;
-    }
-
-    routes
-        .into_iter()
-        .filter(|route| crate::subscription_catalog::is_curated_model(&route.model))
-        .collect()
-}
-
 pub(crate) fn ensure_model_allowed_for_subscription(model: &str) -> Result<()> {
-    if crate::subscription_catalog::is_runtime_mode_enabled()
-        && !crate::subscription_catalog::is_curated_model(model)
-    {
-        anyhow::bail!(
-            "Model '{}' is not included in the current jcode subscription catalog",
-            model
-        );
+    if !crate::subscription_catalog::is_runtime_mode_enabled() {
+        return Ok(());
+    }
+    match crate::subscription_catalog::find_curated_model(model) {
+        None => {
+            anyhow::bail!(
+                "Model '{}' is not included in the current jcode subscription catalog",
+                model
+            );
+        }
+        Some(curated) => {
+            let tier = crate::subscription_catalog::effective_tier();
+            if !tier.allows(curated.min_tier) {
+                anyhow::bail!(
+                    "Model '{}' requires the {} tier (current tier: {}). Upgrade your jcode subscription to use it.",
+                    curated.display_name,
+                    curated.min_tier.display_name(),
+                    tier.display_name()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -167,11 +174,7 @@ pub fn format_account_model_availability_detail(
 }
 
 pub(crate) fn normalize_model_id(model: &str) -> String {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized
-        .strip_suffix("[1m]")
-        .unwrap_or(&normalized)
-        .to_string()
+    jcode_provider_core::model_id::canonical(model)
 }
 
 fn normalize_provider_id(provider: &str) -> String {
@@ -197,10 +200,16 @@ fn current_claude_account_scope() -> String {
 }
 
 fn current_anthropic_catalog_scope() -> String {
-    if std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .map(|key| !key.trim().is_empty())
-        .unwrap_or(false)
+    // Match the credential-resolution order used by the Anthropic provider:
+    // the API key can come from the process env *or* the persisted
+    // anthropic.env file. Checking only the env var made env-file-keyed
+    // sessions read/write the OAuth scope while requests actually used the
+    // API key, so the `api-key` catalog scope went permanently stale.
+    if crate::provider_catalog::load_api_key_from_env_or_config(
+        "ANTHROPIC_API_KEY",
+        "anthropic.env",
+    )
+    .is_some()
     {
         "api-key".to_string()
     } else {
@@ -269,7 +278,7 @@ fn model_ids_with_context_aliases(models: Vec<String>) -> Vec<String> {
         if seen.insert(model.clone()) {
             deduped.push(model.clone());
         }
-        if get_cached_context_limit(&normalized).unwrap_or_default() >= 1_000_000 {
+        if model_exposes_1m_alias(&normalized) {
             let alias = format!("{}[1m]", normalized);
             if seen.insert(alias.clone()) {
                 deduped.push(alias);
@@ -278,6 +287,27 @@ fn model_ids_with_context_aliases(models: Vec<String>) -> Vec<String> {
     }
 
     deduped
+}
+
+/// Whether a `<model>[1m]` long-context picker alias should be surfaced.
+///
+/// For *known* Claude models this is authoritative: only opt-in 1M models (Opus
+/// 4.6, Sonnet 4.6) get an alias. Native-1M models (Opus 4.8, 4.7) already use
+/// 1M by default, so a `[1m]` alias would be a redundant duplicate, and
+/// 200K-only models (Sonnet 4.5, which the live catalog wrongly advertises as
+/// 1M) get no alias. Unknown/future Claude ids and all non-Claude models keep
+/// the prior behavior: alias when the cached catalog limit is >= 1M.
+fn model_exposes_1m_alias(normalized_model: &str) -> bool {
+    if normalized_model.starts_with("claude-") {
+        let mode = jcode_provider_core::anthropic_context_mode(normalized_model);
+        // Only trust the classifier for models it actually recognizes; for
+        // anything it maps to `Standard` we can't tell a genuine 200K model from
+        // an unrecognized future one, so fall back to the catalog heuristic.
+        if mode != jcode_provider_core::AnthropicContextMode::Standard {
+            return mode.exposes_1m_alias();
+        }
+    }
+    get_cached_context_limit(normalized_model).unwrap_or_default() >= 1_000_000
 }
 
 fn live_catalog_model_ids(service: &ModelCatalogService, scope: &str) -> Option<Vec<String>> {
@@ -338,6 +368,7 @@ fn persist_scoped_model_catalog(
     scope: &str,
     models: &[String],
     context_limits: &HashMap<String, usize>,
+    reasoning_efforts: &HashMap<String, Vec<String>>,
     observed_at: SystemTime,
 ) {
     if models.is_empty() {
@@ -350,6 +381,7 @@ fn persist_scoped_model_catalog(
         PersistedModelCatalogScope {
             models: models.to_vec(),
             context_limits: context_limits.clone(),
+            reasoning_efforts: reasoning_efforts.clone(),
             observed_at_unix_secs: observed_at_unix_secs(observed_at),
         },
     );
@@ -379,7 +411,7 @@ fn hydrate_catalog_cache_from_disk(
     }
 
     let observed_at = system_time_from_unix_secs(persisted.observed_at_unix_secs);
-    service.replace_scope_models(scope, normalized, observed_at);
+    service.hydrate_scope_models_from_snapshot(scope, normalized, observed_at);
     if !persisted.context_limits.is_empty() {
         populate_context_limits(persisted.context_limits.clone());
     }
@@ -399,12 +431,33 @@ pub fn cached_openai_model_ids() -> Option<Vec<String>> {
         .or_else(|| load_openai_catalog_from_disk(&scope))
 }
 
+/// Return model-specific OpenAI reasoning capabilities for the active account
+/// from its scoped disk snapshot. Live refreshes update provider-local state
+/// directly; this keeps startup exact before the first refresh completes.
+pub fn cached_openai_reasoning_efforts() -> Option<HashMap<String, Vec<String>>> {
+    let scope = current_openai_account_scope();
+    let store = load_persisted_model_catalog_store(OPENAI_MODEL_CATALOG_CACHE_FILE)?;
+    let efforts = store.scopes.get(&scope)?.reasoning_efforts.clone();
+    (!efforts.is_empty()).then_some(efforts)
+}
+
+/// Test-only: clear the process-global in-memory model catalogs. The catalog
+/// services are statics shared by every test in the process; a test that
+/// hydrates a scope (directly or via `persist_*` + `cached_*`) otherwise leaks
+/// fixture models into later tests' `known_*_model_ids()` validation.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_model_catalog_services_for_tests() {
+    OPENAI_MODEL_CATALOG_SERVICE.reset_for_tests();
+    ANTHROPIC_MODEL_CATALOG_SERVICE.reset_for_tests();
+}
+
 pub fn persist_openai_model_catalog(catalog: &OpenAIModelCatalog) {
     persist_scoped_model_catalog(
         OPENAI_MODEL_CATALOG_CACHE_FILE,
         &current_openai_account_scope(),
         &catalog.available_models,
         &catalog.context_limits,
+        &catalog.reasoning_efforts,
         SystemTime::now(),
     );
 }
@@ -415,6 +468,7 @@ pub fn persist_anthropic_model_catalog(catalog: &AnthropicModelCatalog) {
         &current_anthropic_catalog_scope(),
         &catalog.available_models,
         &catalog.context_limits,
+        &HashMap::new(),
         SystemTime::now(),
     );
 }
@@ -438,6 +492,69 @@ pub fn populate_context_limits(models: HashMap<String, usize>) {
             cache.insert(model.clone(), *limit);
         }
     }
+}
+
+/// Populate the context limit cache from named provider model configs in the
+/// user's config file.
+///
+/// Custom OpenAI-compatible providers that lack a usable `/v1/models` endpoint
+/// rely on per-model `context_window` config. That value is honored by the
+/// provider instance's own `context_window()` method, but every other
+/// resolution path (TUI info widget, compaction budget, model switching) goes
+/// through the global [`CONTEXT_LIMIT_CACHE`] via
+/// [`context_limit_for_model_with_provider`]. Seed that cache here so the
+/// configured limit is respected globally instead of falling back to
+/// [`DEFAULT_CONTEXT_LIMIT`].
+pub fn populate_context_limits_from_config() {
+    populate_context_limits_from_config_value(crate::config::config());
+}
+
+/// Seed the global context-limit cache from an explicit config reference.
+///
+/// Runtime model specs reach the lookup in several shapes, so each configured
+/// model is seeded under every key the lookup can normalize to (issue #421):
+/// - the bare lowercased id (`qwen3.6-35b-a2000-128k`);
+/// - the slash base (`x.gguf` for `/opt/models/x.gguf`), because
+///   `model_id_for_capability_lookup` reduces slash-containing ids to their
+///   final segment;
+/// - the profile-qualified spec (`cachyai-a2000:qwen3.6-35b-a2000-128k`),
+///   because session-restored models keep the `<profile>:` routing prefix and
+///   non-slash qualified specs are looked up verbatim.
+pub fn populate_context_limits_from_config_value(cfg: &crate::config::Config) {
+    let mut limits = HashMap::new();
+    for (profile_id, provider_cfg) in cfg.providers.iter() {
+        for model in &provider_cfg.models {
+            let Some(limit) = model.context_window else {
+                continue;
+            };
+            for key in config_context_limit_cache_keys(profile_id, &model.id) {
+                limits.insert(key, limit);
+            }
+        }
+    }
+    if !limits.is_empty() {
+        populate_context_limits(limits);
+    }
+}
+
+/// Cache keys under which a configured per-model `context_window` must be
+/// discoverable so every runtime lookup shape resolves to it. See
+/// [`populate_context_limits_from_config_value`].
+pub(crate) fn config_context_limit_cache_keys(profile_id: &str, model_id: &str) -> Vec<String> {
+    let id = model_id.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        return Vec::new();
+    }
+    let mut keys = vec![id.clone()];
+    let slash_base = jcode_provider_core::model_id::slash_base(&id).to_string();
+    if slash_base != id && !slash_base.is_empty() {
+        keys.push(slash_base);
+    }
+    let profile = profile_id.trim().to_ascii_lowercase();
+    if !profile.is_empty() {
+        keys.push(format!("{profile}:{id}"));
+    }
+    keys
 }
 
 /// Populate the account-available model list (called once at startup from the Codex API).
@@ -569,8 +686,33 @@ pub fn known_anthropic_model_ids() -> Vec<String> {
     cached_anthropic_model_ids().unwrap_or_else(anthropic_static_model_ids)
 }
 
+/// True when an OpenAI platform API key is configured (env or openai.env).
+/// Deliberately a direct credential probe: routing/list decisions must not
+/// populate the process-global cached `AuthStatus` snapshot as a side effect
+/// (callers like `known_openai_model_ids` run before auth fixtures/state are
+/// finalized, and a poisoned cache misreports every subsequent route).
+pub fn openai_platform_api_key_configured() -> bool {
+    crate::provider_catalog::load_api_key_from_env_or_config("OPENAI_API_KEY", "openai.env")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 pub fn known_openai_model_ids() -> Vec<String> {
-    cached_openai_model_ids().unwrap_or_else(openai_static_model_ids)
+    let mut models = cached_openai_model_ids().unwrap_or_else(openai_static_model_ids);
+    if !models.iter().any(|model| model == CHATGPT_WEB_MODEL) {
+        models.push(CHATGPT_WEB_MODEL.to_string());
+    }
+    // GPT Pro models never appear in the ChatGPT/Codex OAuth catalog (they are
+    // platform-API-only), so a live OAuth catalog must not hide them when the
+    // user has an OPENAI_API_KEY that can actually reach them.
+    if openai_platform_api_key_configured() {
+        for pro in OPENAI_API_ONLY_PRO_MODELS {
+            if !models.iter().any(|model| model == pro) {
+                models.push((*pro).to_string());
+            }
+        }
+    }
+    models
 }
 
 pub fn note_openai_model_catalog_refresh_attempt() {
@@ -850,12 +992,47 @@ pub fn is_model_available_for_account(model: &str) -> Option<bool> {
 }
 
 pub fn model_availability_for_account(model: &str) -> AccountModelAvailability {
+    if model.trim() == CHATGPT_WEB_MODEL {
+        return AccountModelAvailability {
+            state: AccountModelAvailabilityState::Unknown,
+            reason: Some("requires a logged-in ChatGPT web session".to_string()),
+            source: "browser-session",
+            observed_at: None,
+        };
+    }
+
     if let Some(runtime) = runtime_model_unavailability(model) {
         return AccountModelAvailability {
             state: AccountModelAvailabilityState::Unavailable,
             reason: Some(runtime.reason),
             source: "runtime-error",
             observed_at: Some(runtime.observed_at),
+        };
+    }
+
+    // GPT Pro models are platform-API-only: the ChatGPT/Codex OAuth account
+    // snapshot never contains them, so judging them against it would report
+    // "not available for your account" to every OAuth user who also has a
+    // perfectly working OPENAI_API_KEY. Key presence is the real signal.
+    if is_openai_api_only_pro_model(model) {
+        return if openai_platform_api_key_configured() {
+            AccountModelAvailability {
+                state: AccountModelAvailabilityState::Available,
+                reason: None,
+                source: "api-key",
+                observed_at: None,
+            }
+        } else {
+            AccountModelAvailability {
+                state: AccountModelAvailabilityState::Unavailable,
+                reason: Some(
+                    "requires an OpenAI platform API key (OPENAI_API_KEY); \
+                     not available via ChatGPT/Codex OAuth"
+                        .to_string(),
+                ),
+                source: "api-key",
+                observed_at: None,
+            }
         };
     }
 
@@ -960,9 +1137,9 @@ pub fn provider_for_model_with_hint(
     let model = model.trim();
     if model.contains('@') {
         Some("openrouter")
-    } else if ALL_CLAUDE_MODELS.contains(&model) {
+    } else if jcode_provider_core::model_id::matches_known_model(model, ALL_CLAUDE_MODELS) {
         Some("claude")
-    } else if ALL_OPENAI_MODELS.contains(&model) {
+    } else if jcode_provider_core::model_id::matches_known_model(model, ALL_OPENAI_MODELS) {
         Some("openai")
     } else if crate::provider::bedrock::BedrockProvider::is_bedrock_model_id(model) {
         Some("bedrock")

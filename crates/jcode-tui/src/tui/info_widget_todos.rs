@@ -4,6 +4,50 @@ use super::*;
 /// even if the panel is a bit narrow, so small lists are never normalized.
 const EXACT_PIP_FLOOR: usize = 12;
 
+/// Map swarm plan items into the todo-widget model so the persistent info
+/// widget renders live plan state (this is the durable surface backing the
+/// transient 3s "Swarm plan synced" status notice).
+///
+/// Plan statuses use the scheduler vocabulary (`queued`, `ready`, `running`,
+/// `running_stale`, `done`, `failed`, `stopped`, `crashed`, ...) while the todo
+/// renderer only distinguishes `in_progress`/`completed`/`cancelled`/other.
+/// Without normalization, `running` plan tasks render as open `○` items and
+/// sort *after* completed work, so large plans hide all live activity behind
+/// the "+N more" footer.
+pub(crate) fn swarm_plan_todos(items: &[crate::plan::PlanItem]) -> Vec<crate::todo::TodoItem> {
+    items
+        .iter()
+        .map(|item| crate::todo::TodoItem {
+            content: item.content.clone(),
+            status: normalize_plan_status_for_todo(&item.status),
+            priority: item.priority.clone(),
+            id: item.id.clone(),
+            group: None,
+            blocked_by: item.blocked_by.clone(),
+            assigned_to: item.assigned_to.clone(),
+            confidence: None,
+            completion_confidence: None,
+            confidence_history: Vec::new(),
+        })
+        .collect()
+}
+
+/// Collapse the scheduler's status vocabulary onto the todo renderer's:
+/// active → `in_progress` (▶ amber, sorts first), terminal success →
+/// `completed` (✓), terminal failure → `cancelled` (✗), runnable →
+/// `pending` (○). Statuses the todo renderer already understands (and any
+/// arbitrary strings) pass through unchanged. Blocked items still get their
+/// ⊳ marker from `blocked_by`.
+fn normalize_plan_status_for_todo(status: &str) -> String {
+    match status {
+        "running" | "running_stale" => "in_progress".to_string(),
+        "done" => "completed".to_string(),
+        "failed" | "stopped" | "crashed" => "cancelled".to_string(),
+        "queued" | "ready" | "todo" | "blocked" => "pending".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn todo_confidence_weight(priority: &str) -> u32 {
     match priority {
         "high" => 3,
@@ -20,10 +64,12 @@ fn todo_display_confidence(todo: &crate::todo::TodoItem) -> Option<u8> {
     }
 }
 
-fn aggregate_todo_confidence(todos: &[crate::todo::TodoItem]) -> Option<u8> {
+fn aggregate_todo_confidence<'a>(
+    todos: impl IntoIterator<Item = &'a crate::todo::TodoItem>,
+) -> Option<u8> {
     let mut weighted_sum = 0u32;
     let mut total_weight = 0u32;
-    for todo in todos.iter().filter(|todo| todo.status != "cancelled") {
+    for todo in todos.into_iter().filter(|todo| todo.status != "cancelled") {
         let Some(score) = todo_display_confidence(todo) else {
             continue;
         };
@@ -52,6 +98,59 @@ fn confidence_label(score: Option<u8>) -> String {
     score
         .map(|score| format!("{}%", score))
         .unwrap_or_else(|| "?%".to_string())
+}
+
+/// Find the goal assessment recorded for a todo group (`None` = the
+/// ungrouped/flat list). Group labels are compared after trimming, matching
+/// how the todo tool normalizes them.
+fn goal_for_group<'a>(
+    goals: &'a [crate::todo::TodoGoal],
+    group: Option<&str>,
+) -> Option<&'a crate::todo::TodoGoal> {
+    let key = group.map(str::trim).filter(|group| !group.is_empty());
+    goals.iter().find(|goal| {
+        goal.group
+            .as_deref()
+            .map(str::trim)
+            .filter(|group| !group.is_empty())
+            == key
+    })
+}
+
+/// Color for a hill-climbability score: green when progress has a credible
+/// metric to iterate against, red when it is low (below the reframe-nudge
+/// threshold), amber in between.
+fn hill_style(score: u8) -> Style {
+    let color = if score >= crate::todo::LOW_HILL_CLIMBABILITY {
+        rgb(100, 180, 100)
+    } else if score >= crate::todo::LOW_HILL_CLIMBABILITY.saturating_sub(20) {
+        rgb(220, 190, 100)
+    } else {
+        rgb(220, 120, 100)
+    };
+    Style::default().fg(color)
+}
+
+/// Append a " · hill N%" suffix describing a goal's hill-climbability.
+fn push_goal_hill_suffix(spans: &mut Vec<Span<'static>>, goal: &crate::todo::TodoGoal) {
+    let Some(score) = goal.hill_climbability else {
+        return;
+    };
+    spans.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 90))));
+    spans.push(Span::styled(
+        "hill ",
+        Style::default().fg(rgb(140, 140, 150)),
+    ));
+    spans.push(Span::styled(format!("{}%", score), hill_style(score)));
+}
+
+/// Display width of the suffix `push_goal_hill_suffix` would render for this
+/// goal (0 when it renders nothing), so header truncation can reserve room.
+fn goal_hill_suffix_width(goal: &crate::todo::TodoGoal) -> u16 {
+    match goal.hill_climbability {
+        Some(score) => 3 + "hill ".len() as u16 + format!("{}%", score).len() as u16,
+        None => 0,
+    }
 }
 
 fn todo_confidence_suffix_width(todo: &crate::todo::TodoItem) -> u16 {
@@ -146,8 +245,15 @@ fn push_todo_pips(spans: &mut Vec<Span<'static>>, data: &InfoWidgetData, width_p
     }
 }
 
-fn push_aggregate_confidence_suffix(spans: &mut Vec<Span<'static>>, data: &InfoWidgetData) {
-    let Some(score) = aggregate_todo_confidence(&data.todos) else {
+fn aggregate_confidence_suffix_width(score: Option<u8>) -> u16 {
+    match score {
+        Some(score) => 3 + "confidence ".len() as u16 + confidence_label(Some(score)).len() as u16,
+        None => 0,
+    }
+}
+
+fn push_aggregate_confidence_suffix(spans: &mut Vec<Span<'static>>, score: Option<u8>) {
+    let Some(score) = score else {
         return;
     };
     spans.push(Span::styled(" · ", Style::default().fg(rgb(100, 100, 110))));
@@ -159,6 +265,209 @@ fn push_aggregate_confidence_suffix(spans: &mut Vec<Span<'static>>, data: &InfoW
         confidence_label(Some(score)),
         confidence_style(Some(score)),
     ));
+}
+
+/// Normalize a todo's group label, treating empty/whitespace as ungrouped.
+fn todo_group_key(todo: &crate::todo::TodoItem) -> Option<String> {
+    todo.group
+        .as_deref()
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(|group| group.to_string())
+}
+
+/// Partition todos into ordered groups, preserving the order groups first
+/// appear. Ungrouped items collapse into a trailing `None` bucket. Returns
+/// `None` when no todo declares a group, so callers fall back to the flat list.
+fn grouped_todos(
+    todos: &[crate::todo::TodoItem],
+) -> Option<Vec<(Option<String>, Vec<&crate::todo::TodoItem>)>> {
+    if !todos.iter().any(|todo| todo_group_key(todo).is_some()) {
+        return None;
+    }
+    let mut groups: Vec<(Option<String>, Vec<&crate::todo::TodoItem>)> = Vec::new();
+    for todo in todos {
+        let key = todo_group_key(todo);
+        if let Some(entry) = groups.iter_mut().find(|(existing, _)| *existing == key) {
+            entry.1.push(todo);
+        } else {
+            groups.push((key, vec![todo]));
+        }
+    }
+    // Keep the ungrouped bucket last; sort_by_key is stable so named groups
+    // retain their first-seen order.
+    groups.sort_by_key(|(key, _)| key.is_none());
+    Some(groups)
+}
+
+fn status_sort_rank(status: &str) -> u8 {
+    match status {
+        "in_progress" => 0,
+        "pending" => 1,
+        "completed" => 2,
+        "cancelled" => 3,
+        _ => 4,
+    }
+}
+
+fn sort_todos_by_status<'a>(todos: &[&'a crate::todo::TodoItem]) -> Vec<&'a crate::todo::TodoItem> {
+    let mut sorted: Vec<&crate::todo::TodoItem> = todos.to_vec();
+    sorted.sort_by(|a, b| status_sort_rank(&a.status).cmp(&status_sort_rank(&b.status)));
+    sorted
+}
+
+fn push_group_header(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    items: &[&crate::todo::TodoItem],
+    goal: Option<&crate::todo::TodoGoal>,
+    inner: Rect,
+) {
+    let total = items.len();
+    let completed = items.iter().filter(|t| t.status == "completed").count();
+    let counter = format!(" {}/{}", completed, total);
+    let confidence = aggregate_todo_confidence(items.iter().copied());
+    let confidence_width = aggregate_confidence_suffix_width(confidence);
+    let hill_width = goal.map(goal_hill_suffix_width).unwrap_or(0);
+    let max_name = inner
+        .width
+        .saturating_sub(counter.len() as u16 + confidence_width + hill_width)
+        .max(4) as usize;
+    let highlight = items.iter().any(|t| t.status == "in_progress");
+    let name_style = if highlight {
+        Style::default().fg(rgb(255, 210, 130)).bold()
+    } else {
+        Style::default().fg(rgb(170, 175, 205)).bold()
+    };
+    let mut spans = vec![
+        Span::styled(truncate_smart(name, max_name), name_style),
+        Span::styled(counter, Style::default().fg(rgb(120, 120, 140))),
+    ];
+    push_aggregate_confidence_suffix(&mut spans, confidence);
+    if let Some(goal) = goal {
+        push_goal_hill_suffix(&mut spans, goal);
+    }
+    lines.push(Line::from(spans));
+}
+
+/// Render one todo as a line. `show_priority_marker` adds the `!` high-priority
+/// marker (used by the expanded widget); `indent` is the leading-space depth
+/// used when items sit under a group header.
+fn push_todo_item_line(
+    lines: &mut Vec<Line<'static>>,
+    todo: &crate::todo::TodoItem,
+    inner: Rect,
+    show_priority_marker: bool,
+    indent: usize,
+) {
+    let is_blocked = !todo.blocked_by.is_empty();
+    let (icon, status_color) = if is_blocked && todo.status != "completed" {
+        ("⊳", rgb(180, 140, 100))
+    } else {
+        match todo.status.as_str() {
+            "completed" => ("✓", rgb(100, 180, 100)),
+            "in_progress" => ("▶", rgb(255, 200, 100)),
+            "cancelled" => ("✗", rgb(120, 80, 80)),
+            _ => ("○", rgb(120, 120, 130)),
+        }
+    };
+
+    let priority_marker = if show_priority_marker {
+        match todo.priority.as_str() {
+            "high" => ("!", rgb(255, 120, 100)),
+            _ => ("", rgb(120, 120, 130)),
+        }
+    } else {
+        ("", rgb(120, 120, 130))
+    };
+
+    let suffix = if is_blocked && todo.status != "completed" {
+        " (blocked)"
+    } else {
+        ""
+    };
+
+    let reserved = indent as u16
+        + 3
+        + priority_marker.0.len() as u16
+        + suffix.len() as u16
+        + todo_confidence_suffix_width(todo);
+    let max_len = inner.width.saturating_sub(reserved) as usize;
+    let content = truncate_smart(&todo.content, max_len);
+
+    let text_color = if todo.status == "completed" {
+        rgb(100, 100, 110)
+    } else if is_blocked {
+        rgb(120, 120, 130)
+    } else if todo.status == "in_progress" {
+        rgb(200, 200, 210)
+    } else {
+        rgb(160, 160, 170)
+    };
+
+    let mut spans = Vec::new();
+    if indent > 0 {
+        spans.push(Span::raw(" ".repeat(indent)));
+    }
+    spans.push(Span::styled(
+        format!("{} ", icon),
+        Style::default().fg(status_color),
+    ));
+    if !priority_marker.0.is_empty() {
+        spans.push(Span::styled(
+            priority_marker.0,
+            Style::default().fg(priority_marker.1),
+        ));
+    }
+    spans.push(Span::styled(content, Style::default().fg(text_color)));
+    push_todo_confidence_suffix(&mut spans, todo);
+    if !suffix.is_empty() {
+        spans.push(Span::styled(
+            suffix.to_string(),
+            Style::default().fg(rgb(100, 100, 110)),
+        ));
+    }
+    lines.push(Line::from(spans));
+}
+
+/// Render todos partitioned by group, honoring a `max_lines` budget that counts
+/// both group headers and item rows. Returns the rendered lines plus the number
+/// of todo items actually shown (so callers can render a "+N more" footer).
+fn render_grouped_todo_lines(
+    groups: &[(Option<String>, Vec<&crate::todo::TodoItem>)],
+    goals: &[crate::todo::TodoGoal],
+    inner: Rect,
+    show_priority_marker: bool,
+    max_lines: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut shown = 0usize;
+    for (group, items) in groups {
+        if lines.len() >= max_lines {
+            break;
+        }
+        let header_name = group.as_deref().unwrap_or("Other");
+        let goal = goal_for_group(goals, group.as_deref());
+        push_group_header(&mut lines, header_name, items, goal, inner);
+        for todo in sort_todos_by_status(items) {
+            if lines.len() >= max_lines {
+                break;
+            }
+            push_todo_item_line(&mut lines, todo, inner, show_priority_marker, 2);
+            shown += 1;
+        }
+    }
+    (lines, shown)
+}
+
+/// Header label for the todo slot: "Plan" when the items are the shared
+/// swarm plan projection, "Todos" for the session's own private list.
+fn todos_widget_label(data: &InfoWidgetData) -> &'static str {
+    if data.todos_are_swarm_plan {
+        "Plan"
+    } else {
+        "Todos"
+    }
 }
 
 /// Render todos widget content
@@ -182,7 +491,10 @@ pub(super) fn render_todos_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
 
     // Header with progress + inline pip meter
     let mut header = vec![
-        Span::styled("Todos ", Style::default().fg(rgb(180, 180, 190)).bold()),
+        Span::styled(
+            format!("{} ", todos_widget_label(data)),
+            Style::default().fg(rgb(180, 180, 190)).bold(),
+        ),
         Span::styled(
             format!("{}/{}", completed, total),
             Style::default().fg(rgb(140, 140, 150)),
@@ -190,74 +502,44 @@ pub(super) fn render_todos_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
     ];
     let pip_budget = (inner.width.saturating_sub(12) / 2).clamp(0, 10) as usize;
     push_todo_pips(&mut header, data, pip_budget);
-    push_aggregate_confidence_suffix(&mut header, data);
+    push_aggregate_confidence_suffix(&mut header, aggregate_todo_confidence(&data.todos));
+
+    let available_lines = inner.height.saturating_sub(1) as usize; // Account for header
+    let budget = available_lines.clamp(1, 5);
+
+    // Grouped layout when any todo declares a group; otherwise the flat list.
+    if let Some(groups) = grouped_todos(&data.todos) {
+        lines.push(Line::from(header));
+        let (group_lines, shown) =
+            render_grouped_todo_lines(&groups, &data.todo_goals, inner, false, budget);
+        lines.extend(group_lines);
+        if total > shown {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  +{} more", total - shown),
+                Style::default().fg(rgb(100, 100, 110)),
+            )]));
+        }
+        return lines;
+    }
+
+    // Flat list: the whole list is one implicit goal, so its hill score
+    // (if recorded) lives on the header line.
+    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+        push_goal_hill_suffix(&mut header, goal);
+    }
     lines.push(Line::from(header));
 
     // Sort todos: in_progress first, then pending, then completed
     let mut sorted_todos: Vec<&crate::todo::TodoItem> = data.todos.iter().collect();
-    sorted_todos.sort_by(|a, b| {
-        let order = |s: &str| match s {
-            "in_progress" => 0,
-            "pending" => 1,
-            "completed" => 2,
-            "cancelled" => 3,
-            _ => 4,
-        };
-        order(&a.status).cmp(&order(&b.status))
-    });
+    sorted_todos.sort_by(|a, b| status_sort_rank(&a.status).cmp(&status_sort_rank(&b.status)));
 
     // Render todos (limit based on available height)
-    let available_lines = inner.height.saturating_sub(1) as usize; // Account for header
-    for todo in sorted_todos.iter().take(available_lines.min(5)) {
-        let is_blocked = !todo.blocked_by.is_empty();
-        let (icon, status_color) = if is_blocked && todo.status != "completed" {
-            ("⊳", rgb(180, 140, 100))
-        } else {
-            match todo.status.as_str() {
-                "completed" => ("✓", rgb(100, 180, 100)),
-                "in_progress" => ("▶", rgb(255, 200, 100)),
-                "cancelled" => ("✗", rgb(120, 80, 80)),
-                _ => ("○", rgb(120, 120, 130)),
-            }
-        };
-
-        let suffix = if is_blocked && todo.status != "completed" {
-            " (blocked)"
-        } else {
-            ""
-        };
-        let max_len = inner
-            .width
-            .saturating_sub(3 + suffix.len() as u16 + todo_confidence_suffix_width(todo))
-            as usize;
-        let content = truncate_smart(&todo.content, max_len);
-
-        let text_color = if todo.status == "completed" {
-            rgb(100, 100, 110)
-        } else if is_blocked {
-            rgb(120, 120, 130)
-        } else if todo.status == "in_progress" {
-            rgb(200, 200, 210)
-        } else {
-            rgb(160, 160, 170)
-        };
-
-        let mut spans = vec![
-            Span::styled(format!("{} ", icon), Style::default().fg(status_color)),
-            Span::styled(content, Style::default().fg(text_color)),
-        ];
-        push_todo_confidence_suffix(&mut spans, todo);
-        if !suffix.is_empty() {
-            spans.push(Span::styled(
-                suffix.to_string(),
-                Style::default().fg(rgb(100, 100, 110)),
-            ));
-        }
-        lines.push(Line::from(spans));
+    for todo in sorted_todos.iter().take(budget) {
+        push_todo_item_line(&mut lines, todo, inner, false, 0);
     }
 
     // Show count of remaining items
-    let shown = available_lines.min(5).min(sorted_todos.len());
+    let shown = budget.min(sorted_todos.len());
     if data.todos.len() > shown {
         let remaining = data.todos.len() - shown;
         lines.push(Line::from(vec![Span::styled(
@@ -290,7 +572,10 @@ pub(super) fn render_todos_expanded(data: &InfoWidgetData, inner: Rect) -> Vec<L
 
     // Header with progress + inline pip meter
     let mut header = vec![
-        Span::styled("Todos ", Style::default().fg(rgb(180, 180, 190)).bold()),
+        Span::styled(
+            format!("{} ", todos_widget_label(data)),
+            Style::default().fg(rgb(180, 180, 190)).bold(),
+        ),
         Span::styled(
             format!("{}/{}", completed, total),
             Style::default().fg(rgb(140, 140, 150)),
@@ -298,89 +583,39 @@ pub(super) fn render_todos_expanded(data: &InfoWidgetData, inner: Rect) -> Vec<L
     ];
     let pip_budget = (inner.width.saturating_sub(12) / 2).clamp(0, 14) as usize;
     push_todo_pips(&mut header, data, pip_budget);
-    push_aggregate_confidence_suffix(&mut header, data);
+    push_aggregate_confidence_suffix(&mut header, aggregate_todo_confidence(&data.todos));
+
+    let available_lines = MAX_TODO_LINES.saturating_sub(1); // Account for header
+
+    // Grouped layout when any todo declares a group; otherwise the flat list.
+    if let Some(groups) = grouped_todos(&data.todos) {
+        lines.push(Line::from(header));
+        let (group_lines, shown) =
+            render_grouped_todo_lines(&groups, &data.todo_goals, inner, true, available_lines);
+        lines.extend(group_lines);
+        if total > shown {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  +{} more", total - shown),
+                Style::default().fg(rgb(100, 100, 110)),
+            )]));
+        }
+        return lines;
+    }
+
+    // Flat list: the whole list is one implicit goal, so its hill score
+    // (if recorded) lives on the header line.
+    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+        push_goal_hill_suffix(&mut header, goal);
+    }
     lines.push(Line::from(header));
 
     // Sort todos: in_progress first, then pending, then completed
     let mut sorted_todos: Vec<&crate::todo::TodoItem> = data.todos.iter().collect();
-    sorted_todos.sort_by(|a, b| {
-        let order = |s: &str| match s {
-            "in_progress" => 0,
-            "pending" => 1,
-            "completed" => 2,
-            "cancelled" => 3,
-            _ => 4,
-        };
-        order(&a.status).cmp(&order(&b.status))
-    });
+    sorted_todos.sort_by(|a, b| status_sort_rank(&a.status).cmp(&status_sort_rank(&b.status)));
 
     // Render todos with priority colors
-    let available_lines = MAX_TODO_LINES.saturating_sub(1); // Account for header
     for todo in sorted_todos.iter().take(available_lines) {
-        let is_blocked = !todo.blocked_by.is_empty();
-        let (icon, status_color) = if is_blocked && todo.status != "completed" {
-            ("⊳", rgb(180, 140, 100))
-        } else {
-            match todo.status.as_str() {
-                "completed" => ("✓", rgb(100, 180, 100)),
-                "in_progress" => ("▶", rgb(255, 200, 100)),
-                "cancelled" => ("✗", rgb(120, 80, 80)),
-                _ => ("○", rgb(120, 120, 130)),
-            }
-        };
-
-        // Priority indicator
-        let priority_marker = match todo.priority.as_str() {
-            "high" => ("!", rgb(255, 120, 100)),
-            "medium" => ("", rgb(200, 180, 100)),
-            _ => ("", rgb(120, 120, 130)),
-        };
-
-        let suffix = if is_blocked && todo.status != "completed" {
-            " (blocked)"
-        } else {
-            ""
-        };
-        let max_len = inner
-            .width
-            .saturating_sub(4 + suffix.len() as u16 + todo_confidence_suffix_width(todo))
-            as usize;
-        let content = truncate_smart(&todo.content, max_len);
-
-        // Dim completed and blocked items
-        let text_color = if todo.status == "completed" {
-            rgb(100, 100, 110)
-        } else if is_blocked {
-            rgb(120, 120, 130)
-        } else if todo.status == "in_progress" {
-            rgb(200, 200, 210)
-        } else {
-            rgb(160, 160, 170)
-        };
-
-        let mut spans = vec![Span::styled(
-            format!("{} ", icon),
-            Style::default().fg(status_color),
-        )];
-
-        if !priority_marker.0.is_empty() {
-            spans.push(Span::styled(
-                priority_marker.0,
-                Style::default().fg(priority_marker.1),
-            ));
-        }
-
-        spans.push(Span::styled(content, Style::default().fg(text_color)));
-        push_todo_confidence_suffix(&mut spans, todo);
-
-        if !suffix.is_empty() {
-            spans.push(Span::styled(
-                suffix.to_string(),
-                Style::default().fg(rgb(100, 100, 110)),
-            ));
-        }
-
-        lines.push(Line::from(spans));
+        push_todo_item_line(&mut lines, todo, inner, true, 0);
     }
 
     // Show count of remaining items
@@ -439,11 +674,14 @@ pub(super) fn render_todos_compact(data: &InfoWidgetData, _inner: Rect) -> Vec<L
             Style::default().fg(rgb(140, 140, 150)),
         ),
     ];
-    push_aggregate_confidence_suffix(&mut summary, data);
+    push_aggregate_confidence_suffix(&mut summary, aggregate_todo_confidence(&data.todos));
+    if let Some(goal) = goal_for_group(&data.todo_goals, None) {
+        push_goal_hill_suffix(&mut summary, goal);
+    }
 
     vec![
         Line::from(vec![Span::styled(
-            "Todos",
+            todos_widget_label(data),
             Style::default().fg(rgb(180, 180, 190)).bold(),
         )]),
         Line::from(summary),

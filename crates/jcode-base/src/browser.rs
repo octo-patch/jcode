@@ -28,7 +28,7 @@ const REQUIRED_BRIDGE_ACTION_PROBES: &[(&str, &str)] = &[
     ("scroll", r#"{"position":"top"}"#),
     (
         "uploadFile",
-        r#"{"selector":"input[type=file]","path":"/tmp/jcode-browser-capability-probe"}"#,
+        r#"{"selector":"input[type=file]","filePath":"/tmp/jcode-browser-capability-probe"}"#,
     ),
 ];
 
@@ -111,8 +111,41 @@ pub fn ensure_browser_session(session_id: &str) -> Option<String> {
         return None;
     }
 
-    let result = std::process::Command::new(&bin)
-        .args(["session", "start", &session_name])
+    // Bind each agent session to a dedicated browser window when the installed
+    // bridge supports it. Older bridge CLIs reject --bind-window, so probe the
+    // command surface instead of paying for a known-failing process launch on
+    // every browser action.
+    if browser_supports_bind_window(&bin)
+        && let Some(name) = spawn_browser_session(&bin, &session_name, true)
+    {
+        return Some(name);
+    }
+    spawn_browser_session(&bin, &session_name, false)
+}
+
+fn browser_supports_bind_window(bin: &std::path::Path) -> bool {
+    std::process::Command::new(bin)
+        .args(["session", "start", "--help"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout).contains("--bind-window")
+                || String::from_utf8_lossy(&output.stderr).contains("--bind-window")
+        })
+}
+
+fn spawn_browser_session(
+    bin: &std::path::Path,
+    session_name: &str,
+    bind_window: bool,
+) -> Option<String> {
+    let mut args = vec!["session", "start", session_name];
+    if bind_window {
+        args.push("--bind-window");
+    }
+    let result = std::process::Command::new(bin)
+        .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -120,25 +153,33 @@ pub fn ensure_browser_session(session_id: &str) -> Option<String> {
 
     match result {
         Ok(mut child) => {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while std::time::Instant::now() < deadline {
-                if session_socket_path(&session_name).exists() && is_session_alive(&session_name) {
+                if session_socket_path(session_name).exists() && is_session_alive(session_name) {
                     let _ = child.stdout.take();
-                    return Some(session_name);
+                    return Some(session_name.to_string());
                 }
                 if let Ok(Some(status)) = child.try_wait() {
                     eprintln!(
-                        "[browser] session '{}' exited before startup with status {}",
-                        session_name, status
+                        "[browser] session '{}' exited before startup with status {}{}",
+                        session_name,
+                        status,
+                        if bind_window {
+                            " (retrying without --bind-window)"
+                        } else {
+                            ""
+                        }
                     );
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             eprintln!(
-                "[browser] session '{}' did not start within 5s",
+                "[browser] session '{}' did not start within 10s",
                 session_name
             );
+            let _ = child.kill();
+            let _ = child.wait();
             None
         }
         Err(e) => {
@@ -368,8 +409,15 @@ async fn download_browser_binary() -> Result<()> {
     let asset_name = get_platform_asset_name();
     let client = jcode_provider_core::shared_http_client();
 
-    let release_info: serde_json::Value = client
+    let mut request = client
         .get(GITHUB_API_LATEST)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json");
+    // Avoid the shared unauthenticated 60 req/h per-IP GitHub bucket when a
+    // token is available (see crate::github).
+    if let Some(token) = crate::github::github_public_api_token() {
+        request = request.bearer_auth(token);
+    }
+    let release_info: serde_json::Value = request
         .send()
         .await?
         .json()
@@ -466,7 +514,7 @@ async fn download_browser_binary() -> Result<()> {
     Ok(())
 }
 
-fn write_file_atomically(path: &PathBuf, bytes: &[u8], executable: bool) -> Result<()> {
+fn write_file_atomically(path: &PathBuf, bytes: &[u8], _executable: bool) -> Result<()> {
     let parent = path
         .parent()
         .context("Target file has no parent directory")?;
@@ -488,7 +536,7 @@ fn write_file_atomically(path: &PathBuf, bytes: &[u8], executable: bool) -> Resu
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = if executable { 0o755 } else { 0o644 };
+        let mode = if _executable { 0o755 } else { 0o644 };
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))?;
     }
 
@@ -656,22 +704,50 @@ fn native_messaging_hosts_dir() -> Result<PathBuf> {
     }
 }
 
+/// How long to wait for the browser CLI before declaring the bridge dead.
+///
+/// The CLI round-trips to the Firefox extension over `ws://127.0.0.1:8766`. If
+/// the extension is missing, disabled, or Firefox is closed, nothing ever
+/// answers and an unbounded `.output().await` hangs `browser status` and
+/// `browser setup` for minutes. See #602.
+const BRIDGE_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run the browser CLI with a hard timeout, killing the child if it overruns.
+///
+/// `Ok(None)` means the call timed out, which callers treat as "not
+/// responding" so they fail fast instead of hanging.
+async fn run_browser_cli_capped(
+    bin: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<Option<std::process::Output>> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args).kill_on_drop(true);
+
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(output) => Ok(Some(output?)),
+        Err(_) => {
+            crate::logging::warn(&format!(
+                "browser CLI '{}' timed out after {}s; treating the bridge as not responding",
+                args.first().copied().unwrap_or("(no action)"),
+                timeout.as_secs()
+            ));
+            Ok(None)
+        }
+    }
+}
+
 async fn check_browser_ping() -> Result<bool> {
     let bin = browser_binary_path();
     if !bin.exists() {
         return Ok(false);
     }
 
-    let output = tokio::process::Command::new(&bin)
-        .arg("ping")
-        .output()
-        .await?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.contains("pong"))
-    } else {
-        Ok(false)
+    match run_browser_cli_capped(&bin, &["ping"], BRIDGE_PING_TIMEOUT).await? {
+        Some(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).contains("pong"))
+        }
+        _ => Ok(false),
     }
 }
 
@@ -681,11 +757,13 @@ async fn probe_bridge_action_support(action: &str, params_json: &str) -> Result<
         return Ok(false);
     }
 
-    let output = tokio::process::Command::new(&bin)
-        .arg(action)
-        .arg(params_json)
-        .output()
-        .await?;
+    let Some(output) =
+        run_browser_cli_capped(&bin, &[action, params_json], BRIDGE_PING_TIMEOUT).await?
+    else {
+        // A dead bridge cannot tell us whether the action exists; report it as
+        // unsupported rather than hanging the caller (#602).
+        return Ok(false);
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -777,8 +855,19 @@ async fn wait_for_ready(timeout_secs: u64) -> Result<bool> {
     Ok(false)
 }
 
+/// Whether `browser setup` should offer to (re)install the bridge extension.
+///
+/// Keying only off the persistent `.setup-complete` marker meant that once a
+/// past setup succeeded, setup could never recover if the extension later
+/// vanished from the live Firefox profile: it just printed "already completed".
+/// Also re-prompt when the binary is installed but the bridge is not
+/// responding, which is the only signal that a previously-working setup lost
+/// its extension. A healthy responding bridge stays inert. See #602.
 fn should_prompt_extension_install(status: &BrowserStatus) -> bool {
-    !status.setup_complete
+    if !status.setup_complete {
+        return true;
+    }
+    status.binary_installed && !status.responding
 }
 
 async fn install_extension() -> Result<String> {
@@ -802,7 +891,30 @@ async fn install_extension() -> Result<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = tokio::process::Command::new("open").arg(&xpi_url).spawn();
+        // macOS has no default handler for `.xpi` files, so a plain `open <url>`
+        // fails with kLSApplicationNotFoundErr. Open the XPI directly with
+        // Firefox, which knows how to install extensions. Try the app name first,
+        // then fall back to the bundle id (covers Firefox installed under a
+        // non-default name or when it is not the default browser).
+        let opened = tokio::process::Command::new("open")
+            .args(["-a", "Firefox", &xpi_url])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !opened {
+            let opened_by_id = tokio::process::Command::new("open")
+                .args(["-b", "org.mozilla.firefox", &xpi_url])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !opened_by_id {
+                // Last resort: let Launch Services pick a handler. This likely
+                // fails for `.xpi`, but keeps the previous behavior as a fallback.
+                let _ = tokio::process::Command::new("open").arg(&xpi_url).spawn();
+            }
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -833,5 +945,6 @@ pub async fn run_setup_command() -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 #[path = "browser_tests.rs"]
 mod browser_tests;

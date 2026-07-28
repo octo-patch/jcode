@@ -49,32 +49,74 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::hidden("/model-status", "Alias for /provider-test-coverage"),
     RegisteredCommand::public("/refresh-model-list", "Refresh provider model catalogs"),
     RegisteredCommand::public("/agents", "Configure models for agent roles"),
+    RegisteredCommand::public(
+        "/swarm-prompt",
+        "Open the active swarm routing prompt in your editor",
+    ),
     RegisteredCommand::public("/subagent", "Launch a subagent manually"),
     RegisteredCommand::public("/observe", "Show the latest tool context in the side panel"),
-    RegisteredCommand::public(
-        "/todos",
-        "Show the current session todo list in the side panel",
-    ),
+    RegisteredCommand::public("/todos", "Show the session todo list as a card in the chat"),
+    RegisteredCommand::hidden("/todo", "Alias for /todos"),
     RegisteredCommand::public("/splitview", "Mirror the current chat in the side panel"),
     RegisteredCommand::public("/split-view", "Alias for /splitview"),
     RegisteredCommand::public("/btw", "Ask a side question in the side panel"),
     RegisteredCommand::public("/ssh", "Connect to a remote machine using system SSH"),
     RegisteredCommand::public("/git", "Show git status for the session working directory"),
+    RegisteredCommand::public("/hotkeys", "List hotkeys with your personal usage"),
     RegisteredCommand::public("/commit", "Make logical commits from current changes"),
+    RegisteredCommand::public(
+        "/commit-push",
+        "Make logical commits from current changes, then push",
+    ),
+    RegisteredCommand::hidden("/commit-and-push", "Alias for /commit-push"),
+    RegisteredCommand::public(
+        "/fast-release",
+        "Publish Linux immediately from the warm selfdev cache; CI adds other platforms",
+    ),
+    RegisteredCommand::public("/remote", "Reach this session from another machine"),
+    RegisteredCommand::public(
+        "/remote-release",
+        "Push the release tag immediately; CI builds and publishes every platform",
+    ),
+    RegisteredCommand::hidden("/cut-release", "Alias for /fast-release"),
+    RegisteredCommand::hidden("/commit-push-release", "Alias for /cut-release"),
+    RegisteredCommand::public(
+        "/triage",
+        "Triage new GitHub issues and autonomously fix the safe ones",
+    ),
     RegisteredCommand::public("/transcript", "Open the current session transcript file"),
     RegisteredCommand::public("/subagent-model", "Show/change subagent model policy"),
     RegisteredCommand::public("/autoreview", "Show/toggle automatic end-of-turn review"),
     RegisteredCommand::public("/autojudge", "Show/toggle automatic end-of-turn judging"),
     RegisteredCommand::public("/review", "Launch a one-shot headed review session"),
     RegisteredCommand::public("/judge", "Launch a one-shot headed judge session"),
-    RegisteredCommand::public("/effort", "Show/change reasoning effort (Alt+left/right)"),
+    RegisteredCommand::public("/effort", crate::tui::keybind::EFFORT_HELP),
     RegisteredCommand::public("/fast", "Toggle fast mode"),
     RegisteredCommand::public("/transport", "Show/change connection transport"),
     RegisteredCommand::public("/alignment", "Show/change default text alignment"),
+    RegisteredCommand::public(
+        "/compact-notifications",
+        "Show/toggle single-line swarm/file-activity notifications",
+    ),
+    RegisteredCommand::public(
+        "/show-agentgrep-output",
+        "Show/toggle full agentgrep search output inline in chat",
+    ),
+    RegisteredCommand::public(
+        "/tool-call-details",
+        "Show/toggle dimmed technical details on tool rows with an intent",
+    ),
+    RegisteredCommand::public(
+        "/thinking-display",
+        "Show/hide the model's thinking text (off/full/current)",
+    ),
+    RegisteredCommand::hidden("/thinking", "Alias for /thinking-display"),
+    RegisteredCommand::hidden("/reasoning", "Alias for /thinking-display"),
+    RegisteredCommand::public("/cancel", "Cancel the current prompt or operation"),
     RegisteredCommand::public("/clear", "Clear conversation history"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
     RegisteredCommand::public("/poke", "Poke model to resume with incomplete todos"),
-    RegisteredCommand::public("/plan", "Create a plan-only response in the side panel"),
+    RegisteredCommand::public("/plan", "Create a plan-only response as a plan card"),
     RegisteredCommand::public("/improve", "Autonomously improve the repository"),
     RegisteredCommand::public("/refactor", "Run a safe refactor loop"),
     RegisteredCommand::public("/compact", "Compact context"),
@@ -91,14 +133,31 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/swarm", "Toggle swarm feature"),
     RegisteredCommand::public("/overnight", "Run a supervised overnight coordinator"),
     RegisteredCommand::public("/context", "Show the full session context snapshot"),
+    RegisteredCommand::public(
+        "/skills",
+        "Show loaded skills and jcode-endorsed recommendations",
+    ),
     RegisteredCommand::public("/version", "Show current version"),
     RegisteredCommand::public("/changelog", "Show recent changes in this build"),
     RegisteredCommand::public("/info", "Show session info and tokens"),
     RegisteredCommand::public("/usage", "Show connected provider usage limits"),
+    RegisteredCommand::public(
+        "/productivity",
+        "Generate a shareable usage report + dashboard image",
+    ),
+    RegisteredCommand::public("/wrapped", "Alias for /productivity"),
     RegisteredCommand::public("/feedback", "Send feedback about jcode"),
+    RegisteredCommand::public("/telemetry", "Show or change what jcode sends"),
+    RegisteredCommand::public("/support", "Email support with diagnostics prefilled"),
     RegisteredCommand::public("/subscription", "Show jcode subscription status"),
+    RegisteredCommand::public("/subscribe", "Why and how to subscribe to jcode"),
     RegisteredCommand::public("/config", "Show or edit configuration"),
     RegisteredCommand::public("/log", "Mark the current location in the jcode logs"),
+    RegisteredCommand::public(
+        "/keys",
+        "Show keybinding conflicts with your terminal and OS (/keys refresh to rescan)",
+    ),
+    RegisteredCommand::hidden("/keybindings", "Alias for /keys"),
     RegisteredCommand::public(
         "/diff",
         "Cycle or set diff display mode (off/inline/full/pinned/file)",
@@ -106,6 +165,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public(
         "/onboarding-preview",
         "Preview the first-run onboarding screen",
+    ),
+    RegisteredCommand::public(
+        "/onboarding-sim",
+        "Walk through every first-run onboarding screen (Alt+5 reset, Cmd+5 toggle)",
     ),
     RegisteredCommand::public("/reload", "Reload into newest available binary"),
     RegisteredCommand::public("/restart", "Restart with current binary"),
@@ -115,12 +178,14 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/resume", "Open session picker"),
     RegisteredCommand::public("/sessions", "Alias for /resume"),
     RegisteredCommand::public("/session", "Alias for /resume"),
+    RegisteredCommand::public("/active", "Manage live sessions (working vs ready)"),
     RegisteredCommand::public("/catchup", "Open Catch Up picker"),
     RegisteredCommand::public("/back", "Return to the previous Catch Up session"),
     RegisteredCommand::public("/save", "Bookmark session for easy access"),
     RegisteredCommand::public("/unsave", "Remove bookmark from session"),
     RegisteredCommand::public("/rename", "Rename current session"),
-    RegisteredCommand::public("/split", "Split session into a new window"),
+    RegisteredCommand::public("/fork", "Fork session into a new window (optional prompt)"),
+    RegisteredCommand::hidden("/split", "Alias for /fork"),
     RegisteredCommand::public("/transfer", "Compact context into a fresh handoff session"),
     RegisteredCommand::public("/workspace", "Niri-style session workspace"),
     RegisteredCommand::public("/quit", "Exit jcode"),
@@ -136,11 +201,28 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/record", "Record a demo capture"),
     RegisteredCommand::remote("/client-reload", "Force reload client binary"),
     RegisteredCommand::remote("/server-reload", "Force reload server binary"),
+    RegisteredCommand::remote(
+        "/continue",
+        "Continue every interrupted live session that would auto-resume",
+    ),
+    RegisteredCommand::remote("/resumeall", "Alias for /continue"),
+    RegisteredCommand::hidden("/resume-all", "Alias for /continue"),
     RegisteredCommand::hidden("/z", "Secret premium-mode command"),
     RegisteredCommand::hidden("/zz", "Secret premium-mode command"),
     RegisteredCommand::hidden("/zzz", "Secret premium-mode command"),
     RegisteredCommand::hidden("/zstatus", "Secret premium-mode status command"),
 ];
+
+/// Every non-hidden slash command with its one-line description, in
+/// registration order. The `/help` overlay uses this to list commands its
+/// hand-written sections have not covered, so a newly registered command can
+/// never be invisible to users.
+pub(crate) fn registered_command_entries() -> impl Iterator<Item = (&'static str, &'static str)> {
+    REGISTERED_COMMANDS
+        .iter()
+        .filter(|command| !command.hidden)
+        .map(|command| (command.name, command.help))
+}
 
 impl App {
     /// Find word boundary going backward (for Ctrl+W, Alt+B)
@@ -214,34 +296,11 @@ impl App {
         self.cursor_pos = self.input.len();
     }
 
-    pub(super) fn fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
-        if needle.is_empty() {
-            return Some(0);
-        }
-        // Both needle and haystack should start with '/', match from char 1 onward
-        let n = needle.strip_prefix('/').unwrap_or(needle);
-        let h = haystack.strip_prefix('/').unwrap_or(haystack);
-        if n.is_empty() {
-            return Some(0);
-        }
-        // First char of the command (after /) must match
-        if let Some(first_char) = n.chars().next()
-            && !h.starts_with(&n[..first_char.len_utf8()])
-        {
-            return None;
-        }
-        let mut score = 0usize;
-        let mut pos = 0usize;
-        for ch in n.chars() {
-            let idx = h[pos..].find(ch)?;
-            score += idx;
-            pos += idx + ch.len_utf8();
-        }
-        // Penalize large gaps - reject if average gap is too big
-        if n.len() > 1 && score > n.len() * 3 {
-            return None;
-        }
-        Some(score)
+    /// Typo-resistant fuzzy score. Higher is better; `None` means no match.
+    /// Delegates to the shared [`crate::tui::fuzzy`] matcher so slash-command
+    /// ranking and highlight positions stay in sync.
+    pub(super) fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+        crate::tui::fuzzy::fuzzy_score(needle, haystack)
     }
 
     pub(super) fn rank_suggestions(
@@ -250,18 +309,20 @@ impl App {
         candidates: Vec<(String, &'static str)>,
     ) -> Vec<(String, &'static str)> {
         let needle = needle.to_lowercase();
-        let mut scored: Vec<(bool, usize, String, &'static str)> = Vec::new();
+        // Bucket 1 = literal prefix matches (exact typing always wins).
+        // Bucket 0 = typo-tolerant fuzzy matches by descending score.
+        let mut scored: Vec<(u8, i32, String, &'static str)> = Vec::new();
         for (cmd, help) in candidates {
             let lower = cmd.to_lowercase();
             if lower.starts_with(&needle) {
-                scored.push((true, 0, cmd, help));
+                scored.push((1, i32::MAX, cmd, help));
             } else if let Some(score) = Self::fuzzy_score(&needle, &lower) {
-                scored.push((false, score, cmd, help));
+                scored.push((0, score, cmd, help));
             }
         }
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| b.1.cmp(&a.1))
                 .then_with(|| a.2.len().cmp(&b.2.len()))
                 .then_with(|| a.2.cmp(&b.2))
         });
@@ -658,7 +719,7 @@ impl App {
         }
 
         if prefix.starts_with("/effort ") {
-            let efforts = ["none", "low", "medium", "high", "xhigh"];
+            let efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
             return self.rank_suggestions(
                 input,
                 efforts
@@ -930,6 +991,66 @@ impl App {
             );
         }
 
+        if prefix.starts_with("/compact-notifications ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/compact-notifications status".into(),
+                        "Show whether notifications are compact",
+                    ),
+                    (
+                        "/compact-notifications on".into(),
+                        "Collapse swarm/file-activity notifications to one line",
+                    ),
+                    (
+                        "/compact-notifications off".into(),
+                        "Show full multi-line notification cards",
+                    ),
+                ],
+            );
+        }
+
+        if prefix.starts_with("/tool-call-details ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/tool-call-details status".into(),
+                        "Show whether technical details render on intent rows",
+                    ),
+                    (
+                        "/tool-call-details on".into(),
+                        "Show the dimmed technical detail next to tool intents",
+                    ),
+                    (
+                        "/tool-call-details off".into(),
+                        "Show only the intent on tool rows that have one",
+                    ),
+                ],
+            );
+        }
+
+        if prefix.starts_with("/show-agentgrep-output ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/show-agentgrep-output status".into(),
+                        "Show whether agentgrep output is shown inline",
+                    ),
+                    (
+                        "/show-agentgrep-output on".into(),
+                        "Render full agentgrep search results inline in chat",
+                    ),
+                    (
+                        "/show-agentgrep-output off".into(),
+                        "Show only the one-line agentgrep summary",
+                    ),
+                ],
+            );
+        }
+
         if prefix.starts_with("/config ") {
             return self.rank_suggestions(
                 input,
@@ -985,7 +1106,7 @@ impl App {
 
         if prefix.starts_with("/rewind ") {
             let arg = prefix.strip_prefix("/rewind ").unwrap_or_default().trim();
-            let visible_count = self.session.visible_conversation_message_count();
+            let visible_count = self.session.rewind_target_count();
 
             // Rewind targets are 1-based visible conversation message numbers.
             // Do not fuzzy-rank numeric arguments: `/rewind 10` should never be
@@ -1012,13 +1133,89 @@ impl App {
 
     /// Get command suggestions based on current input
     pub fn command_suggestions(&self) -> Vec<(String, &'static str)> {
-        if self
-            .inline_interactive_state
-            .as_ref()
-            .is_some_and(|picker| picker.preview && picker.kind == crate::tui::PickerKind::Model)
+        // Read up to eight times per frame; recomputing each time re-ranks
+        // every registered command and skill (and can touch disk for some
+        // prefixes). Memoize on the exact input plus the guard state the
+        // branches below consult, so any transition still recomputes.
+        let signature = self.command_suggestions_signature();
+        let epoch = self.command_suggestions_epoch.get();
+        if let Some(cache) = self.command_suggestions_cache.borrow().as_ref()
+            && cache.epoch == epoch
+            && cache.signature == signature
+            && cache.input == self.input
+        {
+            return cache.suggestions.clone();
+        }
+
+        let suggestions = self.command_suggestions_uncached(&signature);
+        *self.command_suggestions_cache.borrow_mut() = Some(CommandSuggestionsCache {
+            input: self.input.clone(),
+            signature,
+            epoch,
+            suggestions: suggestions.clone(),
+        });
+        suggestions
+    }
+
+    /// Advance the suggestion memo epoch, invalidating it. Called once per
+    /// rendered frame so the memo only ever collapses reads *within* a frame
+    /// and never serves data that predates a state change.
+    pub(crate) fn advance_command_suggestions_epoch(&self) {
+        self.command_suggestions_epoch
+            .set(self.command_suggestions_epoch.get().wrapping_add(1));
+    }
+
+    /// Snapshot the non-input state that `command_suggestions` branches on
+    /// before consulting the input buffer.
+    pub(super) fn command_suggestions_signature(&self) -> CommandSuggestionsSignature {
+        CommandSuggestionsSignature {
+            pending_login: self.pending_login.is_some(),
+            pending_account_input: self.pending_account_input.is_some(),
+            pending_ssh_remote_name: self.pending_ssh_remote_name.is_some(),
+            inline_preview_kind: self
+                .inline_interactive_state
+                .as_ref()
+                .filter(|picker| picker.preview)
+                .map(|picker| picker.kind),
+        }
+    }
+
+    /// Uncached body of [`Self::command_suggestions`].
+    pub(super) fn command_suggestions_uncached(
+        &self,
+        signature: &CommandSuggestionsSignature,
+    ) -> Vec<(String, &'static str)> {
+        // While an interactive prompt is waiting for typed input (API key,
+        // OAuth callback, account label, SSH target), the composer is an
+        // answer box, not a command line. Rendering the full command palette
+        // there is misleading (issue #496): the only command those prompts
+        // advertise is /cancel, so suggest exactly that and nothing else.
+        if signature.pending_login
+            || signature.pending_account_input
+            || signature.pending_ssh_remote_name
         {
             let input = self.input.trim_start();
-            if input.starts_with("/model") || input.starts_with("/models") {
+            let typed = input.trim_end();
+            if !typed.is_empty() && typed.starts_with('/') && "/cancel".starts_with(typed) {
+                return vec![("/cancel".into(), "Cancel the pending prompt")];
+            }
+            return Vec::new();
+        }
+
+        // While an inline picker preview is open for the command being typed,
+        // the picker itself is the suggestion surface. Rendering the textual
+        // suggestion list underneath would duplicate it (and its rows are not
+        // arrow-navigable anyway, since the preview claims Up/Down first).
+        if let Some(kind) = signature.inline_preview_kind {
+            let input = self.input.trim_start();
+            let suppress = match kind {
+                crate::tui::PickerKind::Model => {
+                    input.starts_with("/model") || input.starts_with("/models")
+                }
+                crate::tui::PickerKind::Login => input.starts_with("/login"),
+                _ => false,
+            };
+            if suppress {
                 return Vec::new();
             }
         }
@@ -1098,6 +1295,7 @@ impl App {
         self.cursor_pos = self.input.len();
         self.tab_completion_state = None;
         self.command_suggestion_selected = 0;
+        self.sync_model_picker_preview_from_input();
         true
     }
 
@@ -1128,32 +1326,55 @@ impl App {
     /// the active guided flow phase. Defaults to the starter suggestion cards.
     pub fn onboarding_welcome_kind(&self) -> crate::tui::OnboardingWelcomeKind {
         use crate::tui::OnboardingWelcomeKind;
-        use crate::tui::app::onboarding_flow::OnboardingPhase;
+        use crate::tui::app::onboarding_flow::{OnboardingPhase, SummaryPill, TelemetryLevel};
         match self.onboarding_phase() {
             Some(OnboardingPhase::Login { import }) => {
-                let prompt = import.as_ref().and_then(|review| {
-                    review
-                        .current()
-                        .map(|candidate| crate::tui::LoginImportPrompt {
+                let prompt = import.as_ref().map(|review| {
+                    let rows = review
+                        .candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, candidate)| crate::tui::LoginImportRow {
                             provider_summary: candidate.provider_summary().to_string(),
                             source_name: candidate.source_name().to_string(),
-                            position: review.position(),
-                            total: review.total(),
-                            yes_highlighted: review.yes_highlighted,
-                            seconds_left: review.seconds_remaining(),
+                            checked: review.checked.get(i).copied().unwrap_or(false),
                         })
+                        .collect();
+                    crate::tui::LoginImportPrompt {
+                        rows,
+                        cursor: review.cursor,
+                        continue_focused: review.continue_focused,
+                        choosing: review.choosing,
+                        summary_pill: match review.summary_pill {
+                            SummaryPill::Continue => crate::tui::ImportSummaryPill::Continue,
+                            SummaryPill::ImportLess => crate::tui::ImportSummaryPill::ImportLess,
+                            SummaryPill::Telemetry => crate::tui::ImportSummaryPill::Telemetry,
+                        },
+                        telemetry: review.telemetry.map(|level| match level {
+                            TelemetryLevel::Everything => crate::tui::TelemetryChoice::Everything,
+                            TelemetryLevel::NoContent => crate::tui::TelemetryChoice::NoContent,
+                            TelemetryLevel::Nothing => crate::tui::TelemetryChoice::Nothing,
+                        }),
+                        telemetry_env_forced_off: crate::telemetry::opt_out_forced_by_env(),
+                        checked_count: review.checked_count(),
+                        seconds_left: review.seconds_remaining(),
+                    }
                 });
-                OnboardingWelcomeKind::Login { import: prompt }
+                OnboardingWelcomeKind::Login {
+                    import: prompt,
+                    importing: self.onboarding_import_in_progress.is_some(),
+                    error: self.onboarding_import_error.clone(),
+                    // Only offer the agent-repair option on the failure screen,
+                    // and only when we can name an agent the user recently used.
+                    repair_agent_label: self.onboarding_import_error.as_ref().and_then(|_| {
+                        crate::tui::app::onboarding_repair::detect_preferred_repair_agent()
+                            .map(|a| a.label().to_string())
+                    }),
+                }
             }
-            Some(OnboardingPhase::TelemetryConsent {
-                yes_highlighted,
-                shown_at,
-            }) => {
-                let total = crate::tui::app::onboarding_flow::DECISION_TIMEOUT.as_secs();
-                let seconds_left = total.saturating_sub(shown_at.elapsed().as_secs());
-                OnboardingWelcomeKind::TelemetryConsent {
+            Some(OnboardingPhase::LoginOpenAi { yes_highlighted }) => {
+                OnboardingWelcomeKind::LoginOpenAi {
                     yes_highlighted: *yes_highlighted,
-                    seconds_left,
                 }
             }
             Some(OnboardingPhase::ModelSelect) => OnboardingWelcomeKind::Suggestions,
@@ -1175,15 +1396,15 @@ impl App {
     }
 
     /// Whether the guided onboarding flow is in a phase that should take over
-    /// the welcome screen body (login, telemetry, or continue prompt). The
-    /// transcript-pick phase uses the session-picker overlay instead, and the
-    /// suggestions phase is the default welcome body.
+    /// the welcome screen body (login, OpenAI-login prompt, or continue prompt).
+    /// The transcript-pick phase uses the session-picker overlay instead, and
+    /// the suggestions phase is the default welcome body.
     fn onboarding_flow_drives_welcome(&self) -> bool {
         use crate::tui::app::onboarding_flow::OnboardingPhase;
         matches!(
             self.onboarding_phase(),
             Some(OnboardingPhase::Login { .. })
-                | Some(OnboardingPhase::TelemetryConsent { .. })
+                | Some(OnboardingPhase::LoginOpenAi { .. })
                 | Some(OnboardingPhase::ContinuePrompt { .. })
         )
     }
@@ -1213,16 +1434,7 @@ impl App {
         let is_new_user = if preview_mode {
             true
         } else {
-            crate::storage::jcode_dir()
-                .ok()
-                .and_then(|dir| {
-                    let path = dir.join("setup_hints.json");
-                    std::fs::read_to_string(&path).ok()
-                })
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-                .and_then(|v| v.get("launch_count")?.as_u64())
-                .map(|count| count <= 5)
-                .unwrap_or(true)
+            Self::is_new_user_install()
         };
 
         if !is_new_user {
@@ -1239,6 +1451,17 @@ impl App {
                 "Find a recent file or project I've been working on, read through it, and give me concrete suggestions on how I could improve it.".to_string(),
             ),
         ];
+
+        // macOS-only: offer to install ScrollWM, a scrolling window manager for
+        // macOS. The web installer downloads the latest release, strips the
+        // Gatekeeper quarantine, installs to ~/Applications, and launches it,
+        // with no sudo and no system files touched.
+        if cfg!(target_os = "macos") {
+            prompts.push((
+                "Install ScrollWM (scrolling window manager for macOS)".to_string(),
+                "Install ScrollWM, the scrolling window manager for macOS, by running its official one-line installer: `curl -fsSL https://raw.githubusercontent.com/1jehuang/scrollwm/main/scripts/web-install.sh | bash`. It downloads the latest release, removes the Gatekeeper quarantine, installs to ~/Applications, and launches it (no sudo, no system files touched). Run the command for me and report whether it succeeded.".to_string(),
+            ));
+        }
 
         prompts.push((
             "Continue my last Codex CLI / Claude Code session".to_string(),
@@ -1355,6 +1578,7 @@ impl App {
             "/help"
                 | "/?"
                 | "/btw"
+                | "/fork"
                 | "/git"
                 | "/transcript"
                 | "/observe"
@@ -1396,6 +1620,11 @@ impl App {
                 | "/compact"
                 | "/compact mode"
                 | "/alignment"
+                | "/compact-notifications"
+                | "/show-agentgrep-output"
+                | "/reasoning"
+                | "/thinking"
+                | "/thinking-display"
                 | "/config"
                 | "/save"
                 | "/rename"
@@ -1414,7 +1643,45 @@ struct ExternalCliSuggestionCandidate {
     context: Option<String>,
 }
 
+/// How long a scan of the external-CLI session directories is reused before we
+/// re-scan. The onboarding welcome screen animates a donut, so it redraws at
+/// animation FPS and calls [`latest_external_cli_continuation_prompt`] multiple
+/// times per frame. Scanning `~/.codex/sessions` / `~/.claude/projects` (reading
+/// and JSON-parsing the newest transcripts) can cost hundreds of milliseconds
+/// for users with large histories, which would otherwise make first-run
+/// onboarding extremely laggy. A short TTL keeps the suggestion fresh while
+/// reducing the cost to a single scan per window.
+const EXTERNAL_CLI_PROMPT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cached result of the external-CLI continuation-prompt scan, with the time it
+/// was computed. `None` value means "scanned, but nothing found".
+type ExternalCliPromptCache = std::sync::RwLock<Option<(Option<String>, std::time::Instant)>>;
+static EXTERNAL_CLI_PROMPT_CACHE: std::sync::LazyLock<ExternalCliPromptCache> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// Cached front-end for [`latest_external_cli_continuation_prompt_uncached`].
+///
+/// See [`EXTERNAL_CLI_PROMPT_CACHE_TTL`] for why this is cached: the uncached
+/// scan reads and parses the newest external transcripts, which is expensive for
+/// large histories and would otherwise run several times per onboarding frame.
 fn latest_external_cli_continuation_prompt() -> Option<String> {
+    if let Ok(cache) = EXTERNAL_CLI_PROMPT_CACHE.read()
+        && let Some((ref value, ref when)) = *cache
+        && when.elapsed() < EXTERNAL_CLI_PROMPT_CACHE_TTL
+    {
+        return value.clone();
+    }
+
+    let value = latest_external_cli_continuation_prompt_uncached();
+
+    if let Ok(mut cache) = EXTERNAL_CLI_PROMPT_CACHE.write() {
+        *cache = Some((value.clone(), std::time::Instant::now()));
+    }
+
+    value
+}
+
+fn latest_external_cli_continuation_prompt_uncached() -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let mut candidates = Vec::new();
     candidates.extend(latest_jsonl_suggestion_candidates(
@@ -1634,6 +1901,40 @@ mod external_cli_suggestion_tests {
     use super::*;
     use std::io::Write;
 
+    /// Faithful, real-home measurement of the per-frame onboarding cost.
+    /// Ignored by default (depends on local ~/.codex and ~/.claude contents).
+    /// Run with:
+    ///   cargo test -p jcode-tui --lib onboarding_suggestion_scan_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn onboarding_suggestion_scan_cost() {
+        use std::time::Instant;
+
+        // Cold: the uncached scan that reads + JSON-parses the newest external
+        // transcripts. This is the work that used to run several times per frame.
+        let cold_start = Instant::now();
+        let cold = latest_external_cli_continuation_prompt_uncached();
+        let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Warm: the cached front-end the onboarding screen actually calls. Prime
+        // the cache once, then measure repeated calls (as a redrawing frame does).
+        let _ = latest_external_cli_continuation_prompt();
+        let runs = 1000;
+        let warm_start = Instant::now();
+        let mut warm = None;
+        for _ in 0..runs {
+            warm = latest_external_cli_continuation_prompt();
+        }
+        let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+
+        eprintln!(
+            "external-cli continuation prompt: cold(uncached)={cold_ms:.1} ms, \
+             warm(cached, avg of {runs})={warm_ms:.4} ms; cold_some={}, warm_some={}",
+            cold.is_some(),
+            warm.is_some()
+        );
+    }
+
     #[test]
     fn parses_claude_code_jsonl_with_session_path_and_context() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1709,5 +2010,41 @@ mod external_cli_suggestion_tests {
         let candidates = latest_jsonl_suggestion_candidates(temp.path(), "Claude Code", 1);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].context.as_deref(), Some("new"));
+    }
+
+    /// Every slash command must be registered exactly once. Duplicate entries
+    /// mean two different handlers claim the same name, so which one runs
+    /// depends on dispatch order rather than on the registry the palette and
+    /// `/help` show the user.
+    #[test]
+    fn registered_commands_have_no_duplicate_names() {
+        let mut seen = std::collections::HashSet::new();
+        let duplicates: Vec<&str> = REGISTERED_COMMANDS
+            .iter()
+            .filter(|command| !seen.insert(command.name))
+            .map(|command| command.name)
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "duplicate slash command registrations: {:?}",
+            duplicates
+        );
+    }
+
+    /// Aliases users can actually type must be discoverable through the
+    /// registry, otherwise autocomplete silently omits working commands.
+    #[test]
+    fn known_aliases_are_registered() {
+        let names: std::collections::HashSet<&str> =
+            REGISTERED_COMMANDS.iter().map(|c| c.name).collect();
+        for alias in [
+            "/keybindings",
+            "/commit-and-push",
+            "/resume-all",
+            "/hotkeys",
+            "/keys",
+        ] {
+            assert!(names.contains(alias), "{alias} is not registered");
+        }
     }
 }

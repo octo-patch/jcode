@@ -28,6 +28,14 @@ pub fn debug_flicker_benchmark(steps: usize) -> MermaidFlickerBenchmark {
     debug_support::debug_flicker_benchmark(steps)
 }
 
+pub fn debug_image_scroll_benchmark(
+    images: usize,
+    frames: usize,
+    visible_per_frame: usize,
+) -> ImageScrollBenchmark {
+    debug_support::debug_image_scroll_benchmark(images, frames, visible_per_frame)
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 fn parse_proc_status_value_bytes(status: &str, key: &str) -> Option<u64> {
@@ -45,13 +53,17 @@ pub fn clear_cache() -> Result<(), String> {
     if let Ok(mut cache) = RENDER_CACHE.lock() {
         cache.entries.clear();
         cache.order.clear();
+        cache.width_miss_floor.clear();
     }
+    clear_layout_cache();
     if let Ok(mut state) = IMAGE_STATE.lock() {
         state.clear();
     }
     if let Ok(mut source) = SOURCE_CACHE.lock() {
-        source.entries.clear();
-        source.order.clear();
+        source.clear();
+    }
+    if let Ok(mut fitted) = FITTED_SOURCE_CACHE.lock() {
+        fitted.clear();
     }
     if let Ok(mut kitty) = KITTY_VIEWPORT_STATE.lock() {
         kitty.clear();
@@ -101,6 +113,7 @@ pub fn debug_image_state() -> Vec<ImageStateInfo> {
                     ResizeMode::Scale => "Scale".to_string(),
                     ResizeMode::Crop => "Crop".to_string(),
                     ResizeMode::Viewport => "Viewport".to_string(),
+                    ResizeMode::FitViewport => "FitViewport".to_string(),
                 },
                 last_area: img_state
                     .last_area
@@ -166,6 +179,7 @@ pub fn debug_render(content: &str) -> TestRenderResult {
                     ResizeMode::Scale => "Scale".to_string(),
                     ResizeMode::Crop => "Crop".to_string(),
                     ResizeMode::Viewport => "Viewport".to_string(),
+                    ResizeMode::FitViewport => "FitViewport".to_string(),
                 })
             } else {
                 None
@@ -238,6 +252,7 @@ pub fn debug_test_resize_stability(hash: u64) -> serde_json::Value {
                 ResizeMode::Scale => "Scale",
                 ResizeMode::Crop => "Crop",
                 ResizeMode::Viewport => "Viewport",
+                ResizeMode::FitViewport => "FitViewport",
             })
         } else {
             None
@@ -389,6 +404,7 @@ pub fn debug_test_scroll(content: Option<&str>) -> ScrollTestResult {
                     ResizeMode::Scale => "Scale",
                     ResizeMode::Crop => "Crop",
                     ResizeMode::Viewport => "Viewport",
+                    ResizeMode::FitViewport => "FitViewport",
                 };
                 frame_info.resize_mode = Some(mode.to_string());
                 modes_seen.push(mode.to_string());

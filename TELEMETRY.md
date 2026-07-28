@@ -1,6 +1,6 @@
 # jcode Telemetry
 
-jcode collects **anonymous, minimal usage statistics** to help understand how many people use jcode, what providers/models are popular, whether onboarding works, which feature families are used, how often sessions succeed, and whether performance/regressions are improving. This data helps prioritize development without collecting prompts or code.
+jcode collects **anonymous, minimal usage statistics** to help understand how many people use jcode, what providers/models are popular, whether onboarding works, which feature families are used, how often sessions succeed, and whether performance/regressions are improving. This data helps prioritize development. **We do not collect your prompts, your code, or your conversation transcripts.**
 
 Recent telemetry additions also include: coarse onboarding steps, explicit thumbs-up / thumbs-down feedback, build-channel / dev-mode cleanup flags, session/workflow/tool-category summaries, coarse project language buckets, retention helpers like active days in the last 7 / 30 days, workflow cadence fields for session timing and multi-sessioning, privacy-safe per-turn timing/outcome metrics, and schema v5 agent-time / autonomy / pain-attribution metrics.
 
@@ -54,6 +54,39 @@ Recent telemetry additions also include: coarse onboarding steps, explicit thumb
 | `feedback_text` | `"The model switcher is confusing"` | Freeform feedback explicitly submitted with `/feedback ...` |
 | `feedback_rating` | `"up"` / `"down"` | Legacy explicit product sentiment, if present |
 | `feedback_reason` | `"slow"` | Legacy optional coarse reason bucket, if present |
+
+### Sponsored Discovery Event
+
+One event is sent after each `discover_tools` attempt. A random per-request ID
+is also sent to the discovery API as the `x-jcode-discovery-request-id` header,
+allowing client reliability telemetry to be correlated with server request logs
+without exposing prompts or a persistent telemetry identifier to that service.
+
+| Field | Example | Purpose |
+|-------|---------|----------|
+| `event` | `"discovery"` | Event type |
+| `request_id` | `"9a23..."` | Random correlation ID scoped to one request |
+| `phase` | `"browse"` / `"select"` / `"suggest"` / `"unknown"` | Discovery funnel stage; `suggest` records a missing catalog capability proposal |
+| `category` | `"payments"` | Fixed discovery category, when valid |
+| `selected_tool` | `"agentcard"` | Public catalog tool name in the select phase |
+| `outcome` | `"success"` / `"failure"` | Attempt result |
+| `failure_reason` | `"timeout"` | Allowlisted coarse failure class only |
+| `http_status` | `200` | Discovery service response status, if received |
+| `latency_ms` | `125` | End-to-end client attempt latency |
+| `response_bytes` | `2048` | Response payload size, if received |
+| `result_count` | `3` | Number of browse results, or one for selection |
+| `query_present` / `reason_present` | `true` / `true` | Presence flags only |
+| `custom_endpoint` | `false` | Whether a non-default discovery endpoint was configured |
+| `benchmark_run` | `false` | Explicit marker set by the live Discovery benchmark so it can be excluded from ordinary usage analysis |
+
+The query text, selection-reason text, endpoint URL, prompts, transcript, file
+paths, and tool setup instructions are **not** included in telemetry. The
+backend rejects unknown phase, outcome, and failure labels rather than storing
+arbitrary strings.
+
+The benchmark runner sets `JCODE_DISCOVERY_BENCHMARK=1`. Discovery requests then
+carry `x-jcode-discovery-benchmark: 1`, and the corresponding telemetry event has
+`benchmark_run: true`.
 
 ### Session Start Event
 
@@ -113,8 +146,9 @@ Recent telemetry additions also include: coarse onboarding steps, explicit thumb
 | `input_tokens` / `output_tokens` | `12345` / `678` | Session-level provider-reported token usage totals |
 | `cache_read_input_tokens` / `cache_creation_input_tokens` | `9000` / `1200` | Session-level provider-reported prompt-cache token totals when available |
 | `total_tokens` | `23223` | Sum of input, output, cache-read, and cache-creation tokens |
-| `feature_*_used` | `true/false` | Whether a feature family was used (memory, swarm, web, email, MCP, side panel, goals, selfdev, background, subagents) |
-| `tool_cat_*` | `0..N` | Coarse tool category counts (read/search, write, shell, web, memory, subagent, swarm, email, side-panel, goal, MCP, other) |
+| `feature_*_used` | `true/false` | Whether a feature family was used (memory, swarm, web, email, MCP, side panel, goals, todos, selfdev, background, subagents) |
+| `tool_cat_*` | `0..N` | Coarse tool category counts (read/search, write, shell, web, memory, subagent, swarm, email, side-panel, goal, todo, MCP, other) |
+| `todo_gate_*_count` | `0..N` | How often todo quality gates fired in-session (end-to-end ownership, hill-climbability, completion confidence, confidence spike) |
 | `command_*_used` | `true/false` | Whether a slash-command family was used in-session |
 | `workflow_*_used` | `true/false` | Whether the session looked like coding, research, testing, background, subagent, or swarm work |
 | `unique_mcp_servers` | `2` | Count of distinct MCP servers touched in-session |
@@ -178,6 +212,7 @@ This is a privacy-safe per-prompt summary event. It contains no prompt text, no 
 | `total_tokens` | `9980` | Sum of input, output, cache-read, and cache-creation tokens for the turn |
 | `feature_*_used` | `true/false` | Which feature families were touched in the turn |
 | `tool_cat_*` | `0..N` | Tool category mix for the turn |
+| `todo_gate_*_count` | `0..N` | Todo quality gates fired during the turn |
 | `workflow_*_used` | `true/false` | What kind of workflow this turn looked like |
 | `turn_success` | `true` | Whether the turn produced a useful response/outcome |
 | `turn_abandoned` | `false` | Whether the turn appears to have ended without success |
@@ -199,8 +234,8 @@ Most events also carry a few coarse quality / cleanup fields:
 
 ## What We Do NOT Collect
 
+- **No conversation transcripts, prompts, code, or LLM responses**, except text you explicitly submit with `/feedback ...`
 - No file paths, project names, or directory structures
-- No code, prompts, or LLM responses, except text explicitly submitted with `/feedback ...`
 - No tool inputs or tool outputs
 - No MCP server names or configurations
 - No IP addresses (Cloudflare Workers don't log these by default)
@@ -209,6 +244,20 @@ Most events also carry a few coarse quality / cleanup fields:
 - No exact wall-clock timestamps beyond coarse hour-of-day / weekday buckets
 
 The UUID is randomly generated on first run and stored at `~/.jcode/telemetry_id`. It is not derived from your machine, username, email, or any identifiable information.
+
+## How We Use and Share Data
+
+Telemetry is used to operate, debug, secure, and improve jcode, and for product and
+retention analytics. We may publish or share **aggregate** statistics (for example
+install counts, OS/provider distribution, version adoption) and we share data with the
+infrastructure providers needed to run the pipeline, currently Cloudflare.
+
+We do **not** sell event-level telemetry, and we do not collect conversation content to
+sell or to train models. If that ever changes, it will be a separate, clearly disclosed,
+**opt-in** program rather than a silent change to this document.
+
+We do not attempt to re-identify users from telemetry, and the client does not link
+telemetry to account identity.
 
 ## How It Works
 
@@ -223,6 +272,12 @@ The UUID is randomly generated on first run and stored at `~/.jcode/telemetry_id
 9. If a request fails (offline, firewall, etc.), jcode silently continues - no retries, no queuing
 
 The telemetry endpoint is a Cloudflare Worker that stores events in a D1 database. The source code for the worker is in [`telemetry-worker/`](./telemetry-worker/).
+
+## Changes to This Policy
+
+The version of this document in the repository is the current policy. If we ever want to
+collect conversation content, or to share or sell anything beyond aggregate statistics,
+that will require a separate opt-in rather than a quiet edit here.
 
 ### Schema v5 deployment note
 
@@ -251,4 +306,6 @@ This is open source. The entire telemetry implementation is in [`src/telemetry.r
 
 ## Data Retention
 
-Telemetry data is used in aggregate only (install count, active users, provider distribution, session success/crash rates, feature-level counts). Individual event records are retained for up to 12 months and then deleted.
+Telemetry data is used in aggregate (install count, active users, provider distribution, session success/crash rates, feature-level counts). Individual event records are retained for up to 12 months and then deleted.
+
+High-volume raw events are pruned earlier on a nightly schedule, after their aggregate signal has been captured in a compact daily-activity rollup: per-turn and per-session-start records and onboarding-step records are kept for about 30 days, upgrade records for about 60 days, and auth-success records for about 180 days. Session summary records (the per-session aggregate counts described above) are kept for up to 12 months.

@@ -1,7 +1,7 @@
 use super::{
     accent_color, ai_color, ai_text, asap_color, clear_area, dim_color, get_grouped_changelog,
-    header_icon_color, header_name_color, header_session_color, pending_color, queued_color, rgb,
-    tool_color, user_bg, user_color, user_text,
+    header_icon_color, header_name_color, header_session_color, pending_color, queued_color,
+    record_chat_overlay_copy_snapshot, rgb, tool_color, user_bg, user_color, user_text,
 };
 use crate::tui::TuiState;
 use crate::tui::info_widget::WidgetPlacement;
@@ -10,7 +10,14 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-pub(super) fn draw_changelog_overlay(frame: &mut Frame, area: Rect, scroll: usize) {
+use super::selection_highlight::highlight_line_selection;
+
+pub(super) fn draw_changelog_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    app: &dyn TuiState,
+) {
     clear_area(frame, area);
 
     let groups = get_grouped_changelog();
@@ -69,17 +76,63 @@ pub(super) fn draw_changelog_overlay(frame: &mut Frame, area: Rect, scroll: usiz
                 .add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(
-            " Esc to close · mouse wheel/j/k scroll · Space/PageUp page ",
+            " Esc to close · drag to select, release to copy · wheel/j/k scroll ",
             Style::default().fg(dim_color()),
         )))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(dim_color()));
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .scroll((scroll as u16, 0));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(paragraph, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let visible_end = scroll
+        .saturating_add(inner.height as usize)
+        .min(total_lines);
+
+    // Register the rendered lines so the shared copy-selection machinery can map
+    // mouse drags to text and highlight + copy the selection, exactly like the
+    // chat viewport. Without this, mouse capture would block native terminal
+    // selection and there would be no way to copy from the overlay.
+    record_chat_overlay_copy_snapshot(&lines, scroll, visible_end, inner);
+
+    let mut visible_lines: Vec<Line<'static>> =
+        lines.get(scroll..visible_end).unwrap_or(&[]).to_vec();
+
+    if let Some(range) = app.copy_selection_range().filter(|range| {
+        range.start.pane == crate::tui::CopySelectionPane::Chat
+            && range.end.pane == crate::tui::CopySelectionPane::Chat
+    }) {
+        let (start, end) = if (range.start.abs_line, range.start.column)
+            <= (range.end.abs_line, range.end.column)
+        {
+            (range.start, range.end)
+        } else {
+            (range.end, range.start)
+        };
+        for abs_idx in start.abs_line.max(scroll)..=end.abs_line.min(visible_end.saturating_sub(1))
+        {
+            let rel_idx = abs_idx.saturating_sub(scroll);
+            if let Some(line) = visible_lines.get_mut(rel_idx) {
+                let start_col = if abs_idx == start.abs_line {
+                    start.column
+                } else {
+                    0
+                };
+                let end_col = if abs_idx == end.abs_line {
+                    end.column
+                } else {
+                    line.width()
+                };
+                *line = highlight_line_selection(line, start_col, end_col);
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(visible_lines), inner);
 }
 
 pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, app: &dyn TuiState) {
@@ -111,6 +164,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         ])
     };
 
+    let alt = jcode_tui_core::keybind::alt_chord;
     let key_entry = |key: &str, desc: &str| -> Line<'static> {
         Line::from(vec![
             Span::styled("    ", Style::default()),
@@ -136,8 +190,12 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     ));
     lines.push(help_entry("/agents", "Configure models for agent roles"));
     lines.push(help_entry(
+        "/swarm-prompt",
+        "Open the active swarm routing prompt in your editor",
+    ));
+    lines.push(help_entry(
         "/effort <level>",
-        "Set reasoning effort (none|low|medium|high|xhigh)",
+        "Set effort (none|minimal|low|medium|high|xhigh|max|swarm|swarm-deep)",
     ));
     lines.push(help_entry(
         "/fast [on|off|status|default ...]",
@@ -151,6 +209,14 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/alignment [status|centered|left]",
         "Show or persist text alignment preference",
     ));
+    lines.push(help_entry(
+        "/compact-notifications [status|on|off]",
+        "Collapse swarm/file-activity notifications to one line",
+    ));
+    lines.push(help_entry(
+        "/show-agentgrep-output [status|on|off]",
+        "Render full agentgrep search output inline in chat",
+    ));
     lines.push(help_entry("/config", "Show active configuration"));
     lines.push(help_entry("/config init", "Create default config file"));
     lines.push(help_entry("/config edit", "Open config in $EDITOR"));
@@ -163,8 +229,20 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/context",
         "Show the full session context snapshot",
     ));
+    lines.push(help_entry(
+        "/skills",
+        "Show loaded skills and jcode-endorsed recommendations",
+    ));
     lines.push(help_entry("/info", "Show session info and token usage"));
+    lines.push(help_entry(
+        "/keys",
+        "Show keybinding conflicts with your terminal/OS",
+    ));
     lines.push(help_entry("/usage", "Show connected provider usage limits"));
+    lines.push(help_entry(
+        "/support",
+        "Email support with diagnostics prefilled",
+    ));
     lines.push(help_entry("/version", "Show version and build details"));
     lines.push(help_entry(
         "/changelog",
@@ -196,7 +274,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     ));
     lines.push(help_entry(
         "/plan [goal]",
-        "Draft a plan-only proposal in the side panel (no edits)",
+        "Draft a plan-only proposal as a plan card (no edits)",
     ));
     lines.push(help_entry(
         "/improve",
@@ -218,7 +296,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/splitview [on|off|status]",
         "Mirror the current chat in the side panel",
     ));
-    lines.push(help_entry("/split", "Clone session into a new window"));
+    lines.push(help_entry(
+        "/fork [prompt]",
+        "Fork session into a new window (alias: /split)",
+    ));
     lines.push(help_entry(
         "/transfer",
         "Open a fresh session with only compacted context + copied todos",
@@ -236,6 +317,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Return to the previous Catch Up source session",
     ));
     lines.push(help_entry("/resume", "Browse and resume previous sessions"));
+    lines.push(help_entry(
+        "/active",
+        "Manage live sessions: see which are working vs ready",
+    ));
     lines.push(help_entry(
         "/catchup [next]",
         "Jump into finished sessions with a side-panel brief",
@@ -290,6 +375,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/subscription",
         "Inspect jcode subscription scaffold",
     ));
+    lines.push(help_entry(
+        "/subscribe",
+        "Why and how to subscribe to jcode",
+    ));
 
     lines.push(Line::from(""));
     lines.push(separator());
@@ -309,12 +398,43 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     if app.is_remote_mode() {
         lines.push(help_entry("/client-reload", "Force reload client binary"));
         lines.push(help_entry("/server-reload", "Force reload server binary"));
+        lines.push(help_entry(
+            "/continue",
+            "Continue every interrupted live session that would auto-resume",
+        ));
     }
     lines.push(help_entry(
         "/debug-visual",
         "Enable visual debugging for TUI issues",
     ));
     lines.push(help_entry("/quit", "Exit jcode"));
+
+    // The sections above are hand-curated for ordering, but they drift as
+    // commands are added. Anything registered and not already shown gets listed
+    // here so no working command is invisible in /help.
+    let shown: std::collections::HashSet<String> = lines
+        .iter()
+        .filter_map(|line| line.spans.get(1).map(|span| span.content.to_string()))
+        .map(|cmd| {
+            cmd.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let uncovered: Vec<(&str, &str)> = crate::tui::app::registered_command_entries()
+        .filter(|(name, _)| !shown.contains(*name))
+        .collect();
+    if !uncovered.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(separator());
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  More commands", section_style)));
+        lines.push(Line::from(""));
+        for (name, desc) in uncovered {
+            lines.push(help_entry(name, desc));
+        }
+    }
 
     let skills = app.available_skills();
     if !skills.is_empty() {
@@ -337,10 +457,17 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(Line::from(""));
     lines.push(key_entry("PageUp / PageDown", "Scroll history"));
     lines.push(key_entry("Up / Down", "Scroll history (when input empty)"));
-    lines.push(key_entry("Ctrl+[ / Ctrl+]", "Jump between user prompts"));
+    lines.push(key_entry(
+        "Ctrl+J / Ctrl+K",
+        "Jump to next / previous user prompt (also Ctrl+] / Ctrl+[)",
+    ));
+    lines.push(key_entry(
+        "Ctrl+Shift+J / Ctrl+Shift+K",
+        "Scroll history down / up one line",
+    ));
     lines.push(key_entry(
         "Cmd/Super+K / J",
-        "Jump to previous / next user prompt (macOS)",
+        "Jump to previous / next user prompt (macOS, if forwarded)",
     ));
     lines.push(key_entry("Ctrl+1..4", "Resize side panel to 25/50/75/100%"));
     lines.push(key_entry(
@@ -358,10 +485,14 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     )));
     lines.push(Line::from(""));
     lines.push(key_entry(
-        crate::tui::keybind::side_panel_toggle_key_label(),
+        &crate::tui::keybind::side_panel_toggle_key_label(),
         "Toggle side panel (or diagram pane if empty)",
     ));
-    lines.push(key_entry("Alt+T", "Toggle diagram position (side/top)"));
+    lines.push(key_entry(&alt("T"), "Toggle diagram position (side/top)"));
+    lines.push(key_entry(
+        &alt("Shift+I"),
+        "Show/hide inline images (persists)",
+    ));
     lines.push(key_entry("Ctrl+H / Ctrl+L", "Focus chat / diagram / diffs"));
     lines.push(key_entry(
         "Ctrl+Left / Right",
@@ -371,10 +502,15 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(key_entry("[ / ]", "Zoom diagram (when focused)"));
     lines.push(key_entry("+ / -", "Resize diagram pane"));
     lines.push(key_entry(
-        "Alt+G / /diff",
+        &format!("{} / /diff", alt("G")),
         "Cycle diff mode (Off/Inline/Pinned/File)",
     ));
     lines.push(key_entry("Shift+Tab", "Cycle favorited models"));
+    lines.push(key_entry("Ctrl+O", "Set default model (in /model picker)"));
+    lines.push(key_entry(
+        "Ctrl+N",
+        "Toggle favorite model (in /model picker)",
+    ));
 
     lines.push(Line::from(""));
     lines.push(separator());
@@ -387,7 +523,6 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Quit (press twice to confirm)",
     ));
     lines.push(key_entry("Ctrl+X", "Cut entire input line to clipboard"));
-    lines.push(key_entry("Ctrl+E", "Edit prompt in $EDITOR"));
     lines.push(key_entry(
         "Ctrl+A",
         "Copy visible chat viewport plus nearby context",
@@ -395,17 +530,23 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(key_entry("Ctrl+U", "Clear input line"));
     lines.push(key_entry("Ctrl+K", "Delete to end of input"));
     lines.push(key_entry(
-        "Alt+Backspace / Alt+Delete",
+        &format!("{} / {}", alt("Backspace"), alt("Delete")),
         "Delete previous word in input",
     ));
     lines.push(key_entry(
         "Cmd/Super+Backspace / Delete",
         "Delete previous word in input",
     ));
-    lines.push(key_entry(
-        "Cmd/Super+Left / Right",
-        "Move to start / end of input",
-    ));
+    if cfg!(target_os = "macos") {
+        // On macOS, Cmd+Left/Right default to effort cycling; Home/End and
+        // Cmd+A/E still jump to the start/end of the input.
+        lines.push(key_entry("Home / End", "Move to start / end of input"));
+    } else {
+        lines.push(key_entry(
+            "Cmd/Super+Left / Right",
+            "Move to start / end of input",
+        ));
+    }
     lines.push(key_entry("Cmd/Super+Z", "Undo input edit"));
     lines.push(key_entry("Cmd/Super+X / V", "Cut input / paste clipboard"));
     lines.push(key_entry("Ctrl+S", "Stash / pop input (save for later)"));
@@ -413,30 +554,53 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(key_entry("Ctrl+B / Ctrl+F", "Move by word left / right"));
     lines.push(key_entry("Ctrl+Left / Right", "Move by word left / right"));
     lines.push(key_entry(
-        "Shift+Enter / Alt+Enter",
+        &format!("Shift+Enter / {}", alt("Enter")),
         "Insert newline in input",
     ));
     lines.push(key_entry(
-        "Ctrl+Enter",
+        "Trailing \\ then Enter",
+        "Insert newline (works on terminals that cannot report Shift+Enter)",
+    ));
+    lines.push(key_entry(
+        "Ctrl+Enter / Cmd+Enter",
         "Use opposite send mode while processing",
     ));
     lines.push(key_entry("Ctrl+Up", "Retrieve pending message for editing"));
     lines.push(key_entry("Ctrl+Tab / Ctrl+T", "Toggle queue mode"));
     lines.push(key_entry("Ctrl+R", "Recover from missing tool outputs"));
     lines.push(key_entry(
-        "Ctrl+V / Alt+V",
+        &format!("Ctrl+V / {}", alt("V")),
         "Paste clipboard (text or image)",
     ));
     lines.push(key_entry(
-        "Alt+A",
+        &alt("A"),
         "Quick-copy visible chat viewport plus nearby context",
     ));
-    lines.push(key_entry("Alt+Y", "Toggle chat selection/copy mode"));
-    lines.push(key_entry("Alt+S", "Toggle typing scroll lock"));
+    lines.push(key_entry(&alt("Y"), "Toggle chat selection/copy mode"));
+    lines.push(key_entry(&alt("S"), "Toggle typing scroll lock"));
     lines.push(key_entry("Ctrl+P", "Toggle auto-poke for incomplete todos"));
-    lines.push(key_entry("Alt+Left / Right", "Cycle reasoning effort"));
+    lines.push(key_entry(&alt("X"), "Show/dismiss todo list card in chat"));
+    lines.push(key_entry(
+        &crate::tui::keybind::effort_switch_keys_label(),
+        "Cycle effort (reasoning + swarm)",
+    ));
+    if cfg!(target_os = "macos") {
+        lines.push(key_entry(
+            &alt("Left / Right"),
+            &format!("Move by word in input (also {} / {})", alt("B"), alt("F")),
+        ));
+    }
     if let Some(label) = app.dictation_key_label() {
         lines.push(key_entry(&label, "Run configured dictation"));
+    }
+    if let Some(label) = crate::tui::keybind::load_open_resume_key().label {
+        lines.push(key_entry(&label, "Open the /resume session picker"));
+    }
+    if let Some(label) = crate::tui::keybind::load_new_terminal_key().label {
+        lines.push(key_entry(
+            &label,
+            "Spawn new jcode session in a new terminal",
+        ));
     }
 
     lines.push(Line::from(""));
@@ -533,35 +697,18 @@ pub(super) fn draw_model_status_overlay(
 }
 
 fn model_status_line_style(raw: &str, default: Style) -> Style {
-    let trimmed = raw.trim_start();
-    if trimmed.starts_with('✓')
-        || trimmed.contains("Fully tested")
-        || trimmed.contains("strict_covered")
-        || trimmed.contains("Passed")
-    {
-        Style::default().fg(rgb(120, 220, 150))
-    } else if trimmed.starts_with('✗')
-        || trimmed.contains("Failed")
-        || trimmed.contains("0.00%")
-        || trimmed.contains("no_model_specific_live_evidence")
-    {
-        Style::default().fg(rgb(240, 110, 110))
-    } else if trimmed.starts_with('!')
-        || trimmed.starts_with('-')
-        || trimmed.contains("Skipped")
-        || trimmed.contains("Blocked")
-        || trimmed.contains("Partially tested")
-        || trimmed.contains("observed_missing_strict_checkpoints")
-    {
-        Style::default().fg(rgb(235, 190, 105))
-    } else if trimmed.starts_with('•')
-        || trimmed.contains("NotRun")
-        || trimmed.contains("Known providers")
-        || trimmed.contains("Uncovered provider/model gaps")
-    {
-        Style::default().fg(dim_color())
-    } else {
-        default
+    // Reuse the same semantic classification the CLI uses so the TUI overlay
+    // and `jcode provider-test-coverage` stay color-consistent.
+    use crate::live_tests::CoverageLineStyle;
+    match crate::live_tests::classify_provider_test_coverage_line(raw) {
+        CoverageLineStyle::Title => Style::default()
+            .fg(accent_color())
+            .add_modifier(Modifier::BOLD),
+        CoverageLineStyle::Pass => Style::default().fg(rgb(120, 220, 150)),
+        CoverageLineStyle::Fail => Style::default().fg(rgb(240, 110, 110)),
+        CoverageLineStyle::Warn => Style::default().fg(rgb(235, 190, 105)),
+        CoverageLineStyle::Dim => Style::default().fg(dim_color()),
+        CoverageLineStyle::Plain => default,
     }
 }
 

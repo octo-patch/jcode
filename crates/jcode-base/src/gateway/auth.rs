@@ -97,6 +97,43 @@ pub(crate) fn is_valid_hex_token(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Device identity resolved during the WebSocket handshake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AuthorizedDevice {
+    pub(super) name: String,
+    pub(super) id: String,
+}
+
+/// Validate a token against the device registry at handshake time.
+///
+/// Returning `ErrorResponse` here makes Tungstenite reject the upgrade with a
+/// real 401, so clients with revoked/unknown tokens see an auth failure they
+/// can react to (re-pair) instead of an accepted-then-dropped socket that is
+/// indistinguishable from a network problem.
+#[expect(
+    clippy::result_large_err,
+    reason = "Tungstenite handshake APIs require returning ErrorResponse directly"
+)]
+pub(super) fn authorize_ws_device(
+    registry: &super::DeviceRegistry,
+    token: &str,
+) -> std::result::Result<
+    AuthorizedDevice,
+    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    match registry.validate_token(token) {
+        Some(device) => Ok(AuthorizedDevice {
+            name: device.name.clone(),
+            id: device.id.clone(),
+        }),
+        None => Err(ws_error_response(
+            401,
+            "Unauthorized",
+            "Unknown or revoked auth token; re-pair this device",
+        )),
+    }
+}
+
 pub(super) fn ws_error_response(
     status: u16,
     reason: &str,

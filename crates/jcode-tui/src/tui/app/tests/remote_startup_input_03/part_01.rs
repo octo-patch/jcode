@@ -1,12 +1,12 @@
 #[test]
 fn test_build_turn_footer_combines_compact_duration_with_streaming_stats() {
     let mut app = create_test_app();
-    app.streaming_input_tokens = 210_000;
-    app.streaming_output_tokens = 440;
-    app.streaming_tps_collect_output = true;
-    app.streaming_total_output_tokens = 440;
-    app.streaming_tps_observed_output_tokens = 440;
-    app.streaming_tps_observed_elapsed = Duration::from_secs(220);
+    app.streaming.streaming_input_tokens = 210_000;
+    app.streaming.streaming_output_tokens = 440;
+    app.streaming.streaming_tps_collect_output = true;
+    app.streaming.streaming_total_output_tokens = 440;
+    app.streaming.streaming_tps_observed_output_tokens = 440;
+    app.streaming.streaming_tps_observed_elapsed = Duration::from_secs(220);
 
     let footer = app
         .build_turn_footer(Some(316.1))
@@ -43,17 +43,13 @@ fn test_processing_status_display() {
 fn test_skill_invocation_not_queued() {
     let mut app = create_test_app();
 
-    // Type a skill command
-    app.handle_key(KeyCode::Char('/'), KeyModifiers::empty())
-        .unwrap();
-    app.handle_key(KeyCode::Char('t'), KeyModifiers::empty())
-        .unwrap();
-    app.handle_key(KeyCode::Char('e'), KeyModifiers::empty())
-        .unwrap();
-    app.handle_key(KeyCode::Char('s'), KeyModifiers::empty())
-        .unwrap();
-    app.handle_key(KeyCode::Char('t'), KeyModifiers::empty())
-        .unwrap();
+    // Type a slash invocation for a skill that does not exist. The name must
+    // not collide with a built-in slash command (`/test` is the verification
+    // orchestrator now), so use an obviously bogus skill name.
+    for ch in "/nosuchskill".chars() {
+        app.handle_key(KeyCode::Char(ch), KeyModifiers::empty())
+            .unwrap();
+    }
 
     app.submit_input();
 
@@ -158,6 +154,151 @@ fn test_handle_paste_single_line() {
     assert_eq!(app.input(), "hello world");
     assert_eq!(app.cursor_pos(), 11);
     assert!(app.pasted_contents.is_empty()); // No placeholder storage needed
+}
+
+#[test]
+fn test_terminal_file_drop_submits_as_user_input_instead_of_a_skill() {
+    let mut app = create_test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("dropped notes.txt");
+    std::fs::write(&file, b"notes").unwrap();
+    let dropped = file.display().to_string();
+
+    app.handle_paste(dropped.clone());
+    assert_eq!(app.input(), dropped);
+
+    app.submit_input();
+
+    assert!(
+        app.is_processing,
+        "the dropped file path should start a turn"
+    );
+    assert!(
+        app.display_messages()
+            .iter()
+            .all(|message| message.role != "error"),
+        "a dropped absolute path must not produce an unknown-skill error"
+    );
+    let submitted = app
+        .session
+        .messages
+        .last()
+        .expect("submitted file path message");
+    assert!(matches!(
+        submitted.content.as_slice(),
+        [ContentBlock::Text { text, .. }] if text == &file.display().to_string()
+    ));
+}
+
+#[test]
+fn test_terminal_escaped_file_drop_normalizes_the_path() {
+    let mut app = create_test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("dropped notes.txt");
+    std::fs::write(&file, b"notes").unwrap();
+    let escaped = file.display().to_string().replace(' ', "\\ ");
+
+    app.handle_paste(escaped);
+
+    assert_eq!(app.input(), file.display().to_string());
+}
+
+#[test]
+fn test_terminal_file_drop_with_followup_text_stays_normal_input() {
+    let mut app = create_test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report.md");
+    std::fs::write(&file, b"report").unwrap();
+    let prompt = format!("{} please review this file", file.display());
+    app.set_input_for_test(prompt.clone());
+
+    app.submit_input();
+
+    assert!(app.is_processing, "the file prompt should start a turn");
+    assert!(
+        app.display_messages()
+            .iter()
+            .all(|message| message.role != "error"),
+        "a path followed by instructions must not be parsed as a skill"
+    );
+    let submitted = app
+        .session
+        .messages
+        .last()
+        .expect("submitted file prompt message");
+    assert!(matches!(
+        submitted.content.as_slice(),
+        [ContentBlock::Text { text, .. }] if text == &prompt
+    ));
+}
+
+#[test]
+fn test_mixed_file_and_image_drop_keeps_file_and_attaches_image() {
+    let mut app = create_test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes with spaces.txt");
+    let image = dir.path().join("screenshot.png");
+    std::fs::write(&file, b"notes").unwrap();
+    std::fs::write(&image, b"png bytes").unwrap();
+    let dropped = format!(
+        "{} {}",
+        file.display().to_string().replace(' ', "\\ "),
+        image.display()
+    );
+
+    app.handle_paste(dropped);
+
+    assert_eq!(app.input(), format!("\"{}\" [image 1]", file.display()));
+    assert_eq!(app.pending_images.len(), 1);
+    assert_eq!(app.pending_images[0].0, "image/png");
+}
+
+#[test]
+fn test_terminal_image_drop_attaches_image_instead_of_routing_as_a_skill() {
+    let mut app = create_test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("dropped screenshot.png");
+    std::fs::write(&image, b"png bytes").unwrap();
+
+    app.handle_paste(image.display().to_string());
+
+    assert_eq!(app.input(), "[image 1]");
+    assert_eq!(app.pending_images.len(), 1);
+    assert_eq!(app.pending_images[0].0, "image/png");
+    assert!(
+        app.display_messages()
+            .iter()
+            .all(|message| message.role != "error")
+    );
+}
+
+#[test]
+fn test_typed_absolute_image_path_promotes_before_slash_routing() {
+    let mut app = create_test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("dropped photo.png");
+    std::fs::write(&image, b"png bytes").unwrap();
+    app.set_input_for_test(image.display().to_string());
+
+    assert!(crate::tui::app::input::promote_dropped_images(&mut app));
+    assert_eq!(app.input(), "[image 1]");
+    assert_eq!(app.pending_images.len(), 1);
+    assert_eq!(app.pending_images[0].0, "image/png");
+}
+
+#[test]
+fn test_incremental_terminal_drop_promotes_immediately_when_path_completes() {
+    let mut app = create_test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("instant.png");
+    std::fs::write(&image, b"png bytes").unwrap();
+
+    for ch in image.display().to_string().chars() {
+        crate::tui::app::input::handle_text_input(&mut app, &ch.to_string());
+    }
+
+    assert_eq!(app.input(), "[image 1]");
+    assert_eq!(app.pending_images.len(), 1);
 }
 
 #[test]
@@ -582,6 +723,74 @@ fn test_startup_update_up_to_date_removes_transient_card() {
 }
 
 #[test]
+fn test_startup_update_diverged_offers_merge_without_failure_card() {
+    let mut app = create_test_app();
+
+    app.handle_update_status(UpdateStatus::Checking);
+    app.handle_update_status(UpdateStatus::Error(
+        crate::update::GIT_PULL_DIVERGED_SUMMARY.to_string(),
+    ));
+
+    let message = app
+        .display_messages()
+        .last()
+        .expect("expected update display message");
+    assert_eq!(message.title.as_deref(), Some("Update"));
+    // The diverged card must NOT use the generic failure framing.
+    assert!(
+        !message.content.contains("Status: failed"),
+        "unexpected failure header: {}",
+        message.content
+    );
+    assert!(
+        !message
+            .content
+            .contains("Continuing with the current version."),
+        "unexpected continue footer: {}",
+        message.content
+    );
+    // It should explain the divergence and offer the merge-agent hotkey.
+    assert!(
+        message.content.contains("diverged"),
+        "missing divergence explanation: {}",
+        message.content
+    );
+    assert!(
+        message.content.to_lowercase().contains("agent"),
+        "missing merge-agent hint: {}",
+        message.content
+    );
+    assert!(
+        !message.content.contains('\n'),
+        "divergence notice should be authored as one line: {}",
+        message.content
+    );
+    assert!(app.pending_merge_offer.is_some());
+    assert!(app.background_client_action.is_none());
+}
+
+#[test]
+fn test_startup_update_diverged_offer_clears_on_submit() {
+    let mut app = create_test_app();
+    app.handle_update_status(UpdateStatus::Error(format!(
+        "Update failed: {}",
+        crate::update::GIT_PULL_DIVERGED_SUMMARY
+    )));
+    assert!(
+        app.pending_merge_offer.is_some(),
+        "prefixed divergence summary should still arm the offer"
+    );
+
+    app.input = "do something else".to_string();
+    app.cursor_pos = app.input.len();
+    app.submit_input();
+    assert!(
+        app.pending_merge_offer.is_none(),
+        "a fresh submission should drop the stale merge offer"
+    );
+}
+
+#[test]
 fn test_startup_update_error_replaces_checking_card() {
     let mut app = create_test_app();
 
@@ -593,17 +802,17 @@ fn test_startup_update_error_replaces_checking_card() {
         .last()
         .expect("expected update display message");
     assert_eq!(message.title.as_deref(), Some("Update"));
-    assert!(message.content.contains("Status: failed"));
-    assert!(message.content.contains("Check failed: offline"));
+    // The failure card and notice are one short line each; the verbose error
+    // stays in the log.
+    assert_eq!(message.content, "Status: failed (offline)");
     assert!(
-        message
-            .content
-            .contains("Continuing with the current version.")
+        !message.content.contains('\n'),
+        "failure card should be one line: {}",
+        message.content
     );
-    assert_eq!(
-        app.status_notice(),
-        Some("Update failed; continuing current version".to_string())
-    );
+    let notice = app.status_notice().expect("expected failure notice");
+    assert_eq!(notice, "Update failed: offline");
+    assert!(!notice.contains('\n'), "notice should be one line: {notice}");
     assert!(app.background_client_action.is_none());
     assert!(app.pending_background_client_reload.is_none());
 }
@@ -860,20 +1069,22 @@ fn test_new_for_remote_restores_observe_mode_from_reload_state() {
 
 #[test]
 fn test_new_for_remote_restores_split_view_from_reload_state() {
-    let mut app = create_test_app();
-    let session_id = format!("test-remote-splitview-{}", std::process::id());
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let session_id = "test-remote-splitview";
 
-    app.set_split_view_enabled(true, true);
-    app.save_input_for_reload(&session_id);
+        app.set_split_view_enabled(true, true);
+        app.save_input_for_reload(session_id);
 
-    let restored = App::new_for_remote(Some(session_id));
-    assert!(restored.split_view_enabled());
-    let page = restored
-        .side_panel()
-        .focused_page()
-        .expect("split view page should be focused");
-    assert_eq!(page.id, "split_view");
-    assert!(page.content.contains("Split View"));
+        let restored = App::new_for_remote(Some(session_id.to_string()));
+        assert!(restored.split_view_enabled());
+        let page = restored
+            .side_panel()
+            .focused_page()
+            .expect("split view page should be focused");
+        assert_eq!(page.id, "split_view");
+        assert!(page.content.contains("Split View"));
+    });
 }
 
 #[test]
@@ -892,36 +1103,63 @@ fn test_restore_reload_state_supports_legacy_input_format() {
 
 #[test]
 fn test_new_for_remote_requeues_restored_pending_soft_interrupts() {
-    let mut app = create_test_app();
-    let session_id = format!("test-remote-restore-{}", std::process::id());
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let session_id = "test-remote-restore";
 
-    app.interleave_message = Some("local interleave".to_string());
-    app.pending_soft_interrupts = vec!["sent one".to_string(), "sent two".to_string()];
-    app.pending_soft_interrupt_requests =
-        vec![(101, "sent one".to_string()), (102, "sent two".to_string())];
-    app.queued_messages.push("queued later".to_string());
-    app.save_input_for_reload(&session_id);
+        app.interleave_message = Some("local interleave".to_string());
+        app.pending_soft_interrupts = vec!["sent one".to_string(), "sent two".to_string()];
+        app.pending_soft_interrupt_requests =
+            vec![(101, "sent one".to_string()), (102, "sent two".to_string())];
+        app.queued_messages.push("queued later".to_string());
+        app.save_input_for_reload(session_id);
 
-    let restored = App::new_for_remote(Some(session_id));
-    assert!(restored.interleave_message.is_none());
-    assert_eq!(
-        restored.queued_messages(),
-        &["local interleave", "sent one", "sent two", "queued later"]
-    );
+        let restored = App::new_for_remote(Some(session_id.to_string()));
+        assert!(restored.interleave_message.is_none());
+        assert_eq!(
+            restored.queued_messages(),
+            &["local interleave", "sent one", "sent two", "queued later"]
+        );
+    });
 }
 
 #[test]
 fn test_new_for_remote_restored_interleave_triggers_dispatch_state() {
-    let mut app = create_test_app();
-    let session_id = format!("test-remote-interleave-dispatch-{}", std::process::id());
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let session_id = "test-remote-interleave-dispatch";
 
-    app.interleave_message = Some("interrupt after reload".to_string());
-    app.save_input_for_reload(&session_id);
+        app.interleave_message = Some("interrupt after reload".to_string());
+        app.save_input_for_reload(session_id);
 
-    let restored = App::new_for_remote(Some(session_id));
-    assert!(restored.interleave_message.is_none());
-    assert_eq!(restored.queued_messages(), &["interrupt after reload"]);
-    assert!(restored.pending_queued_dispatch);
-    assert!(restored.is_processing);
-    assert!(matches!(restored.status, ProcessingStatus::Sending));
+        let mut restored = App::new_for_remote(Some(session_id.to_string()));
+        assert!(restored.interleave_message.is_none());
+        assert_eq!(restored.queued_messages(), &["interrupt after reload"]);
+        assert!(!restored.pending_queued_dispatch);
+        assert!(!restored.is_processing);
+        assert!(matches!(restored.status, ProcessingStatus::Idle));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        rt.block_on(super::remote::process_remote_followups(
+            &mut restored,
+            &mut remote,
+        ));
+        assert_eq!(restored.queued_messages(), &["interrupt after reload"]);
+        assert!(!restored.is_processing);
+
+        remote.mark_history_loaded();
+        rt.block_on(super::remote::process_remote_followups(
+            &mut restored,
+            &mut remote,
+        ));
+
+        assert!(restored.queued_messages().is_empty());
+        assert!(restored.is_processing);
+        assert!(matches!(restored.status, ProcessingStatus::Sending));
+        assert!(restored.display_messages().iter().any(|message| {
+            message.role == "user" && message.content == "interrupt after reload"
+        }));
+    });
 }

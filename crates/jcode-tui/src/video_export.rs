@@ -56,12 +56,13 @@ fn find_command(name: &str) -> Option<PathBuf> {
     })
 }
 
+#[cfg(windows)]
 fn get_terminal_font() -> (String, f64) {
-    #[cfg(windows)]
-    {
-        return ("JetBrains Mono".to_string(), 11.0);
-    }
+    ("JetBrains Mono".to_string(), 11.0)
+}
 
+#[cfg(not(windows))]
+fn get_terminal_font() -> (String, f64) {
     if let Ok(conf) = std::fs::read_to_string(
         dirs::home_dir()
             .unwrap_or_default()

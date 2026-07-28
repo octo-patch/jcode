@@ -11,6 +11,7 @@ use crate::provider_catalog::{
 
 use super::provider_init::{ProviderChoice, login_provider_for_choice, save_named_api_key};
 
+mod jcode_device;
 mod scriptable;
 use scriptable::*;
 
@@ -256,7 +257,13 @@ pub async fn run_login_provider(
                 provider.display_name
             );
         }
-        start_scriptable_login(provider, account_label, &options).await
+        if provider.target == LoginProviderTarget::Google
+            && !auth::browser_suppressed(options.no_browser)
+        {
+            run_automatic_google_login(provider.id, &options).await
+        } else {
+            start_scriptable_login(provider, account_label, &options).await
+        }
     } else {
         match provider.target {
             LoginProviderTarget::AutoImport => {
@@ -271,7 +278,9 @@ pub async fn run_login_provider(
                 eprintln!("Imported {} existing auth source(s).", imported);
                 Ok(LoginFlowOutcome::Completed)
             }
-            LoginProviderTarget::Jcode => login_jcode_flow().map(|_| LoginFlowOutcome::Completed),
+            LoginProviderTarget::Jcode => login_jcode_flow(options.no_browser)
+                .await
+                .map(|_| LoginFlowOutcome::Completed),
             LoginProviderTarget::Claude => login_claude_flow(account_label, options.no_browser)
                 .await
                 .map(|_| LoginFlowOutcome::Completed),
@@ -456,60 +465,14 @@ async fn notify_running_server_auth_changed_best_effort(provider: Option<&str>) 
     }
 }
 
-fn login_jcode_flow() -> Result<()> {
-    eprintln!("Setting up Jcode subscription access...");
-    eprintln!(
-        "Paste the jcode subscription API key from your account portal. This key is used for your curated jcode router access.\n"
-    );
-    eprint!("Paste your Jcode API key: ");
-    io::stdout().flush()?;
-
-    let key = read_secret_line()?;
-    if key.is_empty() {
-        anyhow::bail!("No API key provided.");
-    }
-
-    eprint!("Optional router base URL (press Enter to use the default placeholder): ");
-    io::stdout().flush()?;
-    let api_base = read_secret_line()?;
-
-    let mut content = format!(
-        "{}={}\n",
-        crate::subscription_catalog::JCODE_API_KEY_ENV,
-        key
-    );
-    if !api_base.trim().is_empty() {
-        content.push_str(&format!(
-            "{}={}\n",
-            crate::subscription_catalog::JCODE_API_BASE_ENV,
-            api_base.trim()
-        ));
-    }
-
-    let config_dir = crate::storage::app_config_dir()?;
-    let file_path = config_dir.join(crate::subscription_catalog::JCODE_ENV_FILE);
-    crate::storage::write_text_secret(&file_path, &content)?;
-
-    crate::env::set_var(crate::subscription_catalog::JCODE_API_KEY_ENV, key);
-    if !api_base.trim().is_empty() {
-        crate::env::set_var(
-            crate::subscription_catalog::JCODE_API_BASE_ENV,
-            api_base.trim(),
-        );
-    }
-
-    eprintln!("\nSuccessfully saved Jcode subscription credentials!");
-    eprintln!("Stored at {}", file_path.display());
-    eprintln!(
-        "Curated models available now: {}",
-        crate::subscription_catalog::curated_models()
-            .iter()
-            .map(|model| model.display_name)
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    crate::telemetry::record_auth_success("jcode", "api_key");
+async fn login_jcode_flow(no_browser: bool) -> Result<()> {
+    eprintln!("Starting jcode subscription sign-in...");
+    let _ = jcode_device::login_jcode_device_flow(no_browser).await?;
     Ok(())
+}
+
+pub(crate) async fn run_jcode_account_login(no_browser: bool) -> Result<()> {
+    login_jcode_flow(no_browser).await
 }
 
 fn login_openai_api_key_flow() -> Result<()> {
@@ -1112,6 +1075,21 @@ async fn login_antigravity_flow(no_browser: bool) -> Result<()> {
 }
 
 async fn login_gemini_flow(no_browser: bool) -> Result<()> {
+    // Offer the auth-method choice only on an interactive terminal so scripted
+    // / piped invocations preserve the historical OAuth-only behavior.
+    if io::stdin().is_terminal() {
+        eprintln!("Gemini login. Choose an authentication method:");
+        eprintln!("  [1] Google account OAuth (free Code Assist tier, default)");
+        eprintln!(
+            "  [2] Gemini Developer API key (Google AI Studio, generativelanguage.googleapis.com)"
+        );
+        eprintln!();
+        let choice = read_line_trimmed("Enter 1-2 [1]: ")?;
+        if choice == "2" {
+            return login_gemini_api_key_flow();
+        }
+    }
+
     eprintln!("Starting native Gemini login...");
     eprintln!(
         "If your student/education plan is attached to your Google account, use that account in the browser flow."
@@ -1135,6 +1113,32 @@ async fn login_gemini_flow(no_browser: bool) -> Result<()> {
         eprintln!("Google account: {}", email);
     }
     crate::telemetry::record_auth_success("gemini", "oauth");
+    Ok(())
+}
+
+fn login_gemini_api_key_flow() -> Result<()> {
+    eprintln!("Setting up Gemini Developer API key...");
+    eprintln!("Get your API key from: https://aistudio.google.com/apikey\n");
+    eprint!("Paste your Gemini API key: ");
+    io::stdout().flush()?;
+
+    let key = read_secret_line()?;
+    if key.is_empty() {
+        anyhow::bail!("No API key provided.");
+    }
+
+    crate::auth::gemini::save_api_key(&key)?;
+    eprintln!("\nSuccessfully saved Gemini Developer API key!");
+    eprintln!(
+        "Stored at {}",
+        crate::storage::app_config_dir()?
+            .join(crate::auth::gemini::GEMINI_API_KEY_ENV_FILE)
+            .display()
+    );
+    eprintln!(
+        "Provider: gemini (official Gemini Developer API, generativelanguage.googleapis.com)"
+    );
+    crate::telemetry::record_auth_success("gemini", "api_key");
     Ok(())
 }
 
@@ -1377,9 +1381,8 @@ async fn login_google_flow(
         "  Tokens:       {}\n",
         auth::google::tokens_path()?.display()
     );
-    eprintln!("The 'gmail' tool is configured, but it is disabled by default for privacy.");
-    eprintln!("To expose it to the AI agent, add this to [tools] in config.toml:");
-    eprintln!("  enabled = [\"*\"]");
+    eprintln!("The 'gmail' tool is enabled by default in the full tool profile.");
+    eprintln!("To hide it, add `disabled = [\"gmail\"]` to [tools] in config.toml.");
     eprintln!("Then try asking: \"check my recent emails\" or \"search emails from ...\"");
 
     crate::telemetry::record_auth_success("google", "oauth");

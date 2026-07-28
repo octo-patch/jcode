@@ -1,13 +1,41 @@
-use crate::id::{extract_session_name, new_id, new_memorable_session_id};
+use crate::id::{extract_session_name, new_id, new_memorable_session_id_avoiding};
 use crate::message::{ContentBlock, Message, Role};
+pub use crate::storage::{
+    SessionCounts, SessionPresence, active_session_ids, find_active_session_id_by_pid,
+    mark_streaming, session_counts, session_presence, unmark_streaming, user_session_counts,
+    user_session_presence,
+};
 use crate::storage::{active_pids_dir, register_active_pid, unregister_active_pid};
-pub use crate::storage::{active_session_ids, find_active_session_id_by_pid};
+
+/// RAII guard that marks a session as actively streaming for its lifetime.
+///
+/// Wraps the on-disk streaming marker from `jcode-storage` (cleared on every
+/// exit path so presence UIs never show a phantom streaming session) and
+/// additionally holds a macOS power assertion so the system does not
+/// idle-sleep in the middle of a streaming model response.
+pub struct StreamingGuard {
+    _marker: crate::storage::StreamingGuard,
+    #[allow(dead_code)]
+    sleep_assertion: crate::platform::PowerAssertion,
+}
+
+impl StreamingGuard {
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            _marker: crate::storage::StreamingGuard::new(session_id),
+            sleep_assertion: crate::platform::PowerAssertion::prevent_user_idle_system_sleep(
+                "Jcode streaming model response",
+            ),
+        }
+    }
+}
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 mod crash;
 mod journal;
+mod maintenance;
 mod memory_profile;
 mod model;
 mod persistence;
@@ -22,6 +50,7 @@ pub use jcode_session_types::{
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
 };
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
+pub use maintenance::prune_old_session_backups;
 pub use memory_profile::SessionMemoryProfileSnapshot;
 use memory_profile::{
     ContentBlockMemoryStats, SessionMemoryProfileCache, summarize_blocks, summarize_message_content,
@@ -29,9 +58,10 @@ use memory_profile::{
 use model::SESSION_CONTEXT_PREFIX;
 pub use model::{StoredReplayEvent, StoredReplayEventKind};
 pub use render::{
-    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageSource, RenderedMessage,
-    has_rendered_images, render_images, render_messages, render_messages_and_images,
-    render_messages_and_images_with_compacted_history, summarize_tool_calls,
+    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageAnchor, RenderedImageSource,
+    RenderedMessage, has_rendered_images, is_attached_image_label_text, render_images,
+    render_messages, render_messages_and_images, render_messages_and_images_with_compacted_history,
+    summarize_tool_calls,
 };
 pub use storage_paths::session_journal_path_from_snapshot;
 #[cfg(test)]
@@ -176,6 +206,8 @@ struct SessionStartupStub {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    route_api_method: Option<String>,
+    #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]
     subagent_model: Option<String>,
@@ -283,6 +315,7 @@ impl Session {
         session.provider_session_id = stub.provider_session_id;
         session.provider_key = stub.provider_key;
         session.model = stub.model;
+        session.route_api_method = stub.route_api_method;
         session.reasoning_effort = stub.reasoning_effort;
         session.subagent_model = stub.subagent_model;
         session.improve_mode = stub.improve_mode;
@@ -317,6 +350,7 @@ impl Session {
         session.provider_session_id = snapshot.provider_session_id;
         session.provider_key = snapshot.provider_key;
         session.model = snapshot.model;
+        session.route_api_method = snapshot.route_api_method;
         session.reasoning_effort = snapshot.reasoning_effort;
         session.subagent_model = snapshot.subagent_model;
         session.improve_mode = snapshot.improve_mode;
@@ -490,6 +524,23 @@ impl Session {
     fn reset_provider_messages_cache(&mut self) {
         self.provider_messages_cache.clear();
         self.provider_message_prefix_hashes_cache.clear();
+        self.provider_messages_cache_len = 0;
+        self.provider_messages_cache_mode = PersistVectorMode::Full;
+        self.memory_profile_cache.provider_cache_count = 0;
+        self.memory_profile_cache.provider_cache_json_bytes = 0;
+        self.memory_profile_cache.provider_cache_stats = ContentBlockMemoryStats::default();
+    }
+
+    /// Drop the derived provider-facing transcript once the current request has
+    /// copied the messages it needs. The canonical [`StoredMessage`] history is
+    /// still retained, so this cache can be rebuilt on the next provider call.
+    ///
+    /// Long-running server sessions otherwise keep two fully owned transcript
+    /// copies while waiting on the network. Tool results and reasoning payloads
+    /// can make that duplicate tens of MiB per active session.
+    pub fn release_provider_messages_cache(&mut self) {
+        self.provider_messages_cache = Vec::new();
+        self.provider_message_prefix_hashes_cache = Vec::new();
         self.provider_messages_cache_len = 0;
         self.provider_messages_cache_mode = PersistVectorMode::Full;
         self.memory_profile_cache.provider_cache_count = 0;
@@ -710,7 +761,14 @@ impl Session {
 
     pub fn create(parent_id: Option<String>, title: Option<String>) -> Self {
         let now = Utc::now();
-        let (id, short_name) = new_memorable_session_id();
+        // Keep memorable identities distinct across all currently active
+        // sessions. This naturally covers swarm members and survives a server
+        // reload because active PID markers retain their encoded short names.
+        let used_names = active_session_ids()
+            .into_iter()
+            .filter_map(|session_id| extract_session_name(&session_id).map(str::to_string))
+            .collect::<HashSet<_>>();
+        let (id, short_name) = new_memorable_session_id_avoiding(&used_names);
         let is_debug = default_is_test_session();
         let mut session = Self {
             id,
@@ -758,6 +816,11 @@ impl Session {
     /// Mark this session as a debug/test session
     pub fn set_debug(&mut self, is_debug: bool) {
         self.is_debug = is_debug;
+        // Debug status can change after activation (e.g. debug-socket created
+        // sessions); keep presence UIs in sync when we are the active owner.
+        if self.status == SessionStatus::Active {
+            self.sync_internal_presence_flag();
+        }
     }
 
     /// Save/bookmark this session with an optional label
@@ -835,13 +898,11 @@ impl Session {
             return false;
         }
 
-        // Capture the cwd at the moment the immutable session-context message is
-        // first inserted. A Session may be constructed before CLI startup, TUI
-        // launch, or tests finish changing the process cwd; using the older
-        // constructor snapshot here can produce a stale "Working directory" and
-        // git status in the model-visible context.
-        if let Some(current_dir) = current_working_dir_string() {
-            self.working_dir = Some(current_dir);
+        // Preserve an explicitly bound session directory. Shared-server clients
+        // provide their cwd before this message is created, and replacing it with
+        // the daemon process cwd would leak the directory that launched the server.
+        if self.working_dir.is_none() {
+            self.working_dir = current_working_dir_string();
         }
 
         let context =
@@ -904,6 +965,35 @@ impl Session {
             .unwrap_or(&self.id)
     }
 
+    /// Append a model-visible notice telling the agent this session is a fork
+    /// of `parent_session_id`'s conversation.
+    ///
+    /// Forking happens when the user splits a window mid-conversation (often
+    /// while the parent agent is still streaming) and points the new window at
+    /// a clone of the transcript. Without this notice the forked agent assumes
+    /// it owns the in-flight request, duplicating the parent's work. The
+    /// notice is wrapped in `<system-reminder>` so it stays out of the visible
+    /// transcript while still reaching the model on the next turn.
+    pub fn append_fork_notice(&mut self, parent_session_id: &str, parent_display_name: &str) {
+        let text = format!(
+            "<system-reminder>\nThis session was forked (split) from session {parent} ({parent_id}) by the user. \
+The full conversation above is inherited from that session, but the original agent in {parent} \
+is still active and will continue handling whatever request or work was in progress there. \
+Do NOT continue or duplicate that in-flight work here. Treat the next user message as a fresh \
+request in this new forked session, using the inherited conversation only as context.\n</system-reminder>",
+            parent = parent_display_name,
+            parent_id = parent_session_id,
+        );
+        self.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text,
+                cache_control: None,
+            }],
+            Some(StoredDisplayRole::System),
+        );
+    }
+
     /// Mark this session as a canary tester
     pub fn set_canary(&mut self, build_hash: &str) {
         self.is_canary = true;
@@ -945,6 +1035,7 @@ impl Session {
         self.last_pid = Some(pid);
         self.last_active_at = Some(Utc::now());
         register_active_pid(&self.id, pid);
+        self.sync_internal_presence_flag();
     }
 
     /// Mark session as active for a specific PID
@@ -953,6 +1044,17 @@ impl Session {
         self.last_pid = Some(pid);
         self.last_active_at = Some(Utc::now());
         register_active_pid(&self.id, pid);
+        self.sync_internal_presence_flag();
+    }
+
+    /// Keep the on-disk internal-session flag in sync with this session's
+    /// role. Debug/test sessions and spawned children (swarm workers,
+    /// subagents) are internal: they stay tracked for lifecycle purposes but
+    /// are hidden from user-facing presence UIs like the menu bar (issue
+    /// #508).
+    fn sync_internal_presence_flag(&self) {
+        let internal = self.is_debug || self.parent_id.is_some();
+        crate::storage::set_session_internal(&self.id, internal);
     }
 
     /// Detect if an active session likely crashed (process no longer running)
@@ -1013,7 +1115,9 @@ impl Session {
         for msg in &mut redacted.messages {
             for block in &mut msg.content {
                 match block {
-                    ContentBlock::Text { text, .. } | ContentBlock::Reasoning { text } => {
+                    ContentBlock::Text { text, .. }
+                    | ContentBlock::Reasoning { text }
+                    | ContentBlock::ReasoningTrace { text } => {
                         *text = crate::message::redact_secrets(text);
                     }
                     ContentBlock::AnthropicThinking { thinking, .. } => {
@@ -1170,6 +1274,30 @@ impl Session {
         }
     }
 
+    /// Drop oversized inline images from the stored transcript, oldest-first,
+    /// until the total remaining base64 image payload fits within
+    /// `target_total_chars`. Used to recover from provider HTTP 413
+    /// "request too large" errors, which are driven by base64 image payload size
+    /// rather than the token context window.
+    ///
+    /// Mutates and persists the authoritative transcript (replacing each dropped
+    /// image with a short text marker) and invalidates the provider-message
+    /// cache so the next API call reflects the reduced payload. Returns the
+    /// number of images that were stripped.
+    pub fn strip_oversized_images(&mut self, target_total_chars: usize) -> usize {
+        let mut contents: Vec<&mut Vec<ContentBlock>> =
+            self.messages.iter_mut().map(|m| &mut m.content).collect();
+        let stripped = jcode_compaction_core::strip_large_images_in_contents(
+            &mut contents,
+            target_total_chars,
+        );
+        if stripped > 0 {
+            self.mark_memory_profile_dirty();
+            self.mark_messages_full_dirty();
+        }
+        stripped
+    }
+
     pub fn visible_conversation_message_count(&self) -> usize {
         self.messages
             .iter()
@@ -1202,6 +1330,33 @@ impl Session {
             }
         }
         None
+    }
+
+    /// Stored-message indices of the rewind targets shown in the TUI's
+    /// numbered `/rewind` list, in display order.
+    ///
+    /// The TUI numbers user/assistant *transcript entries* (what the user
+    /// actually sees), not raw stored messages. Stored tool-result messages
+    /// and tool-call-only assistant messages render as tool cards or nothing,
+    /// so counting raw stored messages diverges wildly from the on-screen
+    /// numbering in tool-heavy sessions (issue #432). Deriving targets from
+    /// the same rendering used for the transcript keeps `/rewind N` aligned
+    /// with the numbers `/rewind` prints.
+    ///
+    /// A single stored message can produce multiple transcript entries (text
+    /// split around a tool result); each entry keeps its own number and maps
+    /// to the same stored index so numbering matches the visible list exactly.
+    pub fn rewind_target_stored_indices(&self) -> Vec<usize> {
+        render_messages(self)
+            .into_iter()
+            .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+            .filter_map(|message| message.stored_index)
+            .collect()
+    }
+
+    /// Number of `/rewind` targets (see [`Self::rewind_target_stored_indices`]).
+    pub fn rewind_target_count(&self) -> usize {
+        self.rewind_target_stored_indices().len()
     }
 
     /// Record a memory injection event for replay visualization
@@ -1427,6 +1582,8 @@ struct RemoteStartupSessionSnapshot {
     provider_key: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    route_api_method: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]

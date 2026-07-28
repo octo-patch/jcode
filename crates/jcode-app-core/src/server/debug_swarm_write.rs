@@ -25,15 +25,23 @@ pub(super) async fn maybe_handle_swarm_write_command(
             .strip_prefix("swarm:clear_coordinator:")
             .unwrap_or("")
             .trim();
-        let mut coordinators = ctx.swarm_coordinators.write().await;
-        if coordinators.remove(swarm_id).is_some() {
-            let mut members = ctx.swarm_members.write().await;
-            for member in members.values_mut() {
-                if member.swarm_id.as_deref() == Some(swarm_id) && member.role == "coordinator" {
-                    member.role = "agent".to_string();
+        // Swarm member/coordinator mutations never nest these independent
+        // locks. In particular, persistence reads coordinators again, so a
+        // retained write guard here self-deadlocks the command.
+        let removed = {
+            let mut coordinators = ctx.swarm_coordinators.write().await;
+            coordinators.remove(swarm_id).is_some()
+        };
+        if removed {
+            {
+                let mut members = ctx.swarm_members.write().await;
+                for member in members.values_mut() {
+                    if member.swarm_id.as_deref() == Some(swarm_id) && member.role == "coordinator"
+                    {
+                        member.role = "agent".to_string();
+                    }
                 }
             }
-            drop(members);
             let swarm_state = SwarmState {
                 members: Arc::clone(ctx.swarm_members),
                 swarms_by_id: Arc::clone(ctx.swarms_by_id),
@@ -49,6 +57,71 @@ pub(super) async fn maybe_handle_swarm_write_command(
         return Err(anyhow::anyhow!(
             "No coordinator set for swarm '{}'",
             swarm_id
+        ));
+    }
+
+    if cmd.starts_with("swarm:clear_plan:") {
+        let swarm_id = cmd.strip_prefix("swarm:clear_plan:").unwrap_or("").trim();
+        if swarm_id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "swarm:clear_plan requires a swarm_id: swarm:clear_plan:<swarm_id>"
+            ));
+        }
+        let removed = {
+            let mut plans = ctx.swarm_plans.write().await;
+            plans.remove(swarm_id)
+        };
+        let Some(removed) = removed else {
+            return Err(anyhow::anyhow!("No plan found for swarm '{}'", swarm_id));
+        };
+        // Re-persist so the on-disk swarm state drops the plan too; otherwise
+        // the next server restart resurrects it and every fresh session in
+        // this working dir gets the stale plan graph pushed on subscribe.
+        let swarm_state = SwarmState {
+            members: Arc::clone(ctx.swarm_members),
+            swarms_by_id: Arc::clone(ctx.swarms_by_id),
+            plans: Arc::clone(ctx.swarm_plans),
+            coordinators: Arc::clone(ctx.swarm_coordinators),
+        };
+        persist_swarm_state_for(swarm_id, &swarm_state).await;
+        // Push the cleared state to attached clients. Without this, every
+        // connected TUI keeps rendering (and holding resident) the old item
+        // graph until its next reconnect; a 1.5k-item stale plan is ~650 KB
+        // of JSON pinned per client. Version advances past the removed plan
+        // so the client-side stale-regression guard accepts the update.
+        let clear_event = ServerEvent::SwarmPlan {
+            swarm_id: swarm_id.to_string(),
+            version: removed.version.saturating_add(1),
+            items: Vec::new(),
+            participants: Vec::new(),
+            reason: Some("plan_cleared".to_string()),
+            summary: None,
+        };
+        let session_ids: Vec<String> = {
+            let swarms = ctx.swarms_by_id.read().await;
+            swarms
+                .get(swarm_id)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        {
+            let members = ctx.swarm_members.read().await;
+            for sid in session_ids {
+                if let Some(member) = members.get(&sid) {
+                    let _ = member.event_tx.send(clear_event.clone());
+                    for tx in member.event_txs.values() {
+                        let _ = tx.send(clear_event.clone());
+                    }
+                }
+            }
+        }
+        return Ok(Some(
+            serde_json::json!({
+                "swarm_id": swarm_id,
+                "cleared_version": removed.version,
+                "cleared_item_count": removed.items.len(),
+            })
+            .to_string(),
         ));
     }
 
@@ -98,6 +171,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
                             notification_type: NotificationType::Message {
                                 scope: Some("broadcast".to_string()),
                                 channel: None,
+                                tldr: None,
                             },
                             message: message.clone(),
                         };
@@ -147,6 +221,7 @@ pub(super) async fn maybe_handle_swarm_write_command(
                     notification_type: NotificationType::Message {
                         scope: Some("dm".to_string()),
                         channel: None,
+                        tldr: None,
                     },
                     message: message.to_string(),
                 };
@@ -317,6 +392,15 @@ pub(super) async fn maybe_handle_swarm_write_command(
                             let versioned_plan = plans
                                 .entry(swarm_id.clone())
                                 .or_insert_with(VersionedPlan::new);
+                            let merged_count =
+                                versioned_plan.items.len().saturating_add(items.len());
+                            if merged_count > jcode_plan::MAX_PLAN_ITEMS {
+                                return Err(anyhow::anyhow!(
+                                    "Plan approval would contain {} items, exceeding the per-swarm limit of {}",
+                                    merged_count,
+                                    jcode_plan::MAX_PLAN_ITEMS
+                                ));
+                            }
                             versioned_plan.items.extend(items.clone());
                             versioned_plan.version += 1;
                             versioned_plan
@@ -435,5 +519,272 @@ pub(super) async fn maybe_handle_swarm_write_command(
         return Err(anyhow::anyhow!("Not in a swarm."));
     }
 
+    // Task-DAG ops over the debug socket, for testing/operability without a live
+    // model session. Arg is a JSON object:
+    //   {"op":"seed","swarm_id":"..","mode":"deep","nodes":[{id,content,kind,depends_on}]}
+    //   {"op":"expand","swarm_id":"..","actor":"sess","node_id":"..","children":[..]}
+    //   {"op":"complete","swarm_id":"..","actor":"sess","node_id":"..","artifact":{..}}
+    //   {"op":"inject","swarm_id":"..","actor":"sess","gate_id":"..","nodes":[..]}
+    if let Some(rest) = cmd.strip_prefix("swarm:graph:") {
+        return Ok(Some(handle_debug_graph_op(rest.trim(), ctx).await));
+    }
+
     Ok(None)
+}
+
+#[derive(serde::Deserialize)]
+struct DebugGraphArg {
+    op: String,
+    swarm_id: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    gate_id: Option<String>,
+    #[serde(default)]
+    nodes: Vec<DebugNodeSpec>,
+    #[serde(default)]
+    children: Vec<DebugNodeSpec>,
+    #[serde(default)]
+    artifact: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct DebugNodeSpec {
+    id: String,
+    content: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    priority: u8,
+}
+
+fn debug_specs(specs: Vec<DebugNodeSpec>) -> Vec<jcode_plan::dag::NodeSpec> {
+    specs
+        .into_iter()
+        .map(|s| jcode_plan::dag::NodeSpec {
+            id: Some(s.id),
+            content: s.content,
+            kind: jcode_plan::bridge::parse_kind(s.kind.as_deref()),
+            depends_on: s.depends_on,
+            priority: s.priority,
+        })
+        .collect()
+}
+
+async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> String {
+    use jcode_plan::bridge::{apply_task_graph, to_task_graph};
+    use jcode_plan::dag;
+
+    fn fail(msg: impl std::fmt::Display) -> String {
+        serde_json::json!({"ok": false, "error": msg.to_string()}).to_string()
+    }
+
+    let parsed: DebugGraphArg = match serde_json::from_str(arg) {
+        Ok(parsed) => parsed,
+        Err(e) => return fail(format!("invalid swarm:graph JSON: {e}")),
+    };
+    let swarm_id = parsed.swarm_id.clone();
+
+    let result: Result<(usize, &'static str), String> = {
+        let mut plans = ctx.swarm_plans.write().await;
+        let plan = plans
+            .entry(swarm_id.clone())
+            .or_insert_with(VersionedPlan::new);
+        match parsed.op.as_str() {
+            "seed" => {
+                if let Some(mode) = parsed.mode {
+                    plan.mode = mode;
+                }
+                let count = parsed.nodes.len();
+                let mut graph = to_task_graph(plan);
+                let before = graph.clone();
+                match dag::seed(&mut graph, debug_specs(parsed.nodes)) {
+                    Ok(()) => {
+                        if graph != before {
+                            apply_task_graph(plan, &graph);
+                            plan.version += 1;
+                        }
+                        Ok((count, "seed"))
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            "expand" => {
+                let Some(actor) = parsed.actor.clone() else {
+                    return fail("'actor' required");
+                };
+                let Some(node_id) = parsed.node_id.clone() else {
+                    return fail("'node_id' required");
+                };
+                let count = parsed.children.len();
+                // Dispatch the node to the actor so engine ownership checks pass.
+                if let Some(item) = plan.items.iter_mut().find(|i| i.id == node_id) {
+                    item.assigned_to = Some(actor.clone());
+                    item.status = "running".to_string();
+                }
+                let mut graph = to_task_graph(plan);
+                match dag::expand_node(&mut graph, &node_id, &actor, debug_specs(parsed.children)) {
+                    Ok(_) => {
+                        apply_task_graph(plan, &graph);
+                        plan.version += 1;
+                        Ok((count, "expand"))
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            "complete" => {
+                let Some(actor) = parsed.actor.clone() else {
+                    return fail("'actor' required");
+                };
+                let Some(node_id) = parsed.node_id.clone() else {
+                    return fail("'node_id' required");
+                };
+                let artifact: dag::HandoffArtifact = match serde_json::from_value(
+                    parsed.artifact.clone().unwrap_or(serde_json::json!({})),
+                ) {
+                    Ok(artifact) => artifact,
+                    Err(e) => return fail(format!("invalid artifact: {e}")),
+                };
+                if let Some(item) = plan.items.iter_mut().find(|i| i.id == node_id) {
+                    item.assigned_to = Some(actor.clone());
+                    item.status = "running".to_string();
+                }
+                let mut graph = to_task_graph(plan);
+                match dag::complete_node(&mut graph, &node_id, &actor, artifact) {
+                    Ok(()) => {
+                        apply_task_graph(plan, &graph);
+                        plan.version += 1;
+                        Ok((1, "complete"))
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            "inject" => {
+                let Some(actor) = parsed.actor.clone() else {
+                    return fail("'actor' required");
+                };
+                let Some(gate_id) = parsed.gate_id.clone() else {
+                    return fail("'gate_id' required");
+                };
+                let count = parsed.nodes.len();
+                if let Some(item) = plan.items.iter_mut().find(|i| i.id == gate_id) {
+                    item.assigned_to = Some(actor.clone());
+                    item.status = "running".to_string();
+                }
+                let mut graph = to_task_graph(plan);
+                match dag::inject_from_gate(&mut graph, &gate_id, &actor, debug_specs(parsed.nodes))
+                {
+                    Ok(_) => {
+                        apply_task_graph(plan, &graph);
+                        plan.version += 1;
+                        Ok((count, "inject"))
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            other => Err(format!("unknown op '{other}'")),
+        }
+    };
+
+    match result {
+        Ok((count, op)) => {
+            let swarm_state = SwarmState {
+                members: Arc::clone(ctx.swarm_members),
+                swarms_by_id: Arc::clone(ctx.swarms_by_id),
+                plans: Arc::clone(ctx.swarm_plans),
+                coordinators: Arc::clone(ctx.swarm_coordinators),
+            };
+            persist_swarm_state_for(&swarm_id, &swarm_state).await;
+            serde_json::json!({"ok": true, "op": op, "count": count, "swarm_id": swarm_id})
+                .to_string()
+        }
+        Err(e) => fail(format!("graph op rejected: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        runtime: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.runtime.take() {
+                crate::env::set_var("JCODE_RUNTIME_DIR", value);
+            } else {
+                crate::env::remove_var("JCODE_RUNTIME_DIR");
+            }
+        }
+    }
+
+    fn isolated_runtime(dir: &tempfile::TempDir) -> EnvGuard {
+        let lock = crate::storage::lock_test_env();
+        let runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+        crate::env::set_var("JCODE_RUNTIME_DIR", dir.path());
+        EnvGuard {
+            _lock: lock,
+            runtime,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn clear_coordinator_releases_coordinator_lock_before_waiting_for_members() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let _env = isolated_runtime(&dir);
+        let session_id = Arc::new(RwLock::new("session-1".to_string()));
+        let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+        let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+        let shared_context = Arc::new(RwLock::new(HashMap::new()));
+        let swarm_plans = Arc::new(RwLock::new(HashMap::new()));
+        let swarm_coordinators = Arc::new(RwLock::new(HashMap::from([(
+            "swarm-lock-order".to_string(),
+            "session-1".to_string(),
+        )])));
+        let ctx = DebugSwarmWriteContext {
+            session_id: &session_id,
+            swarm_members: &swarm_members,
+            swarms_by_id: &swarms_by_id,
+            shared_context: &shared_context,
+            swarm_plans: &swarm_plans,
+            swarm_coordinators: &swarm_coordinators,
+        };
+
+        // Force the command to wait at members.write(). A safe path must not
+        // retain coordinators.write() while it waits for that independent lock.
+        let members_gate = swarm_members.write().await;
+        let command =
+            maybe_handle_swarm_write_command("swarm:clear_coordinator:swarm-lock-order", &ctx);
+        tokio::pin!(command);
+        tokio::select! {
+            result = &mut command => panic!("command unexpectedly completed: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let coordinators =
+            tokio::time::timeout(Duration::from_millis(100), swarm_coordinators.read())
+                .await
+                .expect("coordinator lock was retained while waiting for members");
+        assert!(!coordinators.contains_key("swarm-lock-order"));
+        drop(coordinators);
+
+        drop(members_gate);
+        let response = tokio::time::timeout(Duration::from_secs(1), &mut command)
+            .await
+            .expect("clear coordinator self-deadlocked")
+            .expect("command failed")
+            .expect("command was not handled");
+        assert!(response.contains("Coordinator cleared"));
+    }
 }

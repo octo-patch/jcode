@@ -42,6 +42,7 @@ async fn handle_resume_session_allows_multiple_live_tui_attach() -> Result<()> {
                 last_seen: now,
                 is_processing: false,
                 current_tool_name: None,
+                terminal_env: Vec::new(),
                 disconnect_tx: mpsc::unbounded_channel().0,
             },
         ),
@@ -56,15 +57,14 @@ async fn handle_resume_session_allows_multiple_live_tui_attach() -> Result<()> {
                 last_seen: now,
                 is_processing: false,
                 current_tool_name: None,
+                terminal_env: Vec::new(),
                 disconnect_tx: mpsc::unbounded_channel().0,
             },
         ),
     ])));
     let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
-    let file_touches = Arc::new(RwLock::new(HashMap::<PathBuf, Vec<FileAccess>>::new()));
-    let files_touched_by_session =
-        Arc::new(RwLock::new(HashMap::<String, HashSet<PathBuf>>::new()));
+    let file_touch = FileTouchService::new();
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
         String,
         HashMap<String, HashSet<String>>,
@@ -90,6 +90,7 @@ async fn handle_resume_session_allows_multiple_live_tui_attach() -> Result<()> {
         42,
         target_session_id.to_string(),
         None,
+        None,
         false,
         false,
         &mut client_selfdev,
@@ -105,8 +106,7 @@ async fn handle_resume_session_allows_multiple_live_tui_attach() -> Result<()> {
         &Arc::new(RwLock::new(ClientDebugState::default())),
         &swarm_members,
         &swarms_by_id,
-        &file_touches,
-        &files_touched_by_session,
+        &file_touch,
         &channel_subscriptions,
         &channel_subscriptions_by_session,
         &swarm_plans,

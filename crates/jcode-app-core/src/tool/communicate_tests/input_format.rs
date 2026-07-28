@@ -92,6 +92,7 @@ fn cleanup_candidates_default_to_owned_terminal_workers() {
             latest_completion_report: None,
             live_attachments: None,
             status_age_secs: None,
+            ..Default::default()
         },
         AgentInfo {
             session_id: "owned-done".to_string(),
@@ -105,6 +106,7 @@ fn cleanup_candidates_default_to_owned_terminal_workers() {
             latest_completion_report: None,
             live_attachments: None,
             status_age_secs: None,
+            ..Default::default()
         },
         AgentInfo {
             session_id: "user-created".to_string(),
@@ -118,6 +120,7 @@ fn cleanup_candidates_default_to_owned_terminal_workers() {
             latest_completion_report: None,
             live_attachments: None,
             status_age_secs: None,
+            ..Default::default()
         },
         AgentInfo {
             session_id: "owned-running".to_string(),
@@ -131,6 +134,7 @@ fn cleanup_candidates_default_to_owned_terminal_workers() {
             latest_completion_report: None,
             live_attachments: None,
             status_age_secs: None,
+            ..Default::default()
         },
     ];
     let statuses = default_cleanup_target_statuses();
@@ -197,16 +201,100 @@ fn format_members_includes_status_and_detail() {
             latest_completion_report: None,
             live_attachments: Some(0),
             status_age_secs: Some(12),
+            ..Default::default()
         }],
     );
 
     assert!(output.output.contains("Status: running — working on tests"));
+    assert!(output.output.contains("· 12s"));
     assert!(output.output.contains("Files: src/main.rs"));
     assert!(
         output
             .output
-            .contains("Meta: headless · owned_by_you · attachments=0 · status_age=12s")
+            .contains("Meta: headless · owned_by_you · attachments=0")
     );
+}
+
+#[test]
+fn format_members_renders_activity_progress_churn_and_turns() {
+    let ctx = test_ctx(
+        "session_self_1234567890_deadbeefcafebabe",
+        std::path::Path::new("."),
+    );
+
+    let output = format_members(
+        &ctx,
+        &[AgentInfo {
+            session_id: "session_peer_1234567890_aaaaaaaaaaaa0001".to_string(),
+            friendly_name: Some("otter".to_string()),
+            files_touched: vec![],
+            status: Some("running".to_string()),
+            detail: Some("implementing".to_string()),
+            task_label: None,
+            role: Some("agent".to_string()),
+            is_headless: Some(false),
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            live_attachments: Some(1),
+            status_age_secs: Some(8),
+            last_activity_age_secs: Some(3),
+            activity: Some(SessionActivitySnapshot {
+                is_processing: true,
+                current_tool_name: Some("edit".to_string()),
+            }),
+            provider_name: Some("anthropic".to_string()),
+            provider_model: Some("claude-sonnet".to_string()),
+            turn_count: Some(7),
+            recent_total_tokens: Some(12_345),
+            recent_output_tokens: Some(2_000),
+            recent_window_secs: Some(10),
+            cumulative_total_tokens: Some(98_765),
+            todos_completed: Some(3),
+            todos_total: Some(7),
+        }],
+    );
+
+    let text = output.output;
+    assert!(text.contains("Activity: working (edit)"), "got: {text}");
+    assert!(text.contains("Progress: 3/7 todos"), "got: {text}");
+    assert!(text.contains("12.3k tok/10s"), "got: {text}");
+    assert!(text.contains("7 turns"), "got: {text}");
+    assert!(text.contains("98.8k tok total"), "got: {text}");
+    assert!(text.contains("Model: anthropic/claude-sonnet"), "got: {text}");
+    // Running agent shows current-turn duration, not an "idle" label.
+    assert!(text.contains("· 8s"), "got: {text}");
+    // Running agent also surfaces last observed activity so a long turn does
+    // not read as a dead worker.
+    assert!(text.contains("· active 3s ago"), "got: {text}");
+    assert!(!text.contains("idle"), "got: {text}");
+}
+
+#[test]
+fn format_members_labels_idle_ready_agent() {
+    let ctx = test_ctx(
+        "session_self_1234567890_deadbeefcafebabe",
+        std::path::Path::new("."),
+    );
+
+    let output = format_members(
+        &ctx,
+        &[AgentInfo {
+            session_id: "session_peer_1234567890_bbbbbbbbbbbb0002".to_string(),
+            friendly_name: Some("idle-one".to_string()),
+            files_touched: vec![],
+            status: Some("ready".to_string()),
+            detail: None,
+            role: Some("agent".to_string()),
+            is_headless: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            live_attachments: Some(0),
+            status_age_secs: Some(90),
+            ..Default::default()
+        }],
+    );
+
+    assert!(output.output.contains("idle 1m"), "got: {}", output.output);
 }
 
 #[test]
@@ -230,6 +318,7 @@ fn format_members_disambiguates_duplicate_friendly_names() {
                 latest_completion_report: None,
                 live_attachments: None,
                 status_age_secs: None,
+                ..Default::default()
             },
             AgentInfo {
                 session_id: "session_shark_1234567890_bbbbbbbbbbbb0002".to_string(),
@@ -243,6 +332,7 @@ fn format_members_disambiguates_duplicate_friendly_names() {
                 latest_completion_report: None,
                 live_attachments: None,
                 status_age_secs: None,
+                ..Default::default()
             },
         ],
     );
@@ -290,6 +380,7 @@ fn format_status_snapshot_includes_activity_and_metadata() {
         is_headless: Some(true),
         live_attachments: Some(0),
         status_age_secs: Some(7),
+        last_activity_age_secs: Some(3),
         joined_age_secs: Some(42),
         files_touched: vec!["src/server/comm_sync.rs".to_string()],
         activity: Some(SessionActivitySnapshot {
@@ -315,7 +406,7 @@ fn format_status_snapshot_includes_activity_and_metadata() {
     assert!(
         output
             .output
-            .contains("Meta: headless · attachments=0 · status_age=7s · joined=42s")
+            .contains("Meta: headless · attachments=0 · active=3s ago · status_age=7s · joined=42s")
     );
     assert!(output.output.contains("Files: src/server/comm_sync.rs"));
 }

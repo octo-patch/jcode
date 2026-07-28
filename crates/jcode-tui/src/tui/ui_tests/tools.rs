@@ -66,6 +66,34 @@ fn test_batch_subcall_params_excludes_name_key() {
 }
 
 #[test]
+fn test_batch_subcall_intent_supports_flat_and_nested_shapes() {
+    let flat = serde_json::json!({
+        "tool": "read",
+        "intent": "Inspect flat input",
+        "file_path": "src/lib.rs"
+    });
+    let nested = serde_json::json!({
+        "tool": "read",
+        "parameters": {
+            "intent": "Inspect nested input",
+            "file_path": "src/main.rs"
+        }
+    });
+
+    let flat_params = tools_ui::batch_subcall_params(&flat);
+    let nested_params = tools_ui::batch_subcall_params(&nested);
+
+    assert_eq!(
+        tools_ui::batch_subcall_intent(&flat, &flat_params).as_deref(),
+        Some("Inspect flat input")
+    );
+    assert_eq!(
+        tools_ui::batch_subcall_intent(&nested, &nested_params).as_deref(),
+        Some("Inspect nested input")
+    );
+}
+
+#[test]
 fn test_parse_batch_sub_outputs_strips_footer_and_tracks_errors() {
     let content = "--- [1] read ---\n1234\n\n--- [2] grep ---\nError: 12345678\n\nCompleted: 1 succeeded, 1 failed";
 
@@ -109,6 +137,7 @@ fn test_render_tool_message_batch_flat_subcall_params_include_read_details() {
                 ]
             }),
             intent: None,
+            thought_signature: None,
         }),
     };
 
@@ -153,8 +182,7 @@ fn test_render_tool_message_batch_subcalls_show_individual_token_badges() {
                         {"tool": "grep", "pattern": "TODO", "path": "src"}
                     ]
                 }),
-                intent: None,
-            }),
+                intent: None, thought_signature: None, }),
         };
 
     let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
@@ -193,8 +221,7 @@ fn test_render_tool_message_batch_first_subcall_token_badge_with_timing_prefix()
                     {"tool": "bash", "command": "echo second"}
                 ]
             }),
-            intent: None,
-        }),
+            intent: None, thought_signature: None, }),
     };
 
     let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
@@ -229,6 +256,7 @@ fn test_render_tool_message_batch_last_subcall_keeps_token_badge_without_trailin
                 ]
             }),
             intent: None,
+            thought_signature: None,
         }),
     };
 
@@ -275,6 +303,7 @@ Completed: 2 succeeded, 1 failed"
                 ]
             }),
             intent: Some("Inspect schemas".to_string()),
+            thought_signature: None,
         }),
     };
 
@@ -324,8 +353,7 @@ fn test_render_tool_message_batch_all_failed_marks_all_children_failed() {
                     {"tool": "agentgrep"}
                 ]
             }),
-            intent: None,
-        }),
+            intent: None, thought_signature: None, }),
     };
 
     let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
@@ -349,6 +377,178 @@ fn test_render_tool_message_batch_all_failed_marks_all_children_failed() {
 }
 
 #[test]
+fn test_tool_summary_gmail_actions() {
+    let search = ToolCall {
+        id: "call_gmail_search".to_string(),
+        name: "gmail".to_string(),
+        input: serde_json::json!({
+            "action": "search",
+            "query": "from:alice subject:invoice",
+            "max_results": 5
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&search, 50, Some(50));
+    assert!(summary.starts_with("search "), "summary={summary:?}");
+    assert!(summary.contains("from:alice"), "summary={summary:?}");
+
+    let read = ToolCall {
+        id: "call_gmail_read".to_string(),
+        name: "gmail".to_string(),
+        input: serde_json::json!({
+            "action": "read",
+            "message_id": "18f2ab34cd56ef78"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&read, 50, Some(50));
+    assert!(summary.starts_with("read "), "summary={summary:?}");
+
+    let send = ToolCall {
+        id: "call_gmail_send".to_string(),
+        name: "gmail".to_string(),
+        input: serde_json::json!({
+            "action": "send",
+            "to": "bob@example.com",
+            "subject": "hello"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&send, 50, Some(50));
+    assert!(
+        summary.contains("send") && summary.contains("bob@example.com"),
+        "summary={summary:?}"
+    );
+
+    let bare = ToolCall {
+        id: "call_gmail_labels".to_string(),
+        name: "gmail".to_string(),
+        input: serde_json::json!({ "action": "labels" }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&bare, 50, Some(50));
+    assert_eq!(summary, "labels");
+}
+
+#[test]
+fn test_tool_activity_detail_prefixes_intent_for_gmail_and_browser() {
+    tools_ui::tests_tool_call_details_override::set(true);
+    let gmail = ToolCall {
+        id: "call_gmail_intent".to_string(),
+        name: "gmail".to_string(),
+        input: serde_json::json!({
+            "action": "search",
+            "query": "is:unread",
+            "intent": "Check unread mail"
+        }),
+        intent: Some("Check unread mail".to_string()),
+        thought_signature: None,
+    };
+    let detail = tools_ui::get_tool_activity_detail(&gmail);
+    assert!(detail.starts_with("Check unread mail"), "detail={detail:?}");
+    assert!(detail.contains("is:unread"), "detail={detail:?}");
+
+    let browser = ToolCall {
+        id: "call_browser_intent".to_string(),
+        name: "browser".to_string(),
+        input: serde_json::json!({
+            "action": "open",
+            "url": "https://example.com",
+            "intent": "Open docs page"
+        }),
+        intent: Some("Open docs page".to_string()),
+        thought_signature: None,
+    };
+    let detail = tools_ui::get_tool_activity_detail(&browser);
+    assert!(detail.starts_with("Open docs page"), "detail={detail:?}");
+    assert!(detail.contains("example.com"), "detail={detail:?}");
+    tools_ui::tests_tool_call_details_override::set(false);
+}
+
+/// By default (tool_call_details off) the activity detail is the intent alone.
+#[test]
+fn test_tool_activity_detail_hides_technical_summary_by_default() {
+    let gmail = ToolCall {
+        id: "call_gmail_intent_only".to_string(),
+        name: "gmail".to_string(),
+        input: serde_json::json!({
+            "action": "search",
+            "query": "is:unread",
+            "intent": "Check unread mail"
+        }),
+        intent: Some("Check unread mail".to_string()),
+        thought_signature: None,
+    };
+    let detail = tools_ui::get_tool_activity_detail(&gmail);
+    assert_eq!(detail, "Check unread mail");
+}
+
+#[test]
+fn test_tool_summary_covers_action_shaped_tools_and_fallback() {
+    let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+        (
+            "schedule",
+            serde_json::json!({ "action": "create", "task": "check CI status" }),
+            "create",
+        ),
+        (
+            "schedule",
+            serde_json::json!({ "action": "cancel", "schedule_id": "sched_123" }),
+            "cancel",
+        ),
+        (
+            "skill_manage",
+            serde_json::json!({ "action": "load", "name": "frontend-design" }),
+            "load /frontend-design",
+        ),
+        (
+            "invalid",
+            serde_json::json!({ "tool": "bash", "error": "missing command" }),
+            "bash: missing command",
+        ),
+        (
+            "discover_tools",
+            serde_json::json!({ "category": "databases", "reason": "need a db" }),
+            "browse databases",
+        ),
+        (
+            "discover_tools",
+            serde_json::json!({
+                "action": "suggest",
+                "category": "payments",
+                "suggestion_kind": "known_product",
+                "product_name": "Stripe sandbox MCP"
+            }),
+            "suggest Stripe sandbox MCP",
+        ),
+        // Unknown/unmatched tools fall back to the action field.
+        (
+            "request_permission",
+            serde_json::json!({ "action": "push", "description": "push commits" }),
+            "push",
+        ),
+    ];
+    for (name, input, expected_prefix) in cases {
+        let tool = ToolCall {
+            id: format!("call_{name}"),
+            name: name.to_string(),
+            input,
+            intent: None,
+            thought_signature: None,
+        };
+        let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(60));
+        assert!(
+            summary.starts_with(expected_prefix),
+            "tool={name} summary={summary:?} expected prefix {expected_prefix:?}"
+        );
+    }
+}
+
+#[test]
 fn test_tool_summary_read_supports_start_line_end_line() {
     let tool = ToolCall {
         id: "call_read_range".to_string(),
@@ -359,6 +559,7 @@ fn test_tool_summary_read_supports_start_line_end_line() {
             "end_line": 20
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(40));
@@ -382,6 +583,7 @@ fn test_render_tool_message_batch_includes_start_end_read_details() {
                 ]
             }),
             intent: None,
+            thought_signature: None,
         }),
     };
 
@@ -412,6 +614,7 @@ fn test_tool_summary_path_truncation_keeps_filename_tail() {
             "limit": 40
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(28));
@@ -432,6 +635,7 @@ fn test_tool_summary_grep_truncation_prefers_middle() {
             "path": "src/some/really/long/module"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(34));
@@ -457,6 +661,7 @@ fn test_tool_summary_bash_truncation_keeps_start_and_end() {
             "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_flat_subcall_params_include_read_details -- --nocapture"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 32, Some(34));
@@ -479,6 +684,7 @@ fn test_tool_summary_bash_keeps_full_command_when_width_fits() {
             "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width -- --nocapture"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 32, Some(160));
@@ -499,6 +705,7 @@ fn test_render_batch_subcall_line_keeps_full_bash_summary_when_row_fits() {
             "command": "cargo test --package jcode --lib tui::ui::tests::render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width -- --nocapture"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let line =
@@ -514,6 +721,55 @@ fn test_render_batch_subcall_line_keeps_full_bash_summary_when_row_fits() {
 }
 
 #[test]
+fn test_render_batch_subcall_line_shows_model_provided_intent() {
+    tools_ui::tests_tool_call_details_override::set(true);
+    let tool = ToolCall {
+        id: "batch-1-read".to_string(),
+        name: "read".to_string(),
+        input: serde_json::json!({"file_path": "src/tui/ui_messages.rs"}),
+        intent: Some("Inspect completed batch rendering".to_string()),
+        thought_signature: None,
+    };
+
+    let line =
+        tools_ui::render_batch_subcall_line(&tool, "✓", rgb(100, 180, 100), 50, Some(120), None);
+    let rendered = extract_line_text(&line);
+
+    assert!(
+        rendered.contains("read · Inspect completed batch rendering ·"),
+        "rendered={rendered:?}"
+    );
+    assert!(rendered.contains("ui_messages.rs"), "rendered={rendered:?}");
+    tools_ui::tests_tool_call_details_override::set(false);
+}
+
+/// By default (tool_call_details off) a subcall row with an intent shows only
+/// the intent, not the dimmed technical summary.
+#[test]
+fn test_render_batch_subcall_line_hides_technical_detail_by_default() {
+    let tool = ToolCall {
+        id: "batch-1-read".to_string(),
+        name: "read".to_string(),
+        input: serde_json::json!({"file_path": "src/tui/ui_messages.rs"}),
+        intent: Some("Inspect completed batch rendering".to_string()),
+        thought_signature: None,
+    };
+
+    let line =
+        tools_ui::render_batch_subcall_line(&tool, "✓", rgb(100, 180, 100), 50, Some(120), None);
+    let rendered = extract_line_text(&line);
+
+    assert!(
+        rendered.contains("read · Inspect completed batch rendering"),
+        "rendered={rendered:?}"
+    );
+    assert!(
+        !rendered.contains("ui_messages.rs"),
+        "technical detail should be hidden by default: {rendered:?}"
+    );
+}
+
+#[test]
 fn test_agentgrep_summary_uses_default_grep_mode_query() {
     let tool = ToolCall {
         id: "agentgrep-default-mode".to_string(),
@@ -523,6 +779,7 @@ fn test_agentgrep_summary_uses_default_grep_mode_query() {
             "path": "src/tui"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(120));
@@ -540,6 +797,7 @@ fn test_render_batch_subcall_line_shows_first_subcall_token_badge() {
             "path": "src/tui"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let line = tools_ui::render_batch_subcall_line(
@@ -572,6 +830,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
                     "limit": 40
                 }),
                 intent: None,
+                thought_signature: None,
             },
             "src/tui/ui_messages.rs:120-160",
         ),
@@ -584,6 +843,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
                     "path": "src/tui"
                 }),
                 intent: None,
+                thought_signature: None,
             },
             "'render_batch_subcall_line' in src/tui",
         ),
@@ -595,6 +855,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
                     "pattern": "src/tui/**/*.rs"
                 }),
                 intent: None,
+                thought_signature: None,
             },
             "'src/tui/**/*.rs'",
         ),
@@ -606,6 +867,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
                     "url": "https://example.com/docs/api/reference"
                 }),
                 intent: None,
+                thought_signature: None,
             },
             "https://example.com/docs/api/reference",
         ),
@@ -618,6 +880,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
                     "target": "src/tui/ui.rs"
                 }),
                 intent: None,
+                thought_signature: None,
             },
             "open src/tui/ui.rs",
         ),
@@ -630,6 +893,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
                     "query": "tool summary truncation"
                 }),
                 intent: None,
+                thought_signature: None,
             },
             "recall 'tool summary truncation'",
         ),
@@ -641,6 +905,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
                     "query": "rust unicode width truncation examples"
                 }),
                 intent: None,
+                thought_signature: None,
             },
             "'rust unicode width truncation examples'",
         ),
@@ -652,6 +917,7 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
                     "command": "tester:list"
                 }),
                 intent: None,
+                thought_signature: None,
             },
             "tester:list",
         ),
@@ -671,6 +937,7 @@ fn test_debug_socket_summary_hides_transient_missing_input() {
         name: "debug_socket".to_string(),
         input: serde_json::Value::Null,
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -687,6 +954,7 @@ fn test_tool_summary_browser_open_shows_url() {
             "url": "https://example.com/docs/reference/browser-tool"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -707,6 +975,7 @@ fn test_tool_summary_browser_type_hides_typed_text() {
             "text": "super-secret-value"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -727,6 +996,7 @@ fn test_tool_summary_browser_type_without_selector_still_hides_text() {
             "text": "secret-token-123"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -744,6 +1014,7 @@ fn test_tool_summary_browser_eval_truncates_script() {
             "script": "return window.__APP_STATE__?.reallyLongNestedValue?.items?.map(item => item.name).join(', ')"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(34));
@@ -762,6 +1033,7 @@ fn test_tool_summary_agentgrep_smart_uses_terms_subject_relation() {
             "terms": ["subject:agentgrep", "relation:build_args", "path:src/tool"]
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -778,6 +1050,7 @@ fn test_tool_summary_agentgrep_smart_uses_query_subject_relation() {
             "query": "subject:agentgrep relation:build_args path:src/tool"
         }),
         intent: None,
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -794,6 +1067,7 @@ fn test_tool_summary_bg_infers_wait_from_intent_when_action_missing() {
             "latest": true
         }),
         intent: Some("Wait for library tests".to_string()),
+        thought_signature: None,
     };
 
     let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -822,6 +1096,7 @@ fn test_render_tool_message_batch_rows_do_not_soft_wrap_on_narrow_width() {
                 ]
             }),
             intent: None,
+            thought_signature: None,
         }),
     };
 
@@ -855,6 +1130,7 @@ fn test_render_tool_message_keeps_token_badge_when_intent_is_truncated() {
                 "Inspect and validate the extremely long wrapping behavior for tool rows"
                     .to_string(),
             ),
+            thought_signature: None,
         }),
     };
 
@@ -865,6 +1141,43 @@ fn test_render_tool_message_keeps_token_badge_when_intent_is_truncated() {
     assert!(rendered[0].width() <= 47, "rendered={rendered:?}");
     assert!(rendered[0].contains('…'), "rendered={rendered:?}");
     assert!(rendered[0].contains("tok"), "rendered={rendered:?}");
+}
+
+/// With an intent present, the bash command preview must never spill onto a
+/// second `$ ...` line. It renders inline when it fits and is dropped when it
+/// does not.
+#[test]
+fn test_render_tool_message_with_intent_never_adds_second_command_line() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "ok".to_string(),
+        tool_calls: vec![],
+        duration_secs: None,
+        title: None,
+        tool_data: Some(ToolCall {
+            id: "call_intent_no_wrap".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({
+                "command": "set -euo pipefail; python -c 'import modal' && echo ready"
+            }),
+            intent: Some("Launch exactly one paid Opus canary".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 60, crate::config::DiffDisplayMode::Off);
+    let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
+
+    assert!(!rendered.is_empty(), "rendered={rendered:?}");
+    assert_eq!(
+        rendered.len(),
+        1,
+        "intent rows must stay single-line: {rendered:?}"
+    );
+    assert!(
+        !rendered[0].trim_start().starts_with('$'),
+        "rendered={rendered:?}"
+    );
 }
 
 #[test]
@@ -882,6 +1195,7 @@ fn test_render_tool_message_keeps_bash_command_visible_when_row_is_narrow() {
                 "command": "grep -rn \"unwrap()\" src/ --include=\"*.rs\" | wc -l"
             }),
             intent: None,
+            thought_signature: None,
         }),
     };
 
@@ -922,6 +1236,7 @@ fn test_action_tools_hide_missing_placeholder_for_streaming_input() {
                 name: name.to_string(),
                 input: input.clone(),
                 intent: None,
+                thought_signature: None,
             };
 
             let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -955,6 +1270,7 @@ fn test_action_tools_degrade_to_tool_name_when_action_absent() {
             name: name.to_string(),
             input,
             intent: None,
+            thought_signature: None,
         };
 
         let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
@@ -963,4 +1279,74 @@ fn test_action_tools_degrade_to_tool_name_when_action_absent() {
             "tool={name} summary={summary:?}"
         );
     }
+}
+
+/// The live activity line should surface the model-provided `intent` for any
+/// tool (including swarm) ahead of the technical summary when tool call
+/// details are enabled.
+#[test]
+fn test_activity_detail_prefers_intent_and_appends_summary() {
+    tools_ui::tests_tool_call_details_override::set(true);
+    let tool = ToolCall {
+        id: "swarm-1".to_string(),
+        name: "swarm".to_string(),
+        input: serde_json::json!({
+            "intent": "Spin up a worker for the parser fix",
+            "action": "spawn",
+            "prompt": "Fix the parser bug in crates/parser"
+        }),
+        intent: Some("Spin up a worker for the parser fix".to_string()),
+        thought_signature: None,
+    };
+
+    let detail = tools_ui::get_tool_activity_detail(&tool);
+    assert!(
+        detail.starts_with("Spin up a worker for the parser fix"),
+        "intent should lead the activity detail: {detail:?}"
+    );
+    assert!(
+        detail.contains("spawn"),
+        "technical summary should still appear: {detail:?}"
+    );
+    tools_ui::tests_tool_call_details_override::set(false);
+}
+
+/// When the `ToolCall.intent` field is not populated yet (e.g. streamed input
+/// parsed but intent refresh missed), fall back to the raw `intent` input key.
+#[test]
+fn test_activity_detail_falls_back_to_input_intent_field() {
+    let tool = ToolCall {
+        id: "swarm-2".to_string(),
+        name: "swarm".to_string(),
+        input: serde_json::json!({
+            "intent": "Check on worker progress",
+            "action": "status",
+            "target_session": "worker-1"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+
+    let detail = tools_ui::get_tool_activity_detail(&tool);
+    assert!(
+        detail.starts_with("Check on worker progress"),
+        "input intent should be used when the field is unset: {detail:?}"
+    );
+}
+
+/// Without an intent, the activity detail matches the plain technical summary.
+#[test]
+fn test_activity_detail_without_intent_matches_summary() {
+    let tool = ToolCall {
+        id: "swarm-3".to_string(),
+        name: "swarm".to_string(),
+        input: serde_json::json!({ "action": "dm", "to_session": "worker-1", "message": "hello" }),
+        intent: None,
+        thought_signature: None,
+    };
+
+    let detail = tools_ui::get_tool_activity_detail(&tool);
+    let summary = tools_ui::get_tool_summary(&tool);
+    assert_eq!(detail, summary);
+    assert!(!detail.is_empty());
 }

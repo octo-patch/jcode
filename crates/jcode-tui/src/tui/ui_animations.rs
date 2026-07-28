@@ -1,5 +1,5 @@
 use crate::tui::{TuiState, color_support::rgb};
-use ratatui::{prelude::*, widgets::Paragraph};
+use ratatui::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -7,18 +7,164 @@ use std::sync::OnceLock;
 
 const IDLE_VARIANTS: &[&str] = &["donut", "orbit_rings"];
 
-fn rotate_xyz(x: f32, y: f32, z: f32, ax: f32, ay: f32, az: f32) -> (f32, f32, f32) {
-    let (sx, cx) = ax.sin_cos();
-    let (sy, cy) = ay.sin_cos();
-    let (sz, cz) = az.sin_cos();
-    let y1 = y * cx - z * sx;
-    let z1 = y * sx + z * cx;
-    let x1 = x * cy + z1 * sy;
-    let z2 = -x * sy + z1 * cy;
-    let x2 = x1 * cz - y1 * sz;
-    let y2 = x1 * sz + y1 * cz;
-    (x2, y2, z2)
+/// Where (if anywhere) the decorative idle animation rendered on the last full
+/// frame, so the run loop can repaint only those rows on animation ticks.
+///
+/// Packed into one atomic (`None` is the all-ones sentinel, which no real Rect
+/// can be) so publishing it costs nothing on the render path and reading it
+/// cannot fail or block. Ratatui coordinates are `u16`, so all four fields fit.
+#[cfg(not(test))]
+static LAST_IDLE_ANIMATION_AREA: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn pack_area(area: Option<Rect>) -> u64 {
+    match area {
+        None => u64::MAX,
+        Some(area) => {
+            u64::from(area.x) << 48
+                | u64::from(area.y) << 32
+                | u64::from(area.width) << 16
+                | u64::from(area.height)
+        }
+    }
 }
+
+fn unpack_area(packed: u64) -> Option<Rect> {
+    if packed == u64::MAX {
+        return None;
+    }
+    Some(Rect::new(
+        (packed >> 48) as u16,
+        (packed >> 32) as u16,
+        (packed >> 16) as u16,
+        packed as u16,
+    ))
+}
+
+/// Counts of how idle-animation ticks were served, so the partial-repaint fast
+/// path is observable in `draw-stats` instead of having to be inferred from a
+/// profile. A healthy idle screen shows `partial` climbing and `full` flat: a
+/// regression that pushes animation ticks back onto the full frame pipeline
+/// (~50x more expensive) shows up immediately as `full` climbing instead.
+static IDLE_ANIMATION_PARTIAL_REPAINTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static IDLE_ANIMATION_FULL_REPAINTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_idle_animation_partial_repaint() {
+    IDLE_ANIMATION_PARTIAL_REPAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn note_idle_animation_full_repaint() {
+    IDLE_ANIMATION_FULL_REPAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Tally of why the animation-only repaint was refused, for `draw-stats`.
+///
+/// A tally rather than a "last reason" because the fast path is consulted many
+/// times per second: a single latest value is ambiguous (it can be a rare case
+/// that happened to fire last), while counts show which predicate actually
+/// dominates.
+static IDLE_ANIMATION_FAST_PATH_BLOCKED: std::sync::Mutex<
+    Option<std::collections::BTreeMap<&'static str, u64>>,
+> = std::sync::Mutex::new(None);
+
+pub(crate) fn note_idle_animation_fast_path_blocked(reason: &'static str) {
+    if let Ok(mut slot) = IDLE_ANIMATION_FAST_PATH_BLOCKED.lock() {
+        *slot
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .entry(reason)
+            .or_insert(0) += 1;
+    }
+}
+
+pub(crate) fn idle_animation_fast_path_blocked_reasons() -> serde_json::Value {
+    match IDLE_ANIMATION_FAST_PATH_BLOCKED.lock() {
+        Ok(slot) => match slot.as_ref() {
+            Some(counts) => serde_json::to_value(counts).unwrap_or(serde_json::Value::Null),
+            None => serde_json::Value::Null,
+        },
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+/// Diagnostic snapshot of how idle-animation ticks are being served, embedded
+/// in `draw-stats`. Assembled here so the animation owns its own reporting and
+/// the generic frame-metrics module stays agnostic.
+pub(crate) fn idle_animation_debug_json() -> serde_json::Value {
+    serde_json::json!({
+        "partial_repaints": IDLE_ANIMATION_PARTIAL_REPAINTS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "full_repaints": IDLE_ANIMATION_FULL_REPAINTS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "last_full_frame_reason": crate::tui::last_full_frame_redraw_reason(),
+        "fast_path_blocked": idle_animation_fast_path_blocked_reasons(),
+    })
+}
+
+/// Publish the animated rectangle for the animation-only partial repaint.
+/// `None` means the last frame drew no animation, disabling the fast path.
+pub(crate) fn record_idle_animation_area(area: Option<Rect>) {
+    #[cfg(test)]
+    {
+        TEST_LAST_IDLE_ANIMATION_AREA.with(|snapshot| {
+            *snapshot.borrow_mut() = area;
+        });
+    }
+    #[cfg(not(test))]
+    {
+        LAST_IDLE_ANIMATION_AREA.store(pack_area(area), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn last_idle_animation_area() -> Option<Rect> {
+    #[cfg(test)]
+    {
+        return TEST_LAST_IDLE_ANIMATION_AREA.with(|snapshot| *snapshot.borrow());
+    }
+    #[cfg(not(test))]
+    {
+        unpack_area(LAST_IDLE_ANIMATION_AREA.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Repaint just the idle-animation rows of an already-rendered frame buffer.
+///
+/// The surrounding cells were already theme/emoji adapted when the full frame
+/// was drawn, so adaptation is applied to the freshly written animation cells
+/// only: `adapt_buffer_for_theme` inverts colors on light terminals and is not
+/// idempotent, so re-running it over the reused buffer would flip everything
+/// back. The animation writes plain box/shade glyphs and a foreground color, so
+/// per-cell foreground adaptation is the complete equivalent here.
+pub(crate) fn render_idle_animation_into(buf: &mut Buffer, area: Rect, elapsed: f32) {
+    let area = area.intersection(*buf.area());
+    // A full frame clears the whole surface before drawing, so the animation
+    // blits over reset cells and leaves its blank cells styleless. Here the rows
+    // still hold the previous tick's glyphs and colors, so reset them first to
+    // reproduce that starting state exactly.
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buf[(x, y)].reset();
+        }
+    }
+    render_idle_animation(buf, area, elapsed);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            cell.fg = jcode_tui_style::adapt_color_for_theme(cell.fg);
+        }
+    }
+}
+
+// Pure math kernels (3D samplers, glyph chooser, HSV->RGB) live in the
+// dependency-free `jcode-tui-anim` crate, which is pinned to opt-level = 3 in
+// all profiles so these trig-heavy loops stay optimized even in debug/selfdev
+// builds. They are imported under their original names so the call sites and
+// tests below are unchanged.
+use jcode_tui_anim::{
+    hsv_to_rgb, sample_black_hole, sample_donut, sample_gyroscope, sample_orbit_rings,
+    shape_char_3x3,
+};
 
 fn animation_seed() -> u64 {
     static SEED: OnceLock<u64> = OnceLock::new();
@@ -114,16 +260,53 @@ impl IdleBuffers {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LAST_IDLE_ANIMATION_AREA: RefCell<Option<Rect>> = const { RefCell::new(None) };
+}
+
 thread_local! {
     static IDLE_BUF: RefCell<IdleBuffers> = RefCell::new(IdleBuffers::new());
 }
 
+/// Rows reserved below the input for the decorative idle donut.
+///
+/// The donut only shows on an (effectively) empty idle screen, which means it
+/// is pure negative space. When the composer grows past its resting one-row
+/// height (multi-line input, or the `/` command menu adding suggestion rows),
+/// take that growth out of the donut's reservation instead of shrinking the
+/// transcript above: this keeps the header/tips text and info widgets
+/// perfectly still when the slash menu opens on a fresh session. The donut
+/// simply renders shorter for as long as the composer is expanded.
+pub(crate) fn idle_donut_reserved_height(show_donut: bool, input_height: u16) -> u16 {
+    const IDLE_DONUT_HEIGHT: u16 = 14;
+    if show_donut {
+        let composer_growth = input_height.saturating_sub(1);
+        IDLE_DONUT_HEIGHT.saturating_sub(composer_growth)
+    } else {
+        0
+    }
+}
+
 pub(super) fn draw_idle_animation(frame: &mut Frame, app: &dyn TuiState, area: Rect) {
+    // Remember the animated rows so the run loop can repaint only them between
+    // full frames. Sizes the animation rejects are recorded as "no animation".
+    record_idle_animation_area((area.width >= 4 && area.height >= 2).then_some(area));
+    render_idle_animation(frame.buffer_mut(), area, app.animation_elapsed());
+}
+
+/// Render the decorative idle animation into `buf` over `area`.
+///
+/// Split out from [`draw_idle_animation`] so the run loop can repaint just the
+/// animation rows between full frames: the animation is the only thing that
+/// changes on an idle screen, and re-rendering the whole frame at animation FPS
+/// was costing ~50ms per tick (dominated by transcript/chrome work that
+/// produced byte-identical cells).
+pub(crate) fn render_idle_animation(buf: &mut Buffer, area: Rect, elapsed: f32) {
     if area.width < 4 || area.height < 2 {
         return;
     }
 
-    let elapsed = app.animation_elapsed();
     let cw = area.width as usize;
     let ch = area.height as usize;
 
@@ -177,7 +360,108 @@ pub(super) fn draw_idle_animation(frame: &mut Frame, app: &dyn TuiState, area: R
         let lum_map = &bufs.lum_map;
 
         let time_hue = elapsed * 40.0;
-        let centered = app.centered_mode();
+
+        // Render glyphs directly into the frame buffer. Each idle line is exactly
+        // `area.width` cells wide, so Paragraph's Center/Left alignment offset is
+        // always 0; writing cells in place produces byte-identical output to the
+        // old `Paragraph::new(Vec<Line<Vec<Span>>>)` path (proven by
+        // `direct_blit_matches_paragraph` below) while avoiding a per-cell String
+        // plus a Vec<Span>/Vec<Line>/Paragraph allocation on every animation
+        // frame (60 FPS) -- the dominant idle-render cost once the samplers were
+        // optimized.
+        blit_idle(buf, area, hit, lum_map, sw, time_hue);
+    });
+}
+
+/// Composite the subpixel `hit`/`lum_map` grids into terminal cells, writing
+/// directly into `buf` over `area`. Factored out so it can be diffed against the
+/// original Paragraph-based renderer in tests.
+fn blit_idle(
+    buf: &mut Buffer,
+    area: Rect,
+    hit: &[bool],
+    lum_map: &[f32],
+    sw: usize,
+    time_hue: f32,
+) {
+    const SUB_X: usize = 3;
+    const SUB_Y: usize = 3;
+    let cw = area.width as usize;
+    let ch = area.height as usize;
+
+    for row in 0..ch {
+        let y = area.y + row as u16;
+        for col in 0..cw {
+            let x = area.x + col as u16;
+
+            let mut pattern = 0u16;
+            let mut total_lum = 0.0f32;
+            let mut hit_count = 0u32;
+
+            for sy in 0..SUB_Y {
+                for sx in 0..SUB_X {
+                    let px = col * SUB_X + sx;
+                    let py = row * SUB_Y + sy;
+                    let idx = py * sw + px;
+                    if hit[idx] {
+                        pattern |= 1 << (sy * SUB_X + sx);
+                        total_lum += lum_map[idx];
+                        hit_count += 1;
+                    }
+                }
+            }
+
+            let cell = &mut buf[(x, y)];
+            if hit_count == 0 {
+                // Matches the old `Span::raw(" ")`: symbol becomes a space and
+                // the (empty) default style patches nothing onto the cell.
+                cell.set_char(' ');
+            } else {
+                let avg_lum = total_lum / hit_count as f32;
+                let coverage = hit_count as f32 / (SUB_X * SUB_Y) as f32;
+                let t = (avg_lum + 1.0) * 0.5;
+                let glyph = shape_char_3x3(pattern, t);
+
+                let hue = (time_hue + t * 160.0) % 360.0;
+                let hue = if hue < 0.0 { hue + 360.0 } else { hue };
+
+                let sat = 0.5 + t * 0.4;
+                let val = (0.10 + t * t * 0.90) * (0.55 + coverage * 0.45);
+                let (r, g, b) = hsv_to_rgb(hue, sat, val);
+                // Matches the old `Span::styled(.., Style::default().fg(..))`:
+                // set the symbol and patch only the foreground color.
+                cell.set_char(glyph).set_fg(rgb(r, g, b));
+            }
+        }
+    }
+}
+
+fn idle_animation_variant() -> &'static str {
+    choose_animation_variant(IDLE_VARIANTS, 0x4944_4c45_414e_494d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::widgets::{Paragraph, Widget};
+
+    type IdleSampler = fn(f32, usize, usize, &mut [bool], &mut [f32], &mut [f32]);
+
+    /// The original Paragraph-based renderer, kept here verbatim so we can prove
+    /// the in-place `blit_idle` produces a byte-identical `Buffer`.
+    fn render_idle_via_paragraph(
+        buf: &mut Buffer,
+        area: Rect,
+        hit: &[bool],
+        lum_map: &[f32],
+        sw: usize,
+        time_hue: f32,
+        centered: bool,
+    ) {
+        const SUB_X: usize = 3;
+        const SUB_Y: usize = 3;
+        let cw = area.width as usize;
+        let ch = area.height as usize;
         let align = if centered {
             Alignment::Center
         } else {
@@ -211,7 +495,7 @@ pub(super) fn draw_idle_animation(frame: &mut Frame, app: &dyn TuiState, area: R
                             let avg_lum = total_lum / hit_count as f32;
                             let coverage = hit_count as f32 / (SUB_X * SUB_Y) as f32;
                             let t = (avg_lum + 1.0) * 0.5;
-                            let ch = shape_char_3x3(pattern, t);
+                            let glyph = shape_char_3x3(pattern, t);
 
                             let hue = (time_hue + t * 160.0) % 360.0;
                             let hue = if hue < 0.0 { hue + 360.0 } else { hue };
@@ -219,7 +503,7 @@ pub(super) fn draw_idle_animation(frame: &mut Frame, app: &dyn TuiState, area: R
                             let sat = 0.5 + t * 0.4;
                             let val = (0.10 + t * t * 0.90) * (0.55 + coverage * 0.45);
                             let (r, g, b) = hsv_to_rgb(hue, sat, val);
-                            Span::styled(String::from(ch), Style::default().fg(rgb(r, g, b)))
+                            Span::styled(String::from(glyph), Style::default().fg(rgb(r, g, b)))
                         }
                     })
                     .collect();
@@ -227,584 +511,62 @@ pub(super) fn draw_idle_animation(frame: &mut Frame, app: &dyn TuiState, area: R
             })
             .collect();
 
-        frame.render_widget(Paragraph::new(lines), area);
-    });
-}
-
-fn sample_donut(
-    elapsed: f32,
-    sw: usize,
-    sh: usize,
-    hit: &mut [bool],
-    lum_map: &mut [f32],
-    z_buf: &mut [f32],
-) {
-    let a_rot = elapsed * 1.0;
-    let b_rot = elapsed * 0.5;
-    let cos_a = a_rot.cos();
-    let sin_a = a_rot.sin();
-    let cos_b = b_rot.cos();
-    let sin_b = b_rot.sin();
-
-    let aspect = 0.5;
-    let r1 = 1.0f32;
-    let r2 = 2.0f32;
-    let k2 = 5.0f32;
-    let k1 = (sw as f32).min(sh as f32 / aspect) * k2 * 0.35 / (r1 + r2);
-
-    let mut theta: f32 = 0.0;
-    while theta < std::f32::consts::TAU {
-        let ct = theta.cos();
-        let st = theta.sin();
-
-        let mut phi: f32 = 0.0;
-        while phi < std::f32::consts::TAU {
-            let cp = phi.cos();
-            let sp = phi.sin();
-
-            let cx = r2 + r1 * ct;
-            let cy = r1 * st;
-
-            let x = cx * (cos_b * cp + sin_a * sin_b * sp) - cy * cos_a * sin_b;
-            let y = cx * (sin_b * cp - sin_a * cos_b * sp) + cy * cos_a * cos_b;
-            let z = k2 + cos_a * cx * sp + cy * sin_a;
-            let ooz = 1.0 / z;
-
-            let xp = (sw as f32 / 2.0 + k1 * ooz * x) as isize;
-            let yp = (sh as f32 / 2.0 - k1 * ooz * y * aspect) as isize;
-
-            let lum = cp * ct * sin_b - cos_a * ct * sp - sin_a * st
-                + cos_b * (cos_a * st - ct * sin_a * sp);
-
-            if xp >= 0 && (xp as usize) < sw && yp >= 0 && (yp as usize) < sh {
-                let idx = yp as usize * sw + xp as usize;
-                if ooz > z_buf[idx] {
-                    z_buf[idx] = ooz;
-                    lum_map[idx] = lum;
-                    hit[idx] = true;
-                }
-            }
-
-            phi += 0.014;
-        }
-        theta += 0.04;
+        Paragraph::new(lines).render(area, buf);
     }
-}
 
-fn idle_animation_variant() -> &'static str {
-    choose_animation_variant(IDLE_VARIANTS, 0x4944_4c45_414e_494d)
-}
+    /// The direct-buffer renderer must produce a Buffer byte-identical to the
+    /// old Paragraph path, for both Center and Left "alignment" (the idle lines
+    /// are full width, so the offset is always 0), across several sizes/times
+    /// and all idle variants.
+    #[test]
+    fn direct_blit_matches_paragraph() {
+        type Sampler = fn(f32, usize, usize, &mut [bool], &mut [f32], &mut [f32]);
+        let samplers: &[(&str, Sampler)] = &[
+            ("donut", sample_donut),
+            ("orbit_rings", sample_orbit_rings),
+            ("gyroscope", sample_gyroscope),
+            ("black_hole", sample_black_hole),
+        ];
 
-fn sample_black_hole(
-    elapsed: f32,
-    sw: usize,
-    sh: usize,
-    hit: &mut [bool],
-    lum_map: &mut [f32],
-    z_buf: &mut [f32],
-) {
-    let cx = sw as f32 / 2.0;
-    let cy = sh as f32 / 2.0;
-    let aspect = 0.5f32;
-    let disk_half_len = sw as f32 * 0.35;
-    let disk_half_thickness = (sh as f32 * 0.052).max(1.0);
-    let horizon_r = (sh as f32).min(sw as f32 / 3.2) * 0.16;
-    let halo_r = horizon_r * 1.8;
-    let shimmer = elapsed * 2.35;
+        for &(cw, chh) in &[(40u16, 16u16), (80, 30), (120, 40), (57, 23)] {
+            const SUB_X: usize = 3;
+            const SUB_Y: usize = 3;
+            let sw = cw as usize * SUB_X;
+            let sh = chh as usize * SUB_Y;
+            let area = Rect::new(2, 1, cw, chh);
+            let buf_area = Rect::new(0, 0, cw + 4, chh + 2);
 
-    for y in 0..sh {
-        for x in 0..sw {
-            let dx = x as f32 - cx;
-            let dy = (y as f32 - cy) / aspect;
-            let r = (dx * dx + dy * dy).sqrt();
-            let idx = y * sw + x;
+            for &(name, sampler) in samplers {
+                for &elapsed in &[0.0f32, 0.4, 1.6, 3.3, 7.1] {
+                    let n = sw * sh;
+                    let (mut hit, mut lum, mut z) =
+                        (vec![false; n], vec![0.0f32; n], vec![0.0f32; n]);
+                    sampler(elapsed, sw, sh, &mut hit, &mut lum, &mut z);
+                    let time_hue = elapsed * 40.0;
 
-            let abs_x = dx.abs();
-            let abs_y = dy.abs();
+                    for &centered in &[false, true] {
+                        let mut buf_ref = Buffer::empty(buf_area);
+                        let mut buf_new = Buffer::empty(buf_area);
+                        render_idle_via_paragraph(
+                            &mut buf_ref,
+                            area,
+                            &hit,
+                            &lum,
+                            sw,
+                            time_hue,
+                            centered,
+                        );
+                        blit_idle(&mut buf_new, area, &hit, &lum, sw, time_hue);
 
-            let disk_falloff_x = (1.0 - abs_x / disk_half_len).clamp(0.0, 1.0);
-            let disk_core = (1.0 - abs_y / disk_half_thickness).clamp(0.0, 1.0);
-            let disk_glow =
-                (1.0 - abs_y / (disk_half_thickness * 3.8 + 1.0)).clamp(0.0, 1.0) * 0.42;
-            let lens_band = (1.0 - ((abs_y - horizon_r * 0.72).abs() / (horizon_r * 0.55 + 0.1)))
-                .clamp(0.0, 1.0)
-                * (1.0 - abs_x / (halo_r * 1.5 + 1.0)).clamp(0.0, 1.0);
-            let halo =
-                (1.0 - ((r - halo_r).abs() / (horizon_r * 0.95 + 0.1))).clamp(0.0, 1.0) * 0.38;
-
-            let streak_phase = shimmer + dx * 0.33;
-            let streaks = ((streak_phase.sin() * 0.5 + 0.5) * 0.55
-                + ((streak_phase * 0.47 + 1.7).sin() * 0.5 + 0.5) * 0.45)
-                * disk_falloff_x;
-            let relativistic_beam = (1.0
-                - ((dx - disk_half_len * 0.34).abs() / (disk_half_len * 0.52 + 0.1)))
-                .clamp(0.0, 1.0)
-                * 0.32;
-
-            let mut brightness = disk_core * (0.55 + 0.45 * streaks) * disk_falloff_x
-                + disk_glow * disk_falloff_x
-                + lens_band * 0.62
-                + halo * 0.28
-                + relativistic_beam * disk_core;
-
-            if r <= horizon_r {
-                brightness = 0.0;
-            }
-
-            if abs_x <= horizon_r * 0.95 && abs_y <= disk_half_thickness * 1.2 {
-                brightness *= (abs_x / (horizon_r * 0.95 + 0.1)).clamp(0.0, 1.0);
-            }
-
-            brightness = brightness.clamp(0.0, 1.0);
-            if brightness > 0.06 {
-                hit[idx] = true;
-                lum_map[idx] = brightness * 2.0 - 1.0;
-                z_buf[idx] = brightness + lens_band * 0.2;
-            } else {
-                hit[idx] = false;
-                lum_map[idx] = -1.0;
-                z_buf[idx] = 0.0;
-            }
-        }
-    }
-}
-
-fn sample_gyroscope(
-    elapsed: f32,
-    sw: usize,
-    sh: usize,
-    hit: &mut [bool],
-    lum_map: &mut [f32],
-    z_buf: &mut [f32],
-) {
-    let rot_x = elapsed * 0.45 + (elapsed * 0.7).sin() * 0.25;
-    let rot_y = elapsed * 0.70;
-    let rot_z = elapsed * 0.28 + (elapsed * 0.5).cos() * 0.18;
-    let cam_dist = 8.5f32;
-    let aspect = 0.5;
-    let scale_base = (sw as f32).min(sh as f32 / aspect) * 0.20;
-
-    let rings = [(0u8, 2.0f32, 0.17f32), (1, 1.45, 0.15), (2, 0.95, 0.13)];
-
-    for (ring_idx, &(axis, major_r, tube_r)) in rings.iter().enumerate() {
-        let phase = elapsed * (0.35 + ring_idx as f32 * 0.15);
-        let mut u: f32 = 0.0;
-        while u < std::f32::consts::TAU {
-            let uu = u + phase;
-            let cu = uu.cos();
-            let su = uu.sin();
-
-            let mut v: f32 = 0.0;
-            while v < std::f32::consts::TAU {
-                let cv = v.cos();
-                let sv = v.sin();
-                let ring_r = major_r + tube_r * cv;
-
-                let (x, y, z, nx, ny, nz) = match axis {
-                    0 => {
-                        let x = tube_r * sv;
-                        let y = ring_r * cu;
-                        let z = ring_r * su;
-                        let nx = sv;
-                        let ny = cv * cu;
-                        let nz = cv * su;
-                        (x, y, z, nx, ny, nz)
-                    }
-                    1 => {
-                        let x = ring_r * cu;
-                        let y = tube_r * sv;
-                        let z = ring_r * su;
-                        let nx = cv * cu;
-                        let ny = sv;
-                        let nz = cv * su;
-                        (x, y, z, nx, ny, nz)
-                    }
-                    _ => {
-                        let x = ring_r * cu;
-                        let y = ring_r * su;
-                        let z = tube_r * sv;
-                        let nx = cv * cu;
-                        let ny = cv * su;
-                        let nz = sv;
-                        (x, y, z, nx, ny, nz)
-                    }
-                };
-
-                let (rx, ry, rz) = rotate_xyz(x, y, z, rot_x, rot_y, rot_z);
-                let d = cam_dist + rz;
-                if d < 0.1 {
-                    v += 0.24;
-                    continue;
-                }
-
-                let proj = cam_dist / d;
-                let xp = (sw as f32 / 2.0 + rx * proj * scale_base) as isize;
-                let yp = (sh as f32 / 2.0 - ry * proj * scale_base * aspect) as isize;
-                let depth = 1.0 / d;
-
-                if xp >= 0 && (xp as usize) < sw && yp >= 0 && (yp as usize) < sh {
-                    let idx = yp as usize * sw + xp as usize;
-                    if depth > z_buf[idx] {
-                        z_buf[idx] = depth;
-                        let (rnx, rny, rnz) = rotate_xyz(nx, ny, nz, rot_x, rot_y, rot_z);
-                        let lum = (rnx * 0.45 + rny * 0.35 + rnz * 0.20 + 0.20).clamp(-1.0, 1.0);
-                        lum_map[idx] = lum;
-                        hit[idx] = true;
+                        assert_eq!(
+                            buf_ref, buf_new,
+                            "{name}: buffer mismatch at {cw}x{chh} t={elapsed} centered={centered}"
+                        );
                     }
                 }
-
-                v += 0.24;
             }
-
-            u += 0.035;
         }
     }
-}
-
-fn sample_orbit_rings(
-    elapsed: f32,
-    sw: usize,
-    sh: usize,
-    hit: &mut [bool],
-    lum_map: &mut [f32],
-    z_buf: &mut [f32],
-) {
-    let rot_x = elapsed * 0.32 + (elapsed * 0.45).sin() * 0.30;
-    let rot_y = elapsed * 0.56;
-    let rot_z = elapsed * 0.22 + (elapsed * 0.38).cos() * 0.22;
-    let cam_dist = 8.8f32;
-    let aspect = 0.5;
-    let scale_base = (sw as f32).min(sh as f32 / aspect) * 0.29;
-
-    let rings = [
-        (0u8, 2.35f32, 0.10f32, 0.32f32, 0.0f32),
-        (1u8, 1.78f32, 0.11f32, 0.26f32, std::f32::consts::TAU / 3.0),
-        (
-            2u8,
-            1.22f32,
-            0.09f32,
-            0.20f32,
-            2.0 * std::f32::consts::TAU / 3.0,
-        ),
-        (1u8, 2.70f32, 0.08f32, 0.36f32, std::f32::consts::TAU / 6.0),
-    ];
-
-    for (ring_idx, &(axis, major_r, tube_r, orbit_r, phase_offset)) in rings.iter().enumerate() {
-        let phase = elapsed * (0.30 + ring_idx as f32 * 0.10) + phase_offset;
-        let center_x = orbit_r * phase.cos() * 0.55;
-        let center_y = orbit_r * (phase * 0.7).sin() * 0.30;
-        let center_z = orbit_r * phase.sin() * 0.50;
-        let radius_pulse = 1.0 + 0.08 * (elapsed * 1.1 + phase_offset).sin();
-
-        let mut u: f32 = 0.0;
-        while u < std::f32::consts::TAU {
-            let uu = u + phase * 0.7;
-            let cu = uu.cos();
-            let su = uu.sin();
-
-            let mut v: f32 = 0.0;
-            while v < std::f32::consts::TAU {
-                let cv = v.cos();
-                let sv = v.sin();
-                let ring_r = major_r * radius_pulse + tube_r * cv;
-
-                let (x, y, z, nx, ny, nz) = match axis {
-                    0 => {
-                        let x = center_x + tube_r * sv;
-                        let y = center_y + ring_r * cu;
-                        let z = center_z + ring_r * su;
-                        let nx = sv;
-                        let ny = cv * cu;
-                        let nz = cv * su;
-                        (x, y, z, nx, ny, nz)
-                    }
-                    1 => {
-                        let x = center_x + ring_r * cu;
-                        let y = center_y + tube_r * sv;
-                        let z = center_z + ring_r * su;
-                        let nx = cv * cu;
-                        let ny = sv;
-                        let nz = cv * su;
-                        (x, y, z, nx, ny, nz)
-                    }
-                    _ => {
-                        let x = center_x + ring_r * cu;
-                        let y = center_y + ring_r * su;
-                        let z = center_z + tube_r * sv;
-                        let nx = cv * cu;
-                        let ny = cv * su;
-                        let nz = sv;
-                        (x, y, z, nx, ny, nz)
-                    }
-                };
-
-                let (rx, ry, rz) = rotate_xyz(x, y, z, rot_x, rot_y, rot_z);
-                let d = cam_dist + rz;
-                if d < 0.1 {
-                    v += 0.22;
-                    continue;
-                }
-
-                let proj = cam_dist / d;
-                let xp = (sw as f32 / 2.0 + rx * proj * scale_base) as isize;
-                let yp = (sh as f32 / 2.0 - ry * proj * scale_base * aspect) as isize;
-                let depth = 1.0 / d;
-
-                if xp >= 0 && (xp as usize) < sw && yp >= 0 && (yp as usize) < sh {
-                    let idx = yp as usize * sw + xp as usize;
-                    if depth > z_buf[idx] {
-                        z_buf[idx] = depth;
-                        let (rnx, rny, rnz) = rotate_xyz(nx, ny, nz, rot_x, rot_y, rot_z);
-                        let glow = (phase.cos() * 0.10 + ring_idx as f32 * 0.03).clamp(-0.2, 0.2);
-                        let lum =
-                            (rnx * 0.42 + rny * 0.33 + rnz * 0.25 + 0.18 + glow).clamp(-1.0, 1.0);
-                        lum_map[idx] = lum;
-                        hit[idx] = true;
-                    }
-                }
-
-                v += 0.22;
-            }
-
-            u += 0.032;
-        }
-    }
-}
-
-fn shape_char_3x3(pattern: u16, brightness: f32) -> char {
-    if pattern == 0 {
-        return ' ';
-    }
-
-    let top_l = pattern & 1 != 0;
-    let top_c = pattern & 2 != 0;
-    let top_r = pattern & 4 != 0;
-    let mid_l = pattern & 8 != 0;
-    let mid_c = pattern & 16 != 0;
-    let mid_r = pattern & 32 != 0;
-    let bot_l = pattern & 64 != 0;
-    let bot_c = pattern & 128 != 0;
-    let bot_r = pattern & 256 != 0;
-
-    let count = pattern.count_ones();
-    let top = (top_l as u8) + (top_c as u8) + (top_r as u8);
-    let mid = (mid_l as u8) + (mid_c as u8) + (mid_r as u8);
-    let bot = (bot_l as u8) + (bot_c as u8) + (bot_r as u8);
-    let left = (top_l as u8) + (mid_l as u8) + (bot_l as u8);
-    let center = (top_c as u8) + (mid_c as u8) + (bot_c as u8);
-    let right = (top_r as u8) + (mid_r as u8) + (bot_r as u8);
-
-    let bl = if brightness > 0.65 {
-        2u8
-    } else if brightness > 0.35 {
-        1u8
-    } else {
-        0u8
-    };
-
-    if count >= 8 {
-        return match bl {
-            2 => '@',
-            1 => '#',
-            _ => '%',
-        };
-    }
-    if count >= 7 {
-        return match bl {
-            2 => '#',
-            1 => '%',
-            _ => '*',
-        };
-    }
-
-    if top_l && mid_c && bot_r && !top_r && !bot_l {
-        return match bl {
-            2 => '\\',
-            1 => '\\',
-            _ => '.',
-        };
-    }
-    if top_r && mid_c && bot_l && !top_l && !bot_r {
-        return match bl {
-            2 => '/',
-            1 => '/',
-            _ => '.',
-        };
-    }
-
-    if mid >= 2 && top <= 1 && bot <= 1 && mid > top && mid > bot {
-        return match bl {
-            2 => '=',
-            1 => '-',
-            _ => '~',
-        };
-    }
-    if top >= 2 && mid <= 1 && bot == 0 {
-        return match bl {
-            2 => '=',
-            1 => '-',
-            _ => '~',
-        };
-    }
-    if bot >= 2 && mid <= 1 && top == 0 {
-        return match bl {
-            2 => '=',
-            1 => '_',
-            _ => '.',
-        };
-    }
-
-    if center >= 2 && left <= 1 && right <= 1 && center > left && center > right {
-        return match bl {
-            2 => '|',
-            1 => '|',
-            _ => ':',
-        };
-    }
-    if left >= 2 && center <= 1 && right == 0 {
-        return match bl {
-            2 => '|',
-            1 => '|',
-            _ => ':',
-        };
-    }
-    if right >= 2 && center <= 1 && left == 0 {
-        return match bl {
-            2 => '|',
-            1 => '|',
-            _ => ':',
-        };
-    }
-
-    if top >= 2 && bot == 0 {
-        return match bl {
-            2 => '"',
-            1 => '^',
-            _ => '\'',
-        };
-    }
-    if bot >= 2 && top == 0 {
-        return match bl {
-            2 => ',',
-            1 => '.',
-            _ => '.',
-        };
-    }
-
-    if left >= 2 && right == 0 {
-        return match bl {
-            2 => '(',
-            1 => '(',
-            _ => ':',
-        };
-    }
-    if right >= 2 && left == 0 {
-        return match bl {
-            2 => ')',
-            1 => ')',
-            _ => ':',
-        };
-    }
-
-    if count >= 6 {
-        return match bl {
-            2 => '%',
-            1 => '*',
-            _ => '+',
-        };
-    }
-    if count >= 5 {
-        return match bl {
-            2 => '*',
-            1 => '+',
-            _ => ':',
-        };
-    }
-
-    if mid_c && count <= 3 {
-        return match bl {
-            2 => 'o',
-            1 => '*',
-            _ => '.',
-        };
-    }
-
-    if top_r && bot_l && count <= 3 {
-        return match bl {
-            2 => '/',
-            1 => '/',
-            _ => '.',
-        };
-    }
-    if top_l && bot_r && count <= 3 {
-        return match bl {
-            2 => '\\',
-            1 => '\\',
-            _ => '.',
-        };
-    }
-
-    if count == 1 {
-        if bot_c || bot_l || bot_r {
-            return match bl {
-                2 => '.',
-                _ => '.',
-            };
-        }
-        if top_c || top_l || top_r {
-            return match bl {
-                2 => '\'',
-                1 => '\'',
-                _ => '.',
-            };
-        }
-        return match bl {
-            2 => ':',
-            1 => '.',
-            _ => '.',
-        };
-    }
-
-    if count <= 3 {
-        return match bl {
-            2 => ':',
-            1 => ':',
-            _ => '.',
-        };
-    }
-
-    match bl {
-        2 => '+',
-        1 => ':',
-        _ => '.',
-    }
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
-    let c = v * s;
-    let h2 = h / 60.0;
-    let x = c * (1.0 - (h2 % 2.0 - 1.0).abs());
-    let (r1, g1, b1) = match h2 as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = v - c;
-    (
-        ((r1 + m) * 255.0) as u8,
-        ((g1 + m) * 255.0) as u8,
-        ((b1 + m) * 255.0) as u8,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    type IdleSampler = fn(f32, usize, usize, &mut [bool], &mut [f32], &mut [f32]);
 
     fn hit_bounds(hit: &[bool], sw: usize, sh: usize) -> Option<(usize, usize, usize, usize)> {
         let mut min_x = sw;
@@ -886,6 +648,32 @@ mod tests {
     fn idle_variants_exclude_retired_variants() {
         assert!(!IDLE_VARIANTS.contains(&"knot"));
         assert!(!IDLE_VARIANTS.contains(&"black_hole"));
+    }
+
+    /// The published animation rectangle is packed into a single atomic word so
+    /// the render path can publish it without a lock. `None` uses an all-ones
+    /// sentinel, which no real `Rect` can produce because a full-`u16` Rect is
+    /// not a valid terminal area. Verify the encoding is lossless.
+    #[test]
+    fn animation_area_packing_round_trips() {
+        for area in [
+            Rect::new(0, 0, 0, 0),
+            Rect::new(0, 0, 4, 2),
+            Rect::new(7, 26, 94, 14),
+            Rect::new(u16::MAX - 1, u16::MAX - 1, 1, 1),
+            Rect::new(1, 1, u16::MAX, u16::MAX),
+        ] {
+            let packed = pack_area(Some(area));
+            assert_ne!(packed, u64::MAX, "{area:?} collided with the None sentinel");
+            assert_eq!(
+                unpack_area(packed),
+                Some(area),
+                "lossy packing for {area:?}"
+            );
+        }
+
+        assert_eq!(pack_area(None), u64::MAX);
+        assert_eq!(unpack_area(pack_area(None)), None);
     }
 
     #[test]

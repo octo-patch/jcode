@@ -115,6 +115,27 @@ impl App {
             })
             .to_string();
         }
+        if cmd == "stream-jitter" {
+            // Arrival-vs-reveal smoothness report for the paced stream buffer.
+            // `reveals.bucket_100ms_cv` well below `arrivals.bucket_100ms_cv`
+            // means pacing is smoothing provider bursts (text and reasoning).
+            return serde_json::to_string_pretty(&self.stream_buffer.jitter_profile())
+                .unwrap_or_else(|_| "{}".to_string());
+        }
+        if cmd == "stream-jitter:reset" {
+            self.stream_buffer.reset_jitter();
+            return "OK: stream jitter stats reset".to_string();
+        }
+        if cmd == "smoothness" {
+            // Anchor-stability report: jarring transcript motion (repositions,
+            // insertions above, big pops, blinks, mass reflows) per rendered
+            // frame, with expected motion (scroll/resize/tail-follow) excluded.
+            return crate::tui::ui::smoothness_report_json();
+        }
+        if cmd == "smoothness:reset" {
+            crate::tui::ui::smoothness_reset();
+            return "OK: smoothness stats reset".to_string();
+        }
         if cmd == "overlay" || cmd == "overlay:status" {
             let overlay = crate::tui::visual_debug::overlay_enabled();
             return serde_json::json!({
@@ -152,7 +173,7 @@ impl App {
                 }
                 SendAction::Interleave => {
                     let prepared = input::take_prepared_input(self);
-                    input::stage_local_interleave(self, prepared.expanded);
+                    input::stage_local_interleave(self, prepared.expanded, prepared.images);
                     self.debug_trace
                         .record("message", format!("interleave:{}", msg));
                     format!("OK: interleave message '{}' (injecting now)", msg)
@@ -185,9 +206,86 @@ impl App {
                 "diagram_pane_position": format!("{:?}", self.diagram_pane_position),
                 "diagram_zoom": self.diagram_zoom,
                 "diagram_count": crate::tui::mermaid::get_active_diagrams().len(),
-                "version": jcode_build_meta::VERSION,
+                "version": jcode_build_meta::version(),
             })
             .to_string()
+        } else if cmd.starts_with("mouse:") {
+            // Inject a raw mouse event: mouse:<kind>:<col>,<row>
+            // kind: down|up|drag|click (click = down then up at same cell)
+            let raw = cmd.strip_prefix("mouse:").unwrap_or("");
+            let (kind, coords) = match raw.split_once(':') {
+                Some(pair) => pair,
+                None => return "mouse error: expected mouse:<kind>:<col>,<row>".to_string(),
+            };
+            let (col, row) = match coords.split_once(',').and_then(|(c, r)| {
+                Some((c.trim().parse::<u16>().ok()?, r.trim().parse::<u16>().ok()?))
+            }) {
+                Some(pair) => pair,
+                None => return "mouse error: bad coords (expected <col>,<row>)".to_string(),
+            };
+            use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+            let mut inject = |kind: MouseEventKind| {
+                self.handle_mouse_event(MouseEvent {
+                    kind,
+                    column: col,
+                    row,
+                    modifiers: crossterm::event::KeyModifiers::empty(),
+                })
+            };
+            match kind {
+                "down" => {
+                    inject(MouseEventKind::Down(MouseButton::Left));
+                }
+                "up" => {
+                    inject(MouseEventKind::Up(MouseButton::Left));
+                }
+                "drag" => {
+                    inject(MouseEventKind::Drag(MouseButton::Left));
+                }
+                "click" => {
+                    inject(MouseEventKind::Down(MouseButton::Left));
+                    inject(MouseEventKind::Up(MouseButton::Left));
+                }
+                // A real kitty click with sub-cell hand jitter: kitty reports
+                // motion at pixel granularity, so Down, Drag (same cell), Up.
+                "jitter-click" => {
+                    inject(MouseEventKind::Down(MouseButton::Left));
+                    inject(MouseEventKind::Drag(MouseButton::Left));
+                    inject(MouseEventKind::Up(MouseButton::Left));
+                }
+                other => return format!("mouse error: unknown kind '{other}'"),
+            }
+            self.debug_trace
+                .record("mouse", format!("{kind} at {col},{row}"));
+            format!(
+                "OK: mouse {kind} at {col},{row} (status: {:?})",
+                self.status_notice.as_ref().map(|(text, _)| text.as_str())
+            )
+        } else if cmd.starts_with("image-click-target:") {
+            // Probe the inline-image expand badge hit-test at screen coords.
+            let raw = cmd.strip_prefix("image-click-target:").unwrap_or("");
+            let (col, row) = match raw.split_once(',').and_then(|(c, r)| {
+                Some((c.trim().parse::<u16>().ok()?, r.trim().parse::<u16>().ok()?))
+            }) {
+                Some(pair) => pair,
+                None => return "image-click-target error: expected <col>,<row>".to_string(),
+            };
+            let image_id = crate::tui::ui::inline_image_expand_target_from_screen(col, row);
+            let body_id =
+                crate::tui::ui::inline_image_body_target_from_screen(col, row, self.centered);
+            let link = crate::tui::ui::link_target_from_screen(col, row);
+            serde_json::json!({
+                "col": col,
+                "row": row,
+                "image_expand_target": image_id,
+                "image_body_target": body_id,
+                "link_target": link,
+            })
+            .to_string()
+        } else if cmd == "image-regions" {
+            // Dump the current chat snapshot's inline-image regions and label
+            // lines so a driver can compute real badge click coordinates.
+            crate::tui::ui::debug_chat_image_regions_json()
         } else if cmd == "expand-badge-fixture" {
             let old_string = (0..24)
                 .map(|idx| format!("old fixture line {idx}\n"))
@@ -208,6 +306,7 @@ impl App {
                             "new_string": new_string,
                         }),
                         intent: None,
+                        thought_signature: None,
                     },
                 ),
             ];
@@ -235,6 +334,39 @@ impl App {
                 "display_messages": self.display_messages.len(),
             })
             .to_string()
+        } else if cmd == "gmail-draft-fixture" {
+            self.display_messages = vec![
+                DisplayMessage::user("Draft a launch update for the team"),
+                DisplayMessage::tool(
+                    "Draft created successfully.\nDraft ID: draft_visual_123\nTo: team@example.com\nSubject: Launch update\nAttachments: 1"
+                        .to_string(),
+                    crate::message::ToolCall {
+                        id: "debug_gmail_draft_1".to_string(),
+                        name: "gmail".to_string(),
+                        input: serde_json::json!({
+                            "action": "draft",
+                            "to": "team@example.com",
+                            "subject": "Launch update",
+                            "body": "Hi team,\n\nThe launch is ready for final review. Please add any blocking feedback by 3 PM.\n\nChecklist:\n1. Confirm production configuration\n2. Verify the rollout dashboard\n3. Review support coverage\n4. Approve the customer announcement\n5. Confirm the rollback owner\n6. Run the final smoke test\n7. Record launch approval\n8. Notify regional teams\n9. Publish the status update\n10. Monitor the initial rollout\n11. Review early telemetry\n12. Confirm support handoff\n13. Check the incident channel\n14. Validate the public changelog\n15. Archive the launch checklist\n16. Schedule the retrospective\n17. Share the launch summary\n18. Thank the release team\n19. Capture follow-up tasks\n20. Confirm launch completion\n\nFULL DRAFT END\n\nThanks,\nJeremy",
+                            "attachments": ["/tmp/launch-checklist.pdf"],
+                            "intent": "Prepare launch update",
+                        }),
+                        intent: Some("Prepare launch update".to_string()),
+                        thought_signature: None,
+                    },
+                ),
+            ];
+            self.bump_display_messages_version();
+            self.scroll_offset = 0;
+            self.auto_scroll_paused = false;
+            self.input.clear();
+            self.cursor_pos = 0;
+            self.set_status_notice("Debug Gmail draft fixture ready");
+            serde_json::json!({
+                "ok": true,
+                "display_messages": self.display_messages.len(),
+            })
+            .to_string()
         } else if cmd == "picker" || cmd == "picker:state" {
             self.debug_picker_state_json(None)
         } else if cmd == "model-picker" || cmd == "model-picker:live" {
@@ -252,6 +384,107 @@ impl App {
             let raw = raw.trim();
             let limit = raw.parse::<usize>().ok();
             self.debug_picker_state_json(limit)
+        } else if let Some(raw) = cmd.strip_prefix("swarm-gallery:") {
+            // Debug-only: inject synthetic inline swarm members and force the
+            // inline gallery active so the band can be captured in a frame.
+            // Format: swarm-gallery:<N>  (N synthetic agents), or
+            //         swarm-gallery:off  (clear injected members + force flag).
+            let raw = raw.trim();
+            if raw == "off" {
+                self.debug_force_inline_gallery = false;
+                self.remote_swarm_members.clear();
+                "OK: inline swarm gallery cleared".to_string()
+            } else {
+                let n: usize = raw.parse().unwrap_or(3);
+                let statuses = ["running", "thinking", "ready", "completed", "blocked"];
+                let names = [
+                    "fox", "owl", "bee", "elk", "ant", "cat", "dog", "jay", "ram", "yak", "ox",
+                    "emu",
+                ];
+                let samples = [
+                    "Editing crates/jcode-tui/src/tui/ui.rs\n  carving the gallery band off chat_area",
+                    "Thinking about how to wire the bus tap\n  into the streaming loop without",
+                    "Running cargo build --profile selfdev\n  Compiling jcode-app-core",
+                    "Done: 4 tests passed, committed.",
+                    "Waiting on coordinator approval for plan",
+                ];
+                self.remote_swarm_members = (0..n)
+                    .map(|i| crate::protocol::SwarmMemberStatus {
+                        session_id: format!("session_{:02}", i),
+                        friendly_name: Some(names[i % names.len()].to_string()),
+                        status: statuses[i % statuses.len()].to_string(),
+                        detail: Some(format!("task {}", i + 1)),
+                        task_label: None,
+                        role: if i == 0 {
+                            Some("coordinator".to_string())
+                        } else {
+                            Some("agent".to_string())
+                        },
+                        is_headless: Some(i != 0),
+                        live_attachments: Some(1),
+                        status_age_secs: Some((i as u64) * 7),
+                        output_tail: Some(samples[i % samples.len()].to_string()),
+                        report_back_to_session_id: None,
+                        todo_progress: Some(((i as u32 * 3) % 9, 9)),
+                        todo_items: (0..5)
+                            .map(|t| {
+                                let status = if (t as u32) < (i as u32 * 3) % 9 {
+                                    "completed".to_string()
+                                } else if t as u32 == (i as u32 * 3) % 9 {
+                                    "in_progress".to_string()
+                                } else {
+                                    "pending".to_string()
+                                };
+                                let tool_intents = if status == "in_progress" {
+                                    vec![
+                                        crate::protocol::SwarmToolIntent {
+                                            tool_call_id: String::new(),
+                                            tool_name: "agentgrep".into(),
+                                            intent: "Locate the affected rendering path".into(),
+                                            status: "completed".into(),
+                                            progress: None,
+                                        },
+                                        crate::protocol::SwarmToolIntent {
+                                            tool_call_id: String::new(),
+                                            tool_name: "read".into(),
+                                            intent: "Inspect the active todo state".into(),
+                                            status: "completed".into(),
+                                            progress: None,
+                                        },
+                                        crate::protocol::SwarmToolIntent {
+                                            tool_call_id: String::new(),
+                                            tool_name: "bash".into(),
+                                            intent: "Run targeted swarm card tests".into(),
+                                            status: "running".into(),
+                                            progress: Some(crate::protocol::SwarmToolProgress {
+                                                current: 27,
+                                                total: 43,
+                                                unit: Some("tests".into()),
+                                            }),
+                                        },
+                                    ]
+                                } else {
+                                    Vec::new()
+                                };
+                                crate::protocol::SwarmTodoItem {
+                                    content: format!("step {} of synthetic plan", t + 1),
+                                    status,
+                                    tool_intents,
+                                }
+                            })
+                            .collect(),
+                        runtime: crate::protocol::SwarmMemberRuntime {
+                            model: Some("gpt-5.6".into()),
+                            provider: Some("OpenAI".into()),
+                            auth_method: Some("OAuth".into()),
+                            effort: Some("high".into()),
+                            elapsed_secs: Some(18),
+                        },
+                    })
+                    .collect();
+                self.debug_force_inline_gallery = true;
+                format!("OK: injected {n} inline swarm members; gallery forced active")
+            }
         } else if cmd == "swarm" || cmd == "swarm-status" {
             if self.is_remote {
                 serde_json::json!({
@@ -276,10 +509,16 @@ impl App {
                             ProcessingStatus::RunningTool(_) => "running".to_string(),
                         },
                         detail: self.subagent_status.clone(),
+                        task_label: None,
                         role: None,
                         is_headless: Some(false),
                         live_attachments: Some(1),
                         status_age_secs: Some(0),
+                        output_tail: None,
+                        report_back_to_session_id: None,
+                        todo_progress: None,
+                        todo_items: Vec::new(),
+                        runtime: crate::protocol::SwarmMemberRuntime::default(),
                     }],
                 })
                 .to_string()
@@ -377,15 +616,33 @@ impl App {
         } else if cmd == "render-stats" {
             use crate::tui::visual_debug;
             visual_debug::enable();
+            let draw_calls = crate::tui::ui::debug_draw_call_history(16);
             match visual_debug::latest_frame() {
                 Some(frame) => serde_json::to_string_pretty(&serde_json::json!({
                     "frame_id": frame.frame_id,
                     "render_timing": frame.render_timing,
                     "render_order": frame.render_order,
+                    "draw_calls": draw_calls,
                 }))
                 .unwrap_or_else(|_| "{}".to_string()),
-                None => "render-stats: no frames captured".to_string(),
+                None => serde_json::to_string_pretty(&serde_json::json!({
+                    "frame_id": serde_json::Value::Null,
+                    "render_timing": serde_json::Value::Null,
+                    "render_order": serde_json::Value::Null,
+                    "draw_calls": draw_calls,
+                }))
+                .unwrap_or_else(|_| "render-stats: no frames captured".to_string()),
             }
+        } else if cmd == "draw-stats" {
+            let mut payload = crate::tui::ui::debug_draw_call_history(32);
+            attach_redraw_schedule_debug(&mut payload, self);
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+        } else if cmd.starts_with("draw-stats ") {
+            let raw_limit = cmd.strip_prefix("draw-stats ").unwrap_or("32").trim();
+            let limit = raw_limit.parse::<usize>().unwrap_or(32);
+            let mut payload = crate::tui::ui::debug_draw_call_history(limit);
+            attach_redraw_schedule_debug(&mut payload, self);
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
         } else if cmd == "render-order" {
             use crate::tui::visual_debug;
             visual_debug::enable();
@@ -422,6 +679,23 @@ impl App {
         } else if cmd == "memory-history" {
             let payload = crate::process_memory::history(128);
             serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_string())
+        } else if cmd == "allocator" {
+            serde_json::to_string_pretty(&crate::process_memory::allocator_info())
+                .unwrap_or_else(|_| "{}".to_string())
+        } else if cmd == "allocator:purge" {
+            let before = crate::process_memory::snapshot();
+            crate::process_memory::release_retained_heap("client_debug_allocator_purge");
+            let after = crate::process_memory::snapshot();
+            let rss_recovered_bytes = before
+                .rss_bytes
+                .unwrap_or(0)
+                .saturating_sub(after.rss_bytes.unwrap_or(0));
+            serde_json::to_string_pretty(&serde_json::json!({
+                "before": before,
+                "after": after,
+                "rss_recovered_bytes": rss_recovered_bytes,
+            }))
+            .unwrap_or_else(|_| "{}".to_string())
         } else if cmd == "slow-frames" {
             let payload = crate::tui::ui::debug_slow_frame_history(32);
             serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
@@ -443,6 +717,20 @@ impl App {
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
         } else if cmd == "mermaid:flicker-bench" {
             let result = crate::tui::mermaid::debug_flicker_benchmark(24);
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        } else if cmd == "image-scroll-bench" || cmd.starts_with("image-scroll-bench ") {
+            // Headless inline-image scroll benchmark. Usage:
+            //   image-scroll-bench [images] [frames] [visible_per_frame]
+            // Defaults model a screenshot-heavy transcript scrolled slowly.
+            let raw = cmd.strip_prefix("image-scroll-bench").unwrap_or("").trim();
+            let mut parts = raw.split_whitespace();
+            let images = parts.next().and_then(|v| v.parse().ok()).unwrap_or(60usize);
+            let frames = parts
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600usize);
+            let visible = parts.next().and_then(|v| v.parse().ok()).unwrap_or(3usize);
+            let result = crate::tui::mermaid::debug_image_scroll_benchmark(images, frames, visible);
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
         } else if cmd.starts_with("mermaid:flicker-bench ") {
             let raw_steps = cmd
@@ -532,6 +820,9 @@ impl App {
         } else if cmd == "scroll-suite" || cmd.starts_with("scroll-suite:") {
             let raw = cmd.strip_prefix("scroll-suite:");
             self.run_scroll_suite(raw)
+        } else if cmd == "widget-stability" || cmd.starts_with("widget-stability:") {
+            let raw = cmd.strip_prefix("widget-stability:");
+            self.run_widget_stability(raw)
         } else if cmd == "side-panel-latency" || cmd.starts_with("side-panel-latency:") {
             let raw = cmd.strip_prefix("side-panel-latency:");
             self.run_side_panel_latency_bench(raw)
@@ -670,7 +961,7 @@ impl App {
                 Err(e) => format!("script error: {}", e),
             }
         } else if cmd == "version" {
-            format!("version: {}", jcode_build_meta::VERSION)
+            format!("version: {}", jcode_build_meta::version())
         } else if cmd == "help" {
             "Debug commands:\n\
                  - message:<text> - inject and submit a message\n\
@@ -694,7 +985,8 @@ impl App {
                  - layout - dump latest layout JSON\n\
                  - margins - dump layout margins JSON\n\
                  - widgets - dump info widget summary/placements\n\
-                 - render-stats - dump render timing + order JSON\n\
+                 - render-stats - dump render timing + order + draw-call attribution JSON\n\
+                 - draw-stats [n] - dump per-draw attribution history (render_ms, changed cells)\n\
                  - render-order - dump render order list\n\
                  - anomalies - dump visual debug anomalies\n\
                  - theme - dump current palette snapshot\n\
@@ -717,8 +1009,12 @@ impl App {
                  - scroll:<up|down|top|bottom> - control scroll\n\
                  - scroll-test[:<json>] - run offscreen scroll+diagram test\n\
                  - scroll-suite[:<json>] - run scroll+diagram test suite\n\
+                 - widget-stability[:<json>] - quantify info-widget movement while scrolling current transcript\n\
                  - side-panel-latency[:<json>] - benchmark headless side-panel input->frame latency\n\
                  - keys:<keyspec> - inject key events (e.g. keys:ctrl+r)\n\
+                 - mouse:<kind>:<col>,<row> - inject mouse events (down|up|drag|click|jitter-click)\n\
+                 - image-click-target:<col>,<row> - probe inline-image badge / link hit-test\n\
+                 - image-regions - dump chat snapshot image regions + badge screen coords\n\
                  - input - get current input buffer\n\
                  - set_input:<text> - set input buffer\n\
                  - submit - submit current input\n\
@@ -824,4 +1120,32 @@ impl App {
         }
         false
     }
+}
+
+/// Attach the live redraw-schedule decision to a `draw-stats` payload.
+///
+/// Frame cost alone cannot explain a choppy animation: a screen can render each
+/// frame in 4ms and still look laggy because the scheduler only asks for a few
+/// frames per second. Reporting the resolved interval and the policy FPS next
+/// to the measured draw rate makes that distinction obvious.
+fn attach_redraw_schedule_debug(payload: &mut serde_json::Value, app: &App) {
+    let Some(map) = payload.as_object_mut() else {
+        return;
+    };
+    let policy = crate::perf::tui_policy();
+    map.insert(
+        "redraw_schedule".to_string(),
+        serde_json::json!({
+            "interval_ms": crate::tui::redraw_interval(app).as_millis() as u64,
+            "animation_fps": policy.animation_fps,
+            "redraw_fps": policy.redraw_fps,
+            "tier": format!("{:?}", policy.tier),
+            "decorative_animations": policy.enable_decorative_animations,
+            "idle_animation_active": crate::tui::idle_donut_active(app),
+            "idle_animation_area": crate::tui::ui::last_idle_animation_area()
+                .map(|a| serde_json::json!([a.x, a.y, a.width, a.height])),
+            "client_focused": crate::tui::TuiState::client_focused(app),
+            "periodic_redraw_required": crate::tui::periodic_redraw_required(app),
+        }),
+    );
 }

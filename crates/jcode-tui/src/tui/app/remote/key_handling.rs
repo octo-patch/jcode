@@ -5,19 +5,19 @@ use crate::tui::core;
 
 pub(in crate::tui::app) fn handle_remote_char_input(app: &mut App, c: char) {
     input::handle_text_input(app, &c.to_string());
-    app.follow_chat_bottom_for_typing();
 }
 
 pub(in crate::tui::app) async fn send_interleave_now(
     app: &mut App,
     content: String,
+    images: Vec<(String, String)>,
     remote: &mut RemoteConnection,
 ) {
     if content.trim().is_empty() {
         return;
     }
     let msg_clone = content.clone();
-    match remote.soft_interrupt(content, false).await {
+    match remote.soft_interrupt(content, images, false).await {
         Err(e) => {
             app.push_display_message(DisplayMessage::error(format!(
                 "Failed to send interleave: {}",
@@ -63,15 +63,19 @@ async fn apply_remote_effort_direction(
     remote: &mut RemoteConnection,
     direction: i8,
 ) -> Result<()> {
-    let efforts = app_mod::inferred_reasoning_efforts(
-        app.remote_provider_name.as_deref(),
-        app.remote_provider_model.as_deref(),
-    );
+    // Use the best-known provider/model identity (server-reported when
+    // available, header hints during the pre-History bootstrap window) so
+    // effort cycling works immediately after spawn instead of claiming the
+    // provider does not support it until the History payload settles.
+    let (provider_name, provider_model) = app.remote_effort_identity();
+    let efforts =
+        app_mod::inferred_reasoning_efforts(provider_name.as_deref(), provider_model.as_deref());
     if efforts.is_empty() {
         app.set_status_notice("Reasoning effort not available for this provider");
         return Ok(());
     }
-    let current = app.remote_reasoning_effort.as_deref();
+    let current = app.remote_reasoning_effort_hint();
+    let current = current.as_deref();
     let current_index = current
         .and_then(|c| efforts.iter().position(|e| *e == c))
         .unwrap_or(efforts.len() - 1);
@@ -224,8 +228,8 @@ impl App {
                 self.prompt_new_account_label(provider)
             }
             other => {
-                if let Some(input) = Self::account_command_for_picker(&other) {
-                    crate::tui::app::auth::handle_account_command_remote(self, &input, remote)
+                if let Some(command) = crate::tui::app::auth::account_command_from_picker(&other) {
+                    crate::tui::app::auth::execute_account_command_remote(self, command, remote)
                         .await?;
                 }
             }
@@ -269,6 +273,18 @@ async fn handle_remote_key_internal(
     let mut modifiers = modifiers;
     ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
 
+    // Alt+5 always resets the simulator before modal routing, including in the
+    // remote/client mode used by self-dev sessions.
+    if app.handle_onboarding_sim_reset_shortcut(code, modifiers) {
+        return Ok(());
+    }
+
+    // The onboarding simulator owns all key handling while active (and Cmd+5
+    // toggles it). Handle it first so no real onboarding action can leak through.
+    if app.handle_onboarding_sim_key(code, modifiers) {
+        return Ok(());
+    }
+
     if app.handle_onboarding_continue_prompt_key(code) {
         return Ok(());
     }
@@ -307,6 +323,21 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    // While the runtime model picker preview is visible, route its
+    // favorite/default hotkeys (Ctrl+O set default, Ctrl+N toggle favorite) to
+    // the focused picker handler before the remote global Ctrl-key handling
+    // can claim them. This mirrors the local path in `input.rs`
+    // `handle_key_core`.
+    if app.model_picker_preview_hotkey(code, modifiers)? {
+        return Ok(());
+    }
+
+    // Inline hotkey feedback: when a known-but-rarely-used chord is pressed,
+    // show "you just pressed X → does Y". Placed after the overlay handlers so
+    // overlay-local keys stay silent. Unknown chords are reported at the
+    // fall-through points below.
+    app.observe_known_hotkey(code, modifiers, true);
+
     if input::handle_visible_copy_shortcut(app, code, modifiers) {
         return Ok(());
     }
@@ -321,6 +352,35 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    if app.new_terminal_key_matches(code, modifiers) {
+        app.handle_new_terminal_hotkey();
+        return Ok(());
+    }
+
+    // Accept an armed post-error fallback offer: stage the route switch and
+    // resend so the remote dispatcher applies it (SetRoute + payload resend).
+    // Checked before the merge offer to match the local key-handling order
+    // (both share the same accept key).
+    if app.pending_fallback_offer.is_some()
+        && !app.is_processing
+        && app.fallback_switch_key_matches(code, modifiers)
+    {
+        app.apply_pending_fallback_offer();
+        return Ok(());
+    }
+
+    // Accept an armed "merge the diverged update" offer (self-dev/remote
+    // sessions surface the same update card as local ones).
+    if app.merge_offer_key_matches(code, modifiers) {
+        app.accept_update_merge_offer();
+        return Ok(());
+    }
+
+    if app.open_resume_key_matches(code, modifiers) {
+        app.open_session_picker();
+        return Ok(());
+    }
+
     if handle_workspace_navigation_key(app, code, modifiers, remote).await? {
         return Ok(());
     }
@@ -329,6 +389,30 @@ async fn handle_remote_key_internal(
         app.toggle_side_panel();
         return Ok(());
     }
+
+    // Swarm views: Alt+N cycles chat → inline controls → full live page → chat.
+    // Selection/open/prompt controls stay available in both active views, while
+    // plain typing continues to flow to the chat input.
+    if app.toggle_keys.swarm_panel_focus.matches(code, modifiers) {
+        match app.cycle_swarm_panel_view() {
+            app_mod::tui_state::SwarmPanelView::Chat => {
+                app.set_status_notice("Swarm view closed");
+            }
+            app_mod::tui_state::SwarmPanelView::Controls => {
+                app.set_status_notice(crate::tui::keybind::swarm_view_hint("full page"));
+            }
+            app_mod::tui_state::SwarmPanelView::FullPage => {
+                app.set_status_notice(crate::tui::keybind::swarm_page_hint());
+            }
+        }
+        return Ok(());
+    }
+    {
+        use crate::tui::TuiState as _;
+        if app.swarm_panel_focused() && app.handle_swarm_panel_key(code, modifiers) {
+            return Ok(());
+        }
+    }
     let macos_option_shortcut =
         crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
     if app.toggle_keys.diagram_pane.matches(code, modifiers) {
@@ -336,10 +420,12 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
     if let Some(direction) = app.model_switch_keys.direction_for(code, modifiers) {
+        app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::ModelSwitch);
         remote.cycle_model(direction).await?;
         return Ok(());
     }
     if let Some(direction) = app.effort_switch_keys.direction_for(code, modifiers) {
+        app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::EffortCycle);
         apply_remote_effort_direction(app, remote, direction).await?;
         return Ok(());
     }
@@ -356,7 +442,12 @@ async fn handle_remote_key_internal(
         app.toggle_typing_scroll_lock();
         return Ok(());
     }
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.toggle_keys.todo_card.matches(code, modifiers) {
+        app.toggle_todo_card();
+        return Ok(());
+    }
+    if app.centered_toggle_keys.matches(code, modifiers) {
+        app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::Alignment);
         app.toggle_centered_mode();
         return Ok(());
     }
@@ -381,7 +472,12 @@ async fn handle_remote_key_internal(
                 app.cursor_pos = app.find_word_boundary_back();
                 return Ok(());
             }
-            KeyCode::Char('f') => {
+            // Alt/Option+Left/Right move by word, matching Alt+B / Alt+F.
+            KeyCode::Left => {
+                app.cursor_pos = app.find_word_boundary_back();
+                return Ok(());
+            }
+            KeyCode::Char('f') | KeyCode::Right => {
                 app.cursor_pos = app.find_word_boundary_forward();
                 return Ok(());
             }
@@ -467,7 +563,8 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.centered_toggle_keys.matches(code, modifiers) {
+        app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::Alignment);
         app.toggle_centered_mode();
         return Ok(());
     }
@@ -550,7 +647,7 @@ async fn handle_remote_key_internal(
                 return Ok(());
             }
             KeyCode::Char('e') => {
-                input::edit_input_in_external_editor(app);
+                app.cursor_pos = app.input.len();
                 return Ok(());
             }
             KeyCode::Char('f') => {
@@ -655,7 +752,7 @@ async fn handle_remote_key_internal(
     }
 
     if code == KeyCode::Enter
-        && modifiers.contains(KeyModifiers::CONTROL)
+        && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         && !app.input.trim().starts_with('/')
     {
         if app.activate_picker_from_preview() {
@@ -676,16 +773,15 @@ async fn handle_remote_key_internal(
                     app.queued_messages.push(prepared.expanded);
                 }
                 SendAction::Interleave => {
-                    app.send_interleave_now(prepared.expanded, remote).await;
+                    app.send_interleave_now(prepared.expanded, prepared.images, remote)
+                        .await;
                 }
             }
         }
         return Ok(());
     }
 
-    if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
-        input::insert_input_text(app, "\n");
-        app.follow_chat_bottom_for_typing();
+    if crate::tui::app::input::newline::enter_inserts_newline(app, code, modifiers) {
         return Ok(());
     }
 
@@ -697,13 +793,13 @@ async fn handle_remote_key_internal(
 
     if let Some(text) = text_input.or_else(|| input::text_input_for_key(code, modifiers)) {
         input::handle_text_input(app, &text);
-        app.follow_chat_bottom_for_typing();
         return Ok(());
     }
 
     // Never fall through and insert literal text for unhandled Ctrl+key chords. This stays after
     // text_input so Ctrl+Alt/AltGr symbols delivered as final printable text still work.
     if modifiers.contains(KeyModifiers::CONTROL) {
+        app.note_unrecognized_hotkey(code, modifiers, true);
         return Ok(());
     }
 
@@ -720,6 +816,10 @@ async fn handle_remote_key_internal(
             _ => {}
         }
     }
+
+    // A modified chord (or function key) that reached this point is not bound
+    // to anything; tell the user instead of silently swallowing it.
+    app.note_unrecognized_hotkey(code, modifiers, true);
 
     match code {
         KeyCode::Char(c) => {
@@ -747,6 +847,10 @@ async fn handle_remote_key_internal(
         KeyCode::Left => {
             if app.cursor_pos > 0 {
                 app.cursor_pos = core::prev_char_boundary(&app.input, app.cursor_pos);
+            } else {
+                // Opt-in: Left on an empty input opens the active sessions
+                // manager (no-op unless display.active_sessions_manager).
+                app.maybe_open_active_sessions_on_left();
             }
         }
         KeyCode::Right => {
@@ -820,10 +924,7 @@ async fn handle_remote_key_internal(
                         app.push_display_message(DisplayMessage::system(
                             "Reloading client with newer binary...".to_string(),
                         ));
-                        let session_id = app
-                            .remote_session_id
-                            .clone()
-                            .unwrap_or_else(|| crate::id::new_id("ses"));
+                        let session_id = app.reload_handoff_session_id();
                         app.save_input_for_reload(&session_id);
                         app.reload_requested = Some(session_id);
                         app.should_quit = true;
@@ -835,10 +936,7 @@ async fn handle_remote_key_internal(
                     app.push_display_message(DisplayMessage::system(
                         "Reloading client...".to_string(),
                     ));
-                    let session_id = app
-                        .remote_session_id
-                        .clone()
-                        .unwrap_or_else(|| crate::id::new_id("ses"));
+                    let session_id = app.reload_handoff_session_id();
                     app.save_input_for_reload(&session_id);
                     app.reload_requested = Some(session_id);
                     app.should_quit = true;
@@ -848,6 +946,23 @@ async fn handle_remote_key_internal(
                 if trimmed == "/server-reload" {
                     app.append_reload_message("Reloading server...");
                     remote.reload().await?;
+                    return Ok(());
+                }
+
+                if trimmed == "/continue" || trimmed == "/resumeall" || trimmed == "/resume-all" {
+                    app.push_display_message(DisplayMessage::system(
+                        "Continuing all interrupted sessions...".to_string(),
+                    ));
+                    match remote.resume_all_sessions().await {
+                        Ok(_) => app.set_status_notice("Continuing interrupted sessions..."),
+                        Err(error) => {
+                            app.push_display_message(DisplayMessage::error(format!(
+                                "Failed to continue sessions: {}",
+                                error
+                            )));
+                            app.set_status_notice("Continue all failed");
+                        }
+                    }
                     return Ok(());
                 }
 
@@ -908,6 +1023,14 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/model" || trimmed == "/models" {
                     let _ = remote.refresh_models().await;
+                    // `refresh_models` re-queries providers and pushes the
+                    // result over the bus, where oversized frames get
+                    // downgraded to names-only. Also request the catalog
+                    // directly so the picker gets real route expansion even
+                    // when the bus push is downgraded and no usable local
+                    // catalog cache exists (otherwise every row is a
+                    // placeholder "remote-catalog" entry).
+                    let _ = remote.request_model_catalog().await;
                     app.set_status_notice("Refreshing model catalog...");
                     app.open_model_picker();
                     return Ok(());
@@ -1009,13 +1132,15 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed == "/effort" {
-                    let current = app.remote_reasoning_effort.as_deref();
+                    let current = app.remote_reasoning_effort_hint();
+                    let current = current.as_deref();
                     let label = current
                         .map(app_mod::effort_display_label)
                         .unwrap_or("default");
+                    let (provider_name, provider_model) = app.remote_effort_identity();
                     let efforts = app_mod::inferred_reasoning_efforts(
-                        app.remote_provider_name.as_deref(),
-                        app.remote_provider_model.as_deref(),
+                        provider_name.as_deref(),
+                        provider_model.as_deref(),
                     );
                     if efforts.is_empty() {
                         app.push_display_message(DisplayMessage::system(
@@ -1034,9 +1159,10 @@ async fn handle_remote_key_internal(
                         })
                         .collect();
                     app.push_display_message(DisplayMessage::system(format!(
-                        "Reasoning effort: {}\nAvailable: {}\nUse /effort <level> or Alt+Left / Alt+Right to change.",
+                        "Effort: {}\nAvailable: {}\nUse /effort <level> or {} to change.",
                         label,
-                        list.join(" · ")
+                        list.join(" · "),
+                        crate::tui::keybind::effort_switch_keys_label()
                     )));
                     return Ok(());
                 }
@@ -1047,9 +1173,10 @@ async fn handle_remote_key_internal(
                         app.push_display_message(DisplayMessage::error("Usage: /effort <level>"));
                         return Ok(());
                     }
+                    let (provider_name, provider_model) = app.remote_effort_identity();
                     let efforts = app_mod::inferred_reasoning_efforts(
-                        app.remote_provider_name.as_deref(),
-                        app.remote_provider_model.as_deref(),
+                        provider_name.as_deref(),
+                        provider_model.as_deref(),
                     );
                     if efforts.contains(&level) {
                         app.remote_reasoning_effort = Some(level.to_string());
@@ -1513,9 +1640,47 @@ async fn handle_remote_key_internal(
                     app.pasted_contents.clear();
                     app.pending_images.clear();
                     app.clear_streaming_render_state();
+                    app.clear_live_usage_state();
+                    // Full transcript discard: diagrams and side panel pages
+                    // are both orphaned (same rationale as
+                    // reset_current_session; side panel is #605).
+                    crate::tui::mermaid::clear_active_diagrams();
+                    super::super::commands_review::clear_side_panel_for_new_session(app);
                     app.is_processing = false;
                     app.status = ProcessingStatus::Idle;
                     app.set_status_notice("Session cleared");
+                    return Ok(());
+                }
+
+                if trimmed == "/fork" || trimmed == "/split" {
+                    app.push_display_message(DisplayMessage::system(
+                        "Forking session...".to_string(),
+                    ));
+                    remote.split().await?;
+                    return Ok(());
+                }
+
+                if trimmed == "/btw"
+                    || trimmed.starts_with("/btw ")
+                    || trimmed.starts_with("/fork ")
+                {
+                    let prompt = trimmed
+                        .strip_prefix("/btw")
+                        .or_else(|| trimmed.strip_prefix("/fork"))
+                        .unwrap_or_default()
+                        .trim();
+                    if prompt.is_empty() {
+                        app.push_display_message(DisplayMessage::error(
+                            "Usage: /btw <question>".to_string(),
+                        ));
+                        return Ok(());
+                    }
+                    let prepared = input::PreparedInput {
+                        raw_input: prompt.to_string(),
+                        expanded: prompt.to_string(),
+                        images: vec![],
+                    };
+                    route_prepared_input_to_new_remote_session(app, remote, prepared).await?;
                     return Ok(());
                 }
 
@@ -1523,7 +1688,10 @@ async fn handle_remote_key_internal(
                     || trimmed == "/observe on"
                     || trimmed == "/observe off"
                     || trimmed == "/observe status"
+                    || trimmed == "/todo"
                     || trimmed == "/todos"
+                    || trimmed == "/todos card"
+                    || trimmed == "/todos panel"
                     || trimmed == "/todos on"
                     || trimmed == "/todos off"
                     || trimmed == "/todos status"
@@ -1603,6 +1771,14 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
                     app.open_session_picker();
+                    app.record_keybinding_slow(
+                        crate::tui::app::shortcut_hints::LearnableAction::Resume,
+                    );
+                    return Ok(());
+                }
+
+                if trimmed == "/active" {
+                    app.open_active_sessions_picker();
                     return Ok(());
                 }
 
@@ -1688,14 +1864,6 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
-                if trimmed == "/split" {
-                    app.push_display_message(DisplayMessage::system(
-                        "Splitting session...".to_string(),
-                    ));
-                    remote.split().await?;
-                    return Ok(());
-                }
-
                 if trimmed == "/transfer" {
                     if app.pending_transfer_request {
                         app.push_display_message(DisplayMessage::system(
@@ -1709,7 +1877,10 @@ async fn handle_remote_key_internal(
                     if app.is_processing {
                         let pause_message = app_mod::commands::transfer_pause_message();
                         let pause_display = pause_message.clone();
-                        match remote.soft_interrupt(pause_message, false).await {
+                        match remote
+                            .soft_interrupt(pause_message, Vec::new(), false)
+                            .await
+                        {
                             Ok(request_id) => {
                                 app.track_pending_soft_interrupt(request_id, pause_display);
                                 app.pending_transfer_request = true;
@@ -1750,29 +1921,80 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
-                if trimmed == "/commit" {
-                    let prompt = app_mod::commands::build_commit_prompt();
+                if trimmed == "/commit"
+                    || trimmed == "/commit-push"
+                    || trimmed == "/commit-and-push"
+                    || trimmed == "/fast-release"
+                    || trimmed == "/remote-release"
+                    || trimmed == "/cut-release"
+                    || trimmed == "/commit-push-release"
+                    || trimmed == "/triage"
+                    || trimmed.starts_with("/triage ")
+                {
+                    let is_triage = trimmed == "/triage" || trimmed.starts_with("/triage ");
+                    let is_fast_release = matches!(
+                        trimmed,
+                        "/fast-release" | "/cut-release" | "/commit-push-release"
+                    );
+                    let is_remote_release = trimmed == "/remote-release";
+                    let is_push = trimmed != "/commit";
+                    let prompt = if is_triage {
+                        app_mod::commands::build_triage_prompt(
+                            trimmed.strip_prefix("/triage").unwrap_or_default(),
+                        )
+                    } else if is_fast_release {
+                        app_mod::commands::build_fast_release_prompt()
+                    } else if is_remote_release {
+                        app_mod::commands::build_remote_release_prompt()
+                    } else if is_push {
+                        app_mod::commands::build_commit_push_prompt()
+                    } else {
+                        app_mod::commands::build_commit_prompt()
+                    };
+                    let launch_notice = |interrupted: bool| {
+                        if is_triage {
+                            app_mod::commands::triage_launch_notice(interrupted)
+                        } else if is_fast_release {
+                            app_mod::commands::fast_release_launch_notice(interrupted)
+                        } else if is_remote_release {
+                            app_mod::commands::remote_release_launch_notice(interrupted)
+                        } else if is_push {
+                            app_mod::commands::commit_push_launch_notice(interrupted)
+                        } else {
+                            app_mod::commands::commit_launch_notice(interrupted)
+                        }
+                    };
+                    let cmd_label = if is_triage {
+                        "/triage"
+                    } else if is_fast_release {
+                        "/fast-release"
+                    } else if is_remote_release {
+                        "/remote-release"
+                    } else if is_push {
+                        "/commit-push"
+                    } else {
+                        "/commit"
+                    };
                     if app.is_processing {
-                        app.push_display_message(DisplayMessage::system(
-                            app_mod::commands::commit_launch_notice(true),
-                        ));
-                        match remote.soft_interrupt(prompt.clone(), false).await {
+                        app.push_display_message(DisplayMessage::system(launch_notice(true)));
+                        match remote
+                            .soft_interrupt(prompt.clone(), Vec::new(), false)
+                            .await
+                        {
                             Ok(request_id) => {
                                 app.track_pending_soft_interrupt(request_id, prompt);
-                                app.set_status_notice("Interrupting for /commit...");
+                                app.set_status_notice(format!("Interrupting for {}...", cmd_label));
                             }
                             Err(error) => {
                                 app.push_display_message(DisplayMessage::error(format!(
-                                    "Failed to start /commit: {}",
-                                    error
+                                    "Failed to start {}: {}",
+                                    cmd_label, error
                                 )));
-                                app.set_status_notice("/commit failed");
+                                app.set_status_notice(format!("{} failed", cmd_label));
                             }
                         }
                     } else {
-                        app.push_display_message(DisplayMessage::system(
-                            app_mod::commands::commit_launch_notice(false),
-                        ));
+                        app.push_display_message(DisplayMessage::system(launch_notice(false)));
                         input_dispatch::begin_remote_send(
                             app,
                             remote,
@@ -2320,9 +2542,7 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed.starts_with('/') {
-                    app.input = trimmed.to_string();
-                    app.cursor_pos = app.input.len();
-                    app.submit_input();
+                    submit_remote_slash_input(app, remote, prepared).await?;
                     return Ok(());
                 }
 
@@ -2339,7 +2559,8 @@ async fn handle_remote_key_internal(
                         app.queued_messages.push(prepared.expanded);
                     }
                     SendAction::Interleave => {
-                        app.send_interleave_now(prepared.expanded, remote).await;
+                        app.send_interleave_now(prepared.expanded, prepared.images, remote)
+                            .await;
                     }
                 }
             }

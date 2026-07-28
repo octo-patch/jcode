@@ -363,6 +363,7 @@ mod tests {
                 "content": "first line\nsecond line\n"
             }),
             intent: None,
+            thought_signature: None,
         };
 
         assert_eq!(diff_change_counts_for_tool(&tool, ""), (2, 0));
@@ -381,6 +382,7 @@ mod tests {
                 ]
             }),
             intent: None,
+            thought_signature: None,
         };
 
         assert_eq!(diff_change_counts_for_tool(&tool, ""), (2, 2));

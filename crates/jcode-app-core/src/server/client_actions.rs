@@ -5,8 +5,7 @@ use super::{
     ClientConnectionInfo, SessionInterruptQueues, SwarmEvent, SwarmMember, SwarmState,
     VersionedPlan, broadcast_swarm_status, fanout_session_event, persist_swarm_state_for,
     queue_soft_interrupt_for_session, remove_session_channel_subscriptions,
-    remove_session_from_swarm, session_event_fanout_sender, swarm_id_for_dir, truncate_detail,
-    update_member_status,
+    remove_session_from_swarm, swarm_id_for_dir, truncate_detail, update_member_status,
 };
 use crate::agent::Agent;
 use crate::protocol::{FeatureToggle, NotificationType, ServerEvent};
@@ -80,65 +79,15 @@ fn combine_input_shell_output(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
     (output, truncated)
 }
 
-async fn run_scheduled_task_in_live_session_if_idle(
-    session_id: &str,
-    message: &str,
-    sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-) -> bool {
-    let agent = {
-        let guard = sessions.read().await;
-        guard.get(session_id).cloned()
-    };
-    let Some(agent) = agent else {
-        return false;
-    };
-
-    let has_live_attachments = {
-        let members = swarm_members.read().await;
-        members
-            .get(session_id)
-            .map(|member| !member.event_txs.is_empty() || !member.event_tx.is_closed())
-            .unwrap_or(false)
-    };
-    if !has_live_attachments {
-        return false;
-    }
-
-    let is_idle = match agent.try_lock() {
-        Ok(guard) => {
-            drop(guard);
-            true
-        }
-        Err(_) => false,
-    };
-
-    if !is_idle {
-        return false;
-    }
-
-    let session_id = session_id.to_string();
-    let message = message.to_string();
-    let event_tx = session_event_fanout_sender(session_id.clone(), Arc::clone(swarm_members));
-    tokio::spawn(async move {
-        if let Err(err) =
-            process_message_streaming_mpsc(agent, &message, vec![], None, event_tx).await
-        {
-            crate::logging::error(&format!(
-                "Failed to run scheduled task immediately for live session {}: {}",
-                session_id, err
-            ));
-        }
-    });
-
-    true
-}
-
 pub(super) struct NotifySessionContext<'a> {
     pub sessions: &'a SessionAgents,
     pub soft_interrupt_queues: &'a SessionInterruptQueues,
     pub client_connections: &'a Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     pub swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
+    pub swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    pub event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
+    pub event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
+    pub swarm_event_tx: &'a broadcast::Sender<SwarmEvent>,
     pub client_event_tx: &'a mpsc::UnboundedSender<ServerEvent>,
 }
 
@@ -156,11 +105,18 @@ pub(super) async fn handle_notify_session(
     };
 
     let ran_immediately = if target_has_client {
-        run_scheduled_task_in_live_session_if_idle(
+        super::live_turn::run_live_turn_if_idle(
             &session_id,
             &message,
+            None,
             ctx.sessions,
-            ctx.swarm_members,
+            super::live_turn::LiveTurnSwarmContext::new(
+                ctx.swarm_members,
+                ctx.swarms_by_id,
+                ctx.event_history,
+                ctx.event_counter,
+                ctx.swarm_event_tx,
+            ),
         )
         .await
     } else {
@@ -182,6 +138,7 @@ pub(super) async fn handle_notify_session(
                     notification_type: NotificationType::Message {
                         scope: Some("scheduled".to_string()),
                         channel: None,
+                        tldr: None,
                     },
                     message: message.clone(),
                 },
@@ -707,6 +664,10 @@ fn clone_split_session(parent_session_id: &str) -> anyhow::Result<(String, Strin
     child.working_dir = parent.working_dir.clone();
     child.model = parent.model.clone();
     child.status = crate::session::SessionStatus::Closed;
+    // The parent agent keeps ownership of any in-flight request; tell the
+    // forked agent so it treats the next prompt as fresh work instead of
+    // continuing (and duplicating) the parent's current turn.
+    child.append_fork_notice(parent_session_id, parent.display_name());
     child.save()?;
 
     let name = child.display_name().to_string();
@@ -737,6 +698,7 @@ fn create_transfer_child_session(
     child.working_dir = parent.working_dir.clone();
     child.model = parent.model.clone();
     child.provider_key = parent.provider_key.clone();
+    child.route_api_method = parent.route_api_method.clone();
     child.subagent_model = parent.subagent_model.clone();
     child.improve_mode = parent.improve_mode;
     child.autoreview_enabled = parent.autoreview_enabled;
@@ -916,6 +878,161 @@ pub(super) async fn handle_transfer(
 #[cfg(test)]
 #[path = "client_actions_tests.rs"]
 mod tests;
+
+/// Decide whether an idle live session still owes the model a continuation.
+///
+/// This is the live-session analog of `restored_session_was_interrupted`: a
+/// session "would continue if resumed" when it has a pending reload-recovery
+/// directive, when it carries reload-interruption markers, or when its last
+/// model-visible message is a user/tool turn the assistant never answered
+/// (e.g. the turn errored or the process was interrupted mid-generation).
+fn live_session_owes_continuation(agent: &Agent) -> bool {
+    // Never continue an empty/fresh session.
+    if agent.visible_conversation_message_count() == 0 {
+        return false;
+    }
+
+    if super::reload_recovery::peek_for_session(agent.session_id())
+        .ok()
+        .flatten()
+        .map(|record| record.status == super::reload_recovery::ReloadRecoveryStatus::Pending)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if super::client_session::session_was_interrupted_by_reload(agent) {
+        return true;
+    }
+
+    matches!(
+        agent.last_visible_conversation_role(),
+        Some(crate::message::Role::User)
+    )
+}
+
+/// Continue every live, idle session that would auto-resume on a reload.
+///
+/// This is the on-demand equivalent of the post-reload recovery sweep: it walks
+/// the currently-live sessions, and for each idle one that still owes the model
+/// a continuation, injects the standard "continue where you left off" reminder
+/// so the session picks back up without the user having to open each one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resuming live sessions needs session, swarm membership, and status event state"
+)]
+pub(super) async fn handle_resume_all_sessions(
+    id: u64,
+    sessions: &SessionAgents,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
+    event_counter: &Arc<std::sync::atomic::AtomicU64>,
+    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    // Snapshot live sessions (those with at least one live client attachment).
+    let live_session_ids: Vec<String> = {
+        let members = swarm_members.read().await;
+        members
+            .iter()
+            .filter(|(_, member)| !member.event_txs.is_empty() || !member.event_tx.is_closed())
+            .map(|(session_id, _)| session_id.clone())
+            .collect()
+    };
+
+    let mut resumed_sessions: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
+
+    for session_id in live_session_ids {
+        let agent = {
+            let guard = sessions.read().await;
+            guard.get(&session_id).cloned()
+        };
+        let Some(agent) = agent else {
+            continue;
+        };
+
+        // Only act on idle sessions; a busy session is already making progress.
+        let Ok(agent_guard) = agent.try_lock() else {
+            skipped += 1;
+            continue;
+        };
+
+        if !live_session_owes_continuation(&agent_guard) {
+            drop(agent_guard);
+            skipped += 1;
+            continue;
+        }
+
+        let reminder = match super::reload_recovery::pending_directive_for_session(&session_id) {
+            Ok(Some(directive)) => directive.continuation_message,
+            _ => crate::tool::selfdev::ReloadContext::interrupted_session_continuation_message(),
+        };
+        let display_name = agent_guard
+            .session_short_name()
+            .map(str::to_string)
+            .unwrap_or_else(|| session_id[..8.min(session_id.len())].to_string());
+        drop(agent_guard);
+
+        // Best-effort: record that the durable recovery intent was delivered.
+        if let Err(error) = super::reload_recovery::mark_delivered_if_matching_continuation(
+            &session_id,
+            &reminder,
+            "resume_all_sessions",
+        ) {
+            crate::logging::warn(&format!(
+                "resume_all_sessions: failed to mark recovery intent delivered for {}: {}",
+                session_id, error
+            ));
+        }
+
+        super::live_turn::spawn_tracked_live_turn(
+            &session_id,
+            Arc::clone(&agent),
+            String::new(),
+            Some(reminder),
+            Some("resuming interrupted session".to_string()),
+            super::live_turn::LiveTurnSwarmContext::new(
+                swarm_members,
+                swarms_by_id,
+                event_history,
+                event_counter,
+                swarm_event_tx,
+            ),
+        )
+        .await;
+
+        resumed_sessions.push(display_name);
+    }
+
+    let resumed = resumed_sessions.len();
+    let message = if resumed == 0 {
+        "No interrupted sessions to resume. All live sessions are idle or already complete."
+            .to_string()
+    } else if resumed == 1 {
+        format!("Resuming 1 interrupted session: {}.", resumed_sessions[0])
+    } else {
+        format!(
+            "Resuming {} interrupted sessions: {}.",
+            resumed,
+            resumed_sessions.join(", ")
+        )
+    };
+
+    crate::logging::info(&format!(
+        "resume_all_sessions: resumed={} skipped={} sessions={:?}",
+        resumed, skipped, resumed_sessions
+    ));
+
+    let _ = client_event_tx.send(ServerEvent::ResumeAllResult {
+        id,
+        resumed,
+        skipped,
+        resumed_sessions,
+        message,
+    });
+}
 
 pub(super) fn handle_compact(
     id: u64,

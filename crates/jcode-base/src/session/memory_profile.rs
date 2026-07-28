@@ -1,11 +1,6 @@
 use crate::message::ContentBlock;
+use crate::process_memory::estimate_json_bytes;
 use serde::Serialize;
-
-fn estimate_json_bytes<T: Serialize>(value: &T) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(0)
-}
 
 const LARGE_MEMORY_BLOB_THRESHOLD_BYTES: usize = 16 * 1024;
 
@@ -71,7 +66,7 @@ impl ContentBlockMemoryStats {
                 self.text_bytes += text.len();
                 self.record_bytes(text.len());
             }
-            ContentBlock::Reasoning { text } => {
+            ContentBlock::Reasoning { text } | ContentBlock::ReasoningTrace { text } => {
                 self.reasoning_blocks += 1;
                 self.reasoning_bytes += text.len();
                 self.record_bytes(text.len());

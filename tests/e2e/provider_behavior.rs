@@ -121,7 +121,7 @@ async fn test_socket_model_cycle_supported_models() -> Result<()> {
 
     let server_handle = tokio::spawn(async move { server_instance.run().await });
 
-    let mut client = wait_for_server_client(&socket_path).await?;
+    let mut client = wait_for_subscribed_server_client(&socket_path).await?;
     let request_id = client.cycle_model(1).await?;
 
     let mut saw_model_changed = false;
@@ -181,6 +181,7 @@ async fn test_resume_restores_model_and_tool_history() -> Result<()> {
                 id: "tool-1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"cmd": "echo hi"}),
+                thought_signature: None,
             },
         ],
     );
@@ -204,7 +205,7 @@ async fn test_resume_restores_model_and_tool_history() -> Result<()> {
         server::Server::new_with_paths(provider, socket_path.clone(), debug_socket_path.clone());
     let server_handle = tokio::spawn(async move { server_instance.run().await });
 
-    let mut client = wait_for_server_client(&socket_path).await?;
+    let mut client = wait_for_subscribed_server_client(&socket_path).await?;
     let resume_id = client.resume_session(&session.id).await?;
 
     let mut history_event = None;
@@ -395,6 +396,94 @@ async fn test_resume_session_with_local_history_uses_metadata_only_history() -> 
     );
 
     abort_server_and_cleanup(&server_handle, &socket_path, &debug_socket_path);
+
+    Ok(())
+}
+
+/// End-to-end: resume_all_sessions continues a live session whose last
+/// visible turn is an unanswered (interrupted) user message, and reports a
+/// summary describing the resumed session.
+#[tokio::test]
+async fn test_resume_all_sessions_continues_interrupted_live_session() -> Result<()> {
+    let _env = setup_test_env()?;
+    let runtime_dir = short_runtime_dir(format!(
+        "jcode-resume-all-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&runtime_dir)?;
+
+    // A session left with a pending user turn the assistant never answered.
+    let mut session = Session::create(None, Some("Interrupted Session".to_string()));
+    session.model = Some("model-a".to_string());
+    session.add_message(
+        jcode::message::Role::User,
+        vec![jcode::message::ContentBlock::Text {
+            text: "keep going on the migration".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    let socket_path = runtime_dir.join("jcode.sock");
+    let debug_socket_path = runtime_dir.join("jcode-debug.sock");
+
+    let provider = MockProvider::with_models(vec!["model-a"]);
+    provider.queue_response(vec![
+        StreamEvent::TextDelta("Continuing the migration now.".to_string()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some("end_turn".to_string()),
+        },
+    ]);
+    let provider: Arc<dyn jcode::provider::Provider> = Arc::new(provider);
+    let server_instance =
+        server::Server::new_with_paths(provider, socket_path.clone(), debug_socket_path.clone());
+    let server_handle = tokio::spawn(async move { server_instance.run().await });
+
+    let mut client = wait_for_server_client(&socket_path).await?;
+    let subscribe_id = client.subscribe().await?;
+    let _ = collect_until_done_unix(&mut client, subscribe_id).await?;
+
+    // Make the interrupted session live by attaching this client to it.
+    let resume_id = client.resume_session(&session.id).await?;
+    let _ = collect_until_done_unix(&mut client, resume_id).await?;
+
+    // Ask the server to continue every interrupted live session.
+    let resume_all_id = client.resume_all_sessions().await?;
+
+    let mut saw_continuation = false;
+    let mut resume_all_result: Option<(usize, usize)> = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && (!saw_continuation || resume_all_result.is_none()) {
+        let event = tokio::time::timeout(Duration::from_secs(2), client.read_event()).await??;
+        match event {
+            ServerEvent::TextDelta { text } if text.contains("Continuing the migration now.") => {
+                saw_continuation = true;
+            }
+            ServerEvent::ResumeAllResult {
+                id,
+                resumed,
+                skipped,
+                ..
+            } if id == resume_all_id => {
+                resume_all_result = Some((resumed, skipped));
+            }
+            _ => {}
+        }
+    }
+
+    abort_server_and_cleanup(&server_handle, &socket_path, &debug_socket_path);
+
+    assert!(
+        saw_continuation,
+        "interrupted live session should stream a continuation after resume_all_sessions"
+    );
+    let (resumed, skipped) =
+        resume_all_result.ok_or_else(|| anyhow::anyhow!("did not receive ResumeAllResult"))?;
+    assert_eq!(resumed, 1, "exactly one interrupted session should resume");
+    assert_eq!(skipped, 0, "no live session should be skipped");
 
     Ok(())
 }
@@ -623,14 +712,20 @@ async fn test_model_switch_resets_provider_session() -> Result<()> {
 
     let server_handle = tokio::spawn(async move { server_instance.run().await });
 
-    let mut client = wait_for_server_client(&socket_path).await?;
+    let mut client = wait_for_subscribed_server_client(&socket_path).await?;
 
     let msg_id = client.send_message("hello").await?;
     let mut saw_done1 = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // First-turn Done includes full agent-loop startup; slow Windows CI
+    // runners intermittently exceeded the old 5s budget (CI flake). Keep the
+    // loop tolerant of individual read timeouts and bound only the total wait.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        let event = tokio::time::timeout(Duration::from_secs(1), client.read_event()).await??;
-        if matches!(event, ServerEvent::Done { id } if id == msg_id) {
+        let Ok(event) = tokio::time::timeout(Duration::from_secs(1), client.read_event()).await
+        else {
+            continue;
+        };
+        if matches!(event?, ServerEvent::Done { id } if id == msg_id) {
             saw_done1 = true;
             break;
         }
@@ -639,10 +734,13 @@ async fn test_model_switch_resets_provider_session() -> Result<()> {
 
     let model_id = client.cycle_model(1).await?;
     let mut saw_model = false;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        let event = tokio::time::timeout(Duration::from_secs(1), client.read_event()).await??;
-        if matches!(event, ServerEvent::ModelChanged { id, error: None, .. } if id == model_id) {
+        let Ok(event) = tokio::time::timeout(Duration::from_secs(1), client.read_event()).await
+        else {
+            continue;
+        };
+        if matches!(event?, ServerEvent::ModelChanged { id, error: None, .. } if id == model_id) {
             saw_model = true;
             break;
         }
@@ -651,10 +749,13 @@ async fn test_model_switch_resets_provider_session() -> Result<()> {
 
     let msg2_id = client.send_message("second").await?;
     let mut saw_done2 = false;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        let event = tokio::time::timeout(Duration::from_secs(1), client.read_event()).await??;
-        if matches!(event, ServerEvent::Done { id } if id == msg2_id) {
+        let Ok(event) = tokio::time::timeout(Duration::from_secs(1), client.read_event()).await
+        else {
+            continue;
+        };
+        if matches!(event?, ServerEvent::Done { id } if id == msg2_id) {
             saw_done2 = true;
             break;
         }
@@ -717,8 +818,9 @@ async fn test_model_switch_is_per_session() -> Result<()> {
 
     let server_handle = tokio::spawn(async move { server_instance.run().await });
 
-    let mut client1 = wait_for_server_client(&socket_path).await?;
+    let mut client1 = wait_for_subscribed_server_client(&socket_path).await?;
     let mut client2 = server::Client::connect_with_path(socket_path.clone()).await?;
+    subscribe_client(&mut client2).await?;
 
     // Give server time to set up both client sessions
     tokio::time::sleep(Duration::from_millis(100)).await;

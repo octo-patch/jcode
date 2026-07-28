@@ -53,6 +53,43 @@ fn generated_image_visual_context_blocks_attach_safe_image() {
 }
 
 #[test]
+fn generated_image_rendered_image_uses_inline_tool_anchor() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let image_path = dir.path().join("generated.png");
+    ::image::RgbaImage::from_pixel(2, 1, ::image::Rgba([0, 255, 0, 255]))
+        .save(&image_path)
+        .expect("write png");
+
+    let image = generated_image_rendered_image(
+        "image_call_123",
+        image_path.to_str().expect("utf8 path"),
+        "png",
+    )
+    .expect("generated image should render inline");
+
+    assert_eq!(image.media_type, "image/png");
+    assert_eq!(image.label.as_deref(), image_path.to_str());
+    assert_eq!(
+        image.source,
+        jcode_session_types::RenderedImageSource::ToolResult {
+            tool_name: GENERATED_IMAGE_TOOL_NAME.to_string(),
+        }
+    );
+    assert_eq!(
+        image.anchor,
+        Some(jcode_session_types::RenderedImageAnchor::ToolCall {
+            id: "image_call_123".to_string(),
+        })
+    );
+    assert!(
+        !base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .expect("valid base64 image")
+            .is_empty()
+    );
+}
+
+#[test]
 fn tool_call_intent_from_input_trims_optional_intent() {
     let input = serde_json::json!({
         "intent": "  Verify compact rendering  ",
@@ -113,6 +150,7 @@ fn tool_call_preserves_invalid_streamed_json_as_validation_error() {
         name: "bash".to_string(),
         input,
         intent: None,
+        thought_signature: None,
     };
 
     assert_eq!(
@@ -128,6 +166,7 @@ fn tool_call_validation_rejects_empty_name_and_non_object_input() {
         name: "".to_string(),
         input: serde_json::json!({}),
         intent: None,
+        thought_signature: None,
     };
     assert_eq!(
         empty_name.validation_error().as_deref(),
@@ -139,6 +178,7 @@ fn tool_call_validation_rejects_empty_name_and_non_object_input() {
         name: "read".to_string(),
         input: serde_json::json!(20),
         intent: None,
+        thought_signature: None,
     };
     assert_eq!(
         primitive_args.validation_error().as_deref(),
@@ -150,6 +190,7 @@ fn tool_call_validation_rejects_empty_name_and_non_object_input() {
         name: "read".to_string(),
         input: serde_json::json!({"path":"README.md"}),
         intent: None,
+        thought_signature: None,
     };
     assert_eq!(valid.validation_error(), None);
 }
@@ -370,6 +411,7 @@ fn ends_with_fresh_user_turn_rejects_trailing_tool_result() {
                 id: "call_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             }],
             timestamp: Some(Utc::now()),
             tool_duration_ms: None,
@@ -418,6 +460,55 @@ fn format_background_task_notification_markdown_uses_code_block_preview() {
     );
     assert!(rendered.contains("```text\n[stderr] first line\n[stdout] second line\n```"));
     assert!(rendered.contains("_Full output:_ `bg action=\"output\" task_id=\"abc123\"`"));
+}
+
+#[test]
+fn strip_ansi_escape_sequences_removes_terminal_controls() {
+    let input = concat!(
+        "\u{1b}[32mgreen\u{1b}[39m ",
+        "\u{1b}]8;;https://example.com\u{1b}\\link\u{1b}]8;;\u{7} ",
+        "\u{1b}Pignored\u{1b}\\done",
+    );
+
+    assert_eq!(strip_ansi_escape_sequences(input), "green link done");
+}
+
+#[test]
+fn format_input_shell_result_markdown_strips_ansi_from_output() {
+    let rendered = format_input_shell_result_markdown(&InputShellResult {
+        command: "cargo test".to_string(),
+        cwd: None,
+        output: "\u{1b}[32m✓\u{1b}[39m passes\n\u{1b}[2m12ms\u{1b}[22m\n".to_string(),
+        exit_code: Some(0),
+        duration_ms: 12,
+        truncated: false,
+        failed_to_start: false,
+    });
+
+    assert!(rendered.contains("  ✓ passes\n  12ms"));
+    assert!(!rendered.contains('\u{1b}'));
+    assert!(!rendered.contains("[32m"));
+}
+
+#[test]
+fn format_background_task_notification_markdown_strips_ansi_from_preview() {
+    let rendered = format_background_task_notification_markdown(&BackgroundTaskCompleted {
+        task_id: "ansi123".to_string(),
+        tool_name: "bash".to_string(),
+        display_name: None,
+        session_id: "session".to_string(),
+        status: BackgroundTaskStatus::Completed,
+        exit_code: Some(0),
+        output_preview: "\u{1b}[32m✓\u{1b}[39m passes\n\u{1b}[2m12ms\u{1b}[22m\n".to_string(),
+        output_file: std::path::PathBuf::from("/tmp/output.log"),
+        duration_secs: 0.1,
+        notify: true,
+        wake: false,
+    });
+
+    assert!(rendered.contains("```text\n✓ passes\n12ms\n```"));
+    assert!(!rendered.contains('\u{1b}'));
+    assert!(!rendered.contains("[32m"));
 }
 
 #[test]
@@ -657,4 +748,92 @@ fn parse_background_task_notification_markdown_extracts_fields() -> Result<()> {
         "bg action=\"output\" task_id=\"abc123\""
     );
     Ok(())
+}
+
+#[test]
+fn push_reasoning_blocks_always_captures_history() {
+    // seal/claude-api (replay disabled) must still persist a history trace.
+    let mut blocks = Vec::new();
+    push_reasoning_blocks(&mut blocks, "anthropic", "thinking about X", None, false);
+    assert_eq!(blocks.len(), 1);
+    match &blocks[0] {
+        ContentBlock::ReasoningTrace { text } => assert_eq!(text, "thinking about X"),
+        other => panic!("expected ReasoningTrace, got {other:?}"),
+    }
+}
+
+#[test]
+fn push_reasoning_blocks_anthropic_signed_replay() {
+    let mut blocks = Vec::new();
+    push_reasoning_blocks(
+        &mut blocks,
+        "anthropic",
+        "signed thought",
+        Some("sig"),
+        true,
+    );
+    // Signed thinking is replayable AND readable, so no extra trace is needed.
+    assert_eq!(blocks.len(), 1);
+    match &blocks[0] {
+        ContentBlock::AnthropicThinking {
+            thinking,
+            signature,
+        } => {
+            assert_eq!(thinking, "signed thought");
+            assert_eq!(signature, "sig");
+        }
+        other => panic!("expected AnthropicThinking, got {other:?}"),
+    }
+}
+
+#[test]
+fn push_reasoning_blocks_anthropic_unsigned_falls_back_to_trace() {
+    let mut blocks = Vec::new();
+    // Replay requested but no signature: cannot replay, must still keep history.
+    push_reasoning_blocks(&mut blocks, "anthropic", "unsigned thought", None, true);
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(blocks[0], ContentBlock::ReasoningTrace { .. }));
+}
+
+#[test]
+fn push_reasoning_blocks_openai_keeps_readable_trace() {
+    let mut blocks = Vec::new();
+    // OpenAI native reasoning is encrypted/unreadable, so a readable trace is
+    // always added for history regardless of replay setting.
+    push_reasoning_blocks(&mut blocks, "openai", "openai reasoning", None, true);
+    assert_eq!(blocks.len(), 1);
+    match &blocks[0] {
+        ContentBlock::ReasoningTrace { text } => assert_eq!(text, "openai reasoning"),
+        other => panic!("expected ReasoningTrace, got {other:?}"),
+    }
+}
+
+#[test]
+fn push_reasoning_blocks_openrouter_replay_is_readable() {
+    let mut blocks = Vec::new();
+    push_reasoning_blocks(&mut blocks, "openrouter", "or reasoning", None, true);
+    // OpenRouter stores a readable Reasoning block, which doubles as history.
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(blocks[0], ContentBlock::Reasoning { .. }));
+}
+
+#[test]
+fn push_reasoning_blocks_skips_empty() {
+    let mut blocks = Vec::new();
+    push_reasoning_blocks(&mut blocks, "anthropic", "", None, false);
+    assert!(blocks.is_empty());
+}
+
+#[test]
+fn reasoning_trace_serde_round_trip() {
+    let block = ContentBlock::ReasoningTrace {
+        text: "persisted reasoning".to_string(),
+    };
+    let json = serde_json::to_string(&block).expect("serialize");
+    assert!(json.contains("\"type\":\"reasoning_trace\""), "json={json}");
+    let parsed: ContentBlock = serde_json::from_str(&json).expect("deserialize");
+    match parsed {
+        ContentBlock::ReasoningTrace { text } => assert_eq!(text, "persisted reasoning"),
+        other => panic!("expected ReasoningTrace, got {other:?}"),
+    }
 }

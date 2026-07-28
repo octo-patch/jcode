@@ -494,7 +494,11 @@ async fn test_background_command_progress_marker_updates_status_and_stays_out_of
         .to_string();
 
     let mut saw_progress = false;
-    for _ in 0..50 {
+    // Wall-clock deadline: observing emitted progress depends on scheduler
+    // latency, so a fixed 50-iteration budget starved under parallel load
+    // (issue #593). The assertions inside stay exact.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         let status = crate::background::global()
             .status(&task_id)
             .await
@@ -552,7 +556,11 @@ async fn test_background_command_ratio_output_updates_progress() {
         .to_string();
 
     let mut saw_progress = false;
-    for _ in 0..50 {
+    // Wall-clock deadline: observing emitted progress depends on scheduler
+    // latency, so a fixed 50-iteration budget starved under parallel load
+    // (issue #593). The assertions inside stay exact.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         let status = crate::background::global()
             .status(&task_id)
             .await
@@ -600,7 +608,11 @@ async fn test_background_command_byte_ratio_output_updates_progress() {
         .to_string();
 
     let mut saw_progress = false;
-    for _ in 0..50 {
+    // Wall-clock deadline: observing emitted progress depends on scheduler
+    // latency, so a fixed 50-iteration budget starved under parallel load
+    // (issue #593). The assertions inside stay exact.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         let status = crate::background::global()
             .status(&task_id)
             .await
@@ -647,7 +659,14 @@ async fn test_background_command_respects_timeout() {
         .to_string();
 
     let mut final_status = None;
-    for _ in 0..50 {
+    // Wall-clock deadline rather than a fixed iteration count. The command's own
+    // timeout is 100ms, but the *observation* of the resulting Failed status
+    // depends on scheduler latency, and a 50 x 50ms budget starved when the full
+    // suite runs in parallel on a loaded machine (issue #593). A generous
+    // deadline keeps the assertion strict while removing the timing race: a real
+    // regression still fails, it just is not reported as a flake.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         let status = crate::background::global()
             .status(&task_id)
             .await
@@ -748,6 +767,49 @@ async fn test_background_command_without_timeout_keeps_running_past_default_fore
     let _ = tokio::fs::remove_file(status_file).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn process_group_kill_guard_terminates_descendants() {
+    let mut cmd = build_shell_command("sleep 60 & echo $!; wait");
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.kill_on_drop(true).stdout(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn process group probe");
+    let mut lines = BufReader::new(child.stdout.take().expect("probe stdout")).lines();
+    let descendant_pid = lines
+        .next_line()
+        .await
+        .expect("read descendant pid")
+        .expect("descendant pid line")
+        .parse::<u32>()
+        .expect("numeric descendant pid");
+
+    let guard = ProcessGroupKillGuard::new(child.id());
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .expect("shell should exit after process-group kill")
+        .expect("wait for shell");
+
+    // Wall-clock deadline: process teardown is asynchronous and 100 x 10ms was
+    // too tight under parallel load (issue #593).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if !crate::platform::is_process_running(descendant_pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("descendant process {descendant_pid} survived process-group cleanup");
+}
+
 #[test]
 fn test_bash_tool_schema_advertises_background_progress_guidance() {
     let schema = BashTool::new().parameters_schema();
@@ -770,4 +832,157 @@ fn test_bash_tool_schema_advertises_background_progress_guidance() {
         background_description.contains("3/10 tests"),
         "background description should mention parseable fallback progress output"
     );
+}
+
+// Destructive-command gate integration (#604).
+//
+// The unit-level policy is covered in jcode-command-risk. These tests pin the
+// wiring: that the gate actually sits in the bash tool's execute path, that it
+// refuses before spawning a process, and that it does not disturb normal work.
+
+fn gate_ctx(working_dir: &str) -> ToolContext {
+    ToolContext {
+        session_id: "gate-test".to_string(),
+        message_id: "m".to_string(),
+        tool_call_id: "c".to_string(),
+        working_dir: Some(std::path::PathBuf::from(working_dir)),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: crate::tool::ToolExecutionMode::Direct,
+    }
+}
+
+#[tokio::test]
+async fn bash_refuses_to_delete_the_home_directory() {
+    // The #604 incident, at the real tool boundary.
+    let temp = tempfile::tempdir().expect("temp home");
+    let home = temp.path().to_string_lossy().to_string();
+    let previous = std::env::var("HOME").ok();
+    // SAFETY: single-threaded test setup; restored below.
+    unsafe { std::env::set_var("HOME", &home) };
+
+    let canary = temp.path().join("precious.txt");
+    std::fs::write(&canary, "user data").expect("write canary");
+
+    let result = BashTool::new()
+        .execute(
+            serde_json::json!({ "command": format!("rm -rf {home}") }),
+            gate_ctx("/tmp"),
+        )
+        .await;
+
+    match previous {
+        Some(value) => unsafe { std::env::set_var("HOME", value) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+
+    let error = result.expect_err("deleting HOME must be refused");
+    assert!(
+        error.to_string().contains("blocked"),
+        "expected an outright block, got: {error}"
+    );
+    assert!(
+        canary.exists(),
+        "the gate must refuse before the process runs; the file was deleted"
+    );
+}
+
+#[tokio::test]
+async fn bash_holds_a_risky_delete_until_justified_then_runs_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workdir = temp.path().join("work");
+    let target = temp.path().join("outside");
+    std::fs::create_dir_all(&workdir).expect("workdir");
+    std::fs::create_dir_all(&target).expect("target");
+    std::fs::write(target.join("f.txt"), "x").expect("file");
+
+    let command = format!("rm -rf {}", target.display());
+    let tool = BashTool::new();
+
+    // First attempt: no justification, so it is held.
+    let held = tool
+        .execute(
+            serde_json::json!({ "command": command }),
+            gate_ctx(workdir.to_str().expect("utf8")),
+        )
+        .await
+        .expect_err("first attempt should be held");
+    assert!(held.to_string().contains("justification"), "{held}");
+    assert!(target.exists(), "nothing should have been deleted yet");
+
+    // A blind retry is held identically: repetition is not consent.
+    let retried = tool
+        .execute(
+            serde_json::json!({ "command": command }),
+            gate_ctx(workdir.to_str().expect("utf8")),
+        )
+        .await
+        .expect_err("a blind retry should still be held");
+    assert!(retried.to_string().contains("justification"));
+    assert!(target.exists());
+
+    // With a real justification it proceeds.
+    tool.execute(
+        serde_json::json!({
+            "command": command,
+            "justification": "The user asked me to remove the outside/ fixture \
+                              directory they created earlier in this session.",
+        }),
+        gate_ctx(workdir.to_str().expect("utf8")),
+    )
+    .await
+    .expect("a justified command should run");
+    assert!(!target.exists(), "the justified delete should have run");
+}
+
+#[tokio::test]
+async fn bash_does_not_interfere_with_ordinary_commands() {
+    // If the gate fires on routine work it will be worked around, so this is a
+    // load-bearing test, not a formality.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workdir = temp.path().to_str().expect("utf8");
+    std::fs::create_dir_all(temp.path().join("build")).expect("build dir");
+
+    for command in ["echo hello", "rm -rf build", "ls -la"] {
+        BashTool::new()
+            .execute(serde_json::json!({ "command": command }), gate_ctx(workdir))
+            .await
+            .unwrap_or_else(|e| panic!("{command:?} should run untouched: {e}"));
+    }
+}
+
+#[tokio::test]
+async fn indirect_dispatch_paths_cannot_bypass_the_gate() {
+    // batch, and every other caller, dispatch through Tool::execute rather than
+    // reimplementing it, so the gate lives at the only chokepoint. Assert that
+    // directly: calling execute for a background job (the one path that returns
+    // early) is still gated.
+    let temp = tempfile::tempdir().expect("temp home");
+    let home = temp.path().to_string_lossy().to_string();
+    let previous = std::env::var("HOME").ok();
+    // SAFETY: single-threaded test setup; restored below.
+    unsafe { std::env::set_var("HOME", &home) };
+    let canary = temp.path().join("precious.txt");
+    std::fs::write(&canary, "user data").expect("canary");
+
+    let result = BashTool::new()
+        .execute(
+            serde_json::json!({
+                "command": format!("rm -rf {home}"),
+                "run_in_background": true,
+            }),
+            gate_ctx("/tmp"),
+        )
+        .await;
+
+    match previous {
+        Some(value) => unsafe { std::env::set_var("HOME", value) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+
+    assert!(
+        result.is_err(),
+        "background dispatch must be gated too, not just foreground"
+    );
+    assert!(canary.exists(), "the file must survive a backgrounded call");
 }

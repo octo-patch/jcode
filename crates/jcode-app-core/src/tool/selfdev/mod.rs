@@ -23,6 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 mod build_queue;
 mod launch;
 mod reload;
+mod setup;
 mod status;
 #[cfg(test)]
 mod tests;
@@ -30,6 +31,9 @@ mod tests;
 pub use launch::{enter_selfdev_session, schedule_selfdev_prompt_delivery};
 pub use reload::{ReloadRecoveryDirective, persisted_background_tasks_note};
 pub use status::selfdev_status_output;
+
+/// Public GitHub source used when cloning the jcode repository for self-dev.
+pub const JCODE_REPO_URL: &str = "https://github.com/1jehuang/jcode.git";
 
 #[derive(Debug, Deserialize)]
 struct SelfDevInput {
@@ -146,6 +150,8 @@ struct BuildRequest {
 }
 
 impl BuildRequest {
+    const DEFAULT_TERMINAL_HISTORY_LIMIT: usize = 256;
+
     fn requests_dir() -> Result<PathBuf> {
         let dir = storage::jcode_dir()?.join("selfdev-build-requests");
         storage::ensure_dir(&dir)?;
@@ -157,7 +163,76 @@ impl BuildRequest {
     }
 
     fn save(&self) -> Result<()> {
-        storage::write_json(&Self::path_for_request(&self.request_id)?, self)
+        storage::write_json(&Self::path_for_request(&self.request_id)?, self)?;
+        if self.is_terminal() {
+            // Queue polling runs twice per second and historically reparsed every
+            // request ever created. On a long-lived development machine that grew
+            // past 4,000 JSON files, wasting ~40-150 ms per poll. Preserve older
+            // diagnostics in an archive subdirectory while keeping the hot queue
+            // directory bounded.
+            let _ = Self::archive_old_terminal_requests();
+        }
+        Ok(())
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            BuildRequestState::Completed
+                | BuildRequestState::Superseded
+                | BuildRequestState::Failed
+                | BuildRequestState::Cancelled
+        )
+    }
+
+    fn terminal_history_limit() -> usize {
+        std::env::var("JCODE_SELFDEV_REQUEST_HISTORY_LIMIT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(Self::DEFAULT_TERMINAL_HISTORY_LIMIT)
+    }
+
+    fn archive_old_terminal_requests() -> Result<usize> {
+        let requests = Self::load_all()?;
+        Self::archive_terminal_requests(&requests)
+    }
+
+    fn archive_terminal_requests(requests: &[Self]) -> Result<usize> {
+        let limit = Self::terminal_history_limit();
+        let mut terminal = requests
+            .iter()
+            .filter(|request| request.is_terminal())
+            .cloned()
+            .collect::<Vec<_>>();
+        if terminal.len() <= limit {
+            return Ok(0);
+        }
+
+        terminal.sort_by(|a, b| {
+            b.requested_at
+                .cmp(&a.requested_at)
+                .then_with(|| b.request_id.cmp(&a.request_id))
+        });
+        let archive_dir = Self::requests_dir()?.join("archive");
+        storage::ensure_dir(&archive_dir)?;
+        let mut archived = 0;
+        for request in terminal.into_iter().skip(limit) {
+            let path = Self::path_for_request(&request.request_id)?;
+            if let Some(file_name) = path.file_name()
+                && path.exists()
+                && std::fs::rename(&path, archive_dir.join(file_name)).is_ok()
+            {
+                archived += 1;
+            }
+            let backup = path.with_extension("bak");
+            if let Some(file_name) = backup.file_name()
+                && backup.exists()
+            {
+                let _ = std::fs::rename(&backup, archive_dir.join(file_name));
+            }
+        }
+        Ok(archived)
     }
 
     fn load(request_id: &str) -> Result<Option<Self>> {
@@ -191,9 +266,14 @@ impl BuildRequest {
     }
 
     fn pending_requests() -> Result<Vec<Self>> {
+        // Compact legacy history before entering the 500 ms queue polling loop.
+        // Reuse this poll's loaded requests so history maintenance does not double
+        // the number of JSON files parsed on every pass.
+        let requests = Self::load_all()?;
+        let _ = Self::archive_terminal_requests(&requests);
         let mut pending = Vec::new();
 
-        for mut request in Self::load_all()? {
+        for mut request in requests {
             if !matches!(
                 request.state,
                 BuildRequestState::Queued | BuildRequestState::Building
@@ -274,13 +354,35 @@ impl BuildRequest {
         self.save()
     }
 
+    /// Freshly enqueued requests are saved *before* their background task id
+    /// and status file exist (the handler saves once, spawns the task, then
+    /// saves again with the task metadata). The spawned task itself - or any
+    /// concurrent `selfdev status` / queue poll - can reconcile in that window
+    /// and must not prune the request as stale, or the build dies instantly
+    /// with "Queued build request disappeared".
+    fn within_bootstrap_grace(&self) -> bool {
+        const BOOTSTRAP_GRACE_SECS: i64 = 30;
+        chrono::DateTime::parse_from_rfc3339(&self.requested_at)
+            .map(|requested| {
+                Utc::now().signed_duration_since(requested.with_timezone(&Utc))
+                    < chrono::Duration::seconds(BOOTSTRAP_GRACE_SECS)
+            })
+            .unwrap_or(false)
+    }
+
     fn reconcile_pending_state(&mut self) -> Result<bool> {
         let Some(task_id) = self.background_task_id.as_deref() else {
+            if self.within_bootstrap_grace() {
+                return Ok(true);
+            }
             self.mark_stale("Self-dev build request is missing its background task id.")?;
             return Ok(false);
         };
 
         let Some(status_path) = self.status_path() else {
+            if self.within_bootstrap_grace() {
+                return Ok(true);
+            }
             self.mark_stale("Self-dev build request is missing its task status path.")?;
             return Ok(false);
         };
@@ -290,6 +392,9 @@ impl BuildRequest {
         } else {
             None
         }) else {
+            if self.within_bootstrap_grace() {
+                return Ok(true);
+            }
             self.mark_stale(
                 "Background task status file is missing; pruning stale self-dev build request.",
             )?;
@@ -299,6 +404,16 @@ impl BuildRequest {
         match task_status.status {
             BackgroundTaskStatus::Running => {
                 if task_status.detached || background::global().is_live_task(task_id) {
+                    Ok(true)
+                } else if self.within_bootstrap_grace() {
+                    // The status file is written and the build future spawned
+                    // *before* the task is registered in the in-process task
+                    // map. The freshly spawned build task can reach this check
+                    // (via wait_for_turn) ahead of that registration, and
+                    // is_live_task also returns false while the map's write
+                    // lock is held. Without this grace the request marks
+                    // itself stale and the build fails with "queued build
+                    // request disappeared".
                     Ok(true)
                 } else {
                     self.mark_stale(
@@ -344,15 +459,17 @@ impl BuildRequest {
 }
 
 struct BuildLockGuard {
-    _file: std::fs::File,
+    file: Option<std::fs::File>,
     path: PathBuf,
 }
 
 type SelfDevBuildCommand = build::SelfDevBuildCommand;
 
-#[cfg(unix)]
 impl Drop for BuildLockGuard {
     fn drop(&mut self) {
+        // Windows does not allow deleting an open lock file. Close the handle
+        // before unlinking so self-dev builds do not leave a permanent lock.
+        self.file.take();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -364,6 +481,89 @@ impl SelfDevTool {
     pub fn new() -> Self {
         Self
     }
+
+    /// Description shown to the model, tailored to whether this is a self-dev
+    /// session. Outside self-dev mode the tool is an on-ramp (enter/setup/
+    /// reload/find-config); inside self-dev it manages builds and reloads.
+    pub fn description_for(is_selfdev: bool) -> &'static str {
+        if is_selfdev {
+            "Manage self-dev builds, tests, and reloads while working on jcode itself."
+        } else {
+            "Enter self-dev mode to work on jcode itself. Also sets up the dev \
+             environment, reloads jcode to a newer build, and locates jcode config/paths."
+        }
+    }
+
+    /// JSON schema advertised to the model, tailored to the session mode.
+    ///
+    /// Outside self-dev mode only the on-ramp actions are exposed
+    /// (`enter`, `setup`, `reload`, `find-config`, `status`). Inside a self-dev
+    /// session the full build/test/reload/socket surface is exposed.
+    pub fn schema_for(is_selfdev: bool) -> Value {
+        if is_selfdev {
+            json!({
+                "type": "object",
+                "properties": {
+                    "intent": super::intent_schema_property(),
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "enter",
+                            "setup",
+                            "build",
+                            "build-reload",
+                            "test",
+                            "cancel-build",
+                            "reload",
+                            "status",
+                            "find-config",
+                            "socket-info",
+                            "socket-help"
+                        ],
+                        "description": "Action. `build-reload` queues a build and, once it finishes successfully, reloads onto the new binary in one step."
+                    },
+                    "prompt": { "type": "string" },
+                    "context": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "target": {
+                        "type": "string",
+                        "enum": ["auto", "tui", "desktop", "desktop2", "all"],
+                        "description": "Build target for action=build. auto chooses from changed paths; tui builds jcode; desktop builds jcode-desktop; desktop2 builds jcode-desktop2; all builds every binary."
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command for action=test. Runs under the selfdev worktree compile lock."
+                    },
+                    "request_id": { "type": "string" },
+                    "task_id": { "type": "string" }
+                },
+                "required": ["action"]
+            })
+        } else {
+            json!({
+                "type": "object",
+                "properties": {
+                    "intent": super::intent_schema_property(),
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "enter",
+                            "setup",
+                            "reload",
+                            "status",
+                            "find-config"
+                        ],
+                        "description": "Action. `enter` spawns a self-dev session (optionally seeded with `prompt`); `setup` checks/installs the dev prerequisites (rust toolchain, git, repo clone); `reload` restarts jcode into a newer installed build; `status` shows build/version state; `find-config` locates jcode config and key paths."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Optional task to seed the spawned self-dev session when action=enter."
+                    }
+                },
+                "required": ["action"]
+            })
+        }
+    }
 }
 
 #[async_trait]
@@ -373,45 +573,17 @@ impl Tool for SelfDevTool {
     }
 
     fn description(&self) -> &str {
-        "Manage self-dev builds and reloads."
+        // Default to the non-self-dev (on-ramp) description. The agent's tool
+        // definition builder substitutes the self-dev description for canary
+        // sessions via `SelfDevTool::description_for`.
+        SelfDevTool::description_for(false)
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "intent": super::intent_schema_property(),
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "enter",
-                        "build",
-                        "test",
-                        "cancel-build",
-                        "reload",
-                        "status",
-                        "socket-info",
-                        "socket-help"
-                    ],
-                    "description": "Action."
-                },
-                "prompt": { "type": "string" },
-                "context": { "type": "string" },
-                "reason": { "type": "string" },
-                "target": {
-                    "type": "string",
-                    "enum": ["auto", "tui", "desktop", "all"],
-                    "description": "Build target for action=build. auto chooses from changed paths; tui builds jcode; desktop builds jcode-desktop; all builds both."
-                },
-                "command": {
-                    "type": "string",
-                    "description": "Shell command for action=test. Runs under the selfdev worktree compile lock."
-                },
-                "request_id": { "type": "string" },
-                "task_id": { "type": "string" }
-            },
-            "required": ["action"]
-        })
+        // Default to the non-self-dev (on-ramp) schema. The agent's tool
+        // definition builder substitutes the full self-dev schema for canary
+        // sessions via `SelfDevTool::schema_for`.
+        SelfDevTool::schema_for(false)
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
@@ -419,9 +591,30 @@ impl Tool for SelfDevTool {
         let action = params.action.clone();
 
         let title = format!("selfdev {}", action);
+        let is_selfdev = SelfDevTool::session_is_selfdev(&ctx.session_id);
 
         let result = match action.as_str() {
+            // Available in every session.
             "enter" => self.do_enter(params.prompt, &ctx).await,
+            "setup" => self.do_setup(&ctx).await,
+            "status" => self.do_status().await,
+            "find-config" => self.do_find_config(&ctx).await,
+            "reload" => {
+                if is_selfdev {
+                    self.do_reload(
+                        params.context,
+                        &ctx.session_id,
+                        ctx.execution_mode,
+                        ctx.working_dir.as_deref(),
+                    )
+                    .await
+                } else {
+                    self.do_reload_to_newer_build(&ctx).await
+                }
+            }
+
+            // Self-dev-only actions: building, testing, and low-level socket
+            // access only make sense once you are working on jcode itself.
             "build" => {
                 self.do_build(
                     params.reason,
@@ -431,6 +624,16 @@ impl Tool for SelfDevTool {
                     &ctx,
                 )
                 .await
+            }
+            "build-reload" | "build_reload" => {
+                if is_selfdev {
+                    self.do_build_reload(params.reason, params.target, params.context, &ctx)
+                        .await
+                } else {
+                    Ok(ToolOutput::new(SelfDevTool::selfdev_only_action_message(
+                        "build-reload",
+                    )))
+                }
             }
             "test" => {
                 self.do_test(
@@ -446,42 +649,29 @@ impl Tool for SelfDevTool {
                 self.do_cancel_build(params.request_id, params.task_id, &ctx)
                     .await
             }
-            "reload" => {
-                if !SelfDevTool::session_is_selfdev(&ctx.session_id) {
-                    Ok(ToolOutput::new(
-                        "`selfdev reload` is only available inside a self-dev session. Use `selfdev enter` first.",
-                    ))
-                } else {
-                    self.do_reload(
-                        params.context,
-                        &ctx.session_id,
-                        ctx.execution_mode,
-                        ctx.working_dir.as_deref(),
-                    )
-                    .await
-                }
-            }
-            "status" => self.do_status().await,
             "socket-info" => {
-                if !SelfDevTool::session_is_selfdev(&ctx.session_id) {
-                    Ok(ToolOutput::new(
-                        "`selfdev socket-info` is only available inside a self-dev session. Use `selfdev enter` first.",
-                    ))
-                } else {
+                if is_selfdev {
                     self.do_socket_info().await
+                } else {
+                    Ok(ToolOutput::new(SelfDevTool::selfdev_only_action_message(
+                        "socket-info",
+                    )))
                 }
             }
             "socket-help" => {
-                if !SelfDevTool::session_is_selfdev(&ctx.session_id) {
-                    Ok(ToolOutput::new(
-                        "`selfdev socket-help` is only available inside a self-dev session. Use `selfdev enter` first.",
-                    ))
-                } else {
+                if is_selfdev {
                     self.do_socket_help().await
+                } else {
+                    Ok(ToolOutput::new(SelfDevTool::selfdev_only_action_message(
+                        "socket-help",
+                    )))
                 }
             }
             _ => Ok(ToolOutput::new(format!(
-                "Unknown action: {}. Use 'enter', 'build', 'test', 'cancel-build', 'reload', 'status', 'socket-info', or 'socket-help'.",
+                "Unknown action: {}. In a self-dev session use 'enter', 'setup', 'build', \
+                 'build-reload', 'test', 'cancel-build', 'reload', 'status', 'find-config', \
+                 'socket-info', or 'socket-help'. Outside self-dev mode use 'enter', 'setup', \
+                 'reload', 'status', or 'find-config'.",
                 action
             ))),
         };
@@ -508,10 +698,32 @@ impl SelfDevTool {
             .unwrap_or(15)
     }
 
+    /// How long `build-reload` waits inline for the queued build (and any
+    /// builds ahead of it in the queue) to finish before giving up and telling
+    /// the agent to reload manually.
+    fn build_reload_wait_secs() -> u64 {
+        std::env::var("JCODE_SELFDEV_BUILD_WAIT_SECS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(1800)
+    }
+
     fn session_is_selfdev(session_id: &str) -> bool {
         session::Session::load(session_id)
             .map(|session| session.is_canary)
             .unwrap_or(false)
+    }
+
+    /// Guidance returned when a self-dev-only action is requested from a regular
+    /// session. Points the agent at `selfdev enter` to get the full toolset.
+    fn selfdev_only_action_message(action: &str) -> String {
+        format!(
+            "`selfdev {action}` is only available inside a self-dev session. \
+             Run `selfdev enter` first (optionally with a `prompt`) to open a \
+             self-dev session, which exposes builds, tests, reloads, and the \
+             debug socket."
+        )
     }
 
     fn resolve_repo_dir(working_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
@@ -556,7 +768,10 @@ impl SelfDevTool {
             .open(&path)?;
         let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if ret == 0 {
-            Ok(Some(BuildLockGuard { _file: file, path }))
+            Ok(Some(BuildLockGuard {
+                file: Some(file),
+                path,
+            }))
         } else {
             Ok(None)
         }
@@ -568,7 +783,10 @@ impl SelfDevTool {
 
         let path = Self::build_lock_path(worktree_scope)?;
         match OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(file) => Ok(Some(BuildLockGuard { _file: file, path })),
+            Ok(file) => Ok(Some(BuildLockGuard {
+                file: Some(file),
+                path,
+            })),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(err) => Err(err.into()),
         }

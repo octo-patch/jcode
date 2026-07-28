@@ -120,3 +120,51 @@ fn test_extract_ws_auth_rejects_conflicting_sources() {
         .expect("request");
     assert!(extract_ws_auth(&request).is_err());
 }
+
+#[test]
+fn test_find_header_end() {
+    assert_eq!(
+        super::find_header_end(b"POST /pair HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"),
+        Some(38)
+    );
+    assert_eq!(
+        super::find_header_end(b"POST /pair HTTP/1.1\r\nContent-"),
+        None
+    );
+    assert_eq!(super::find_header_end(b""), None);
+}
+
+#[test]
+fn test_authorize_ws_device_valid_token() {
+    let mut registry = DeviceRegistry::default();
+    let token = registry.pair_device("dev-1".to_string(), "iPhone".to_string(), None);
+
+    let device = auth::authorize_ws_device(&registry, &token).expect("valid token authorizes");
+    assert_eq!(device.name, "iPhone");
+    assert_eq!(device.id, "dev-1");
+}
+
+#[test]
+fn test_authorize_ws_device_rejects_unknown_and_revoked_with_401() {
+    let mut registry = DeviceRegistry::default();
+    let token = registry.pair_device("dev-1".to_string(), "iPhone".to_string(), None);
+
+    // Unknown token -> 401 at handshake time.
+    let unknown = "a".repeat(64);
+    let err =
+        auth::authorize_ws_device(&registry, &unknown).expect_err("unknown token must be rejected");
+    assert_eq!(err.status(), 401);
+    assert!(
+        err.body()
+            .as_deref()
+            .unwrap_or_default()
+            .contains("re-pair"),
+        "401 body should tell the client to re-pair"
+    );
+
+    // Revoked device -> same 401 path.
+    registry.devices.retain(|d| d.id != "dev-1");
+    let err =
+        auth::authorize_ws_device(&registry, &token).expect_err("revoked token must be rejected");
+    assert_eq!(err.status(), 401);
+}

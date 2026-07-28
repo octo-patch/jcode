@@ -23,7 +23,15 @@ fn display_message_from_stored_message(
             Some(DisplayMessage::background_task(text))
         }
         None => match message.role {
-            Role::User => Some(DisplayMessage::user(text)),
+            Role::User => {
+                // Synthetic auto-poke continuations are persisted as user
+                // turns for the model but must not display as user prompts.
+                if crate::todo::is_auto_poke_message(&text) {
+                    Some(DisplayMessage::system(text))
+                } else {
+                    Some(DisplayMessage::user(text))
+                }
+            }
             Role::Assistant => Some(DisplayMessage::assistant(text)),
         },
     }
@@ -33,7 +41,9 @@ fn stored_message_visible_text(message: &crate::session::StoredMessage) -> Strin
     let mut parts = Vec::new();
     for block in &message.content {
         match block {
-            ContentBlock::Text { text, .. } | ContentBlock::Reasoning { text } => {
+            ContentBlock::Text { text, .. }
+            | ContentBlock::Reasoning { text }
+            | ContentBlock::ReasoningTrace { text } => {
                 if !text.trim().is_empty() {
                     parts.push(text.trim().to_string());
                 }
@@ -63,8 +73,22 @@ impl App {
             return;
         }
         let is_tool = message.role == "tool";
+        // Track the trailing run of assistant messages so a provider
+        // RetryRollback can remove exactly the current attempt's committed
+        // output. Any non-assistant message (user/tool/system) is a fence: it
+        // proves earlier assistant messages belong to completed work.
+        if message.role == "assistant" {
+            self.attempt_committed_assistant_messages += 1;
+        } else {
+            self.attempt_committed_assistant_messages = 0;
+        }
+        // Maintain the cached display-message counters incrementally for this
+        // single append, then bump the version without a full O(M) rescan.
+        // Appending is the hot path; rescanning every append was O(M^2) over a
+        // long session.
+        self.adjust_display_message_stats(&message, true);
         self.display_messages.push(message);
-        self.bump_display_messages_version();
+        self.bump_display_messages_version_no_stats();
         if is_tool && self.diff_mode.has_side_pane() && self.diff_pane_auto_scroll {
             self.diff_pane_scroll = usize::MAX;
         }
@@ -73,6 +97,7 @@ impl App {
     pub(super) fn replace_display_messages(&mut self, mut messages: Vec<DisplayMessage>) {
         compact_display_messages_for_storage(&mut messages);
         self.display_messages = messages;
+        self.attempt_committed_assistant_messages = 0;
         self.sync_compacted_history_lazy_from_display_messages();
         self.bump_display_messages_version();
         self.note_runtime_memory_event_force("display_messages_replaced", "display_history_reset");
@@ -334,6 +359,10 @@ impl App {
 
     pub(super) fn clear_display_messages(&mut self) {
         self.compacted_history_lazy = CompactedHistoryLazyState::default();
+        // The transcript is about to be discarded; forget where the live reasoning
+        // block started so a stale offset can't slice the new stream.
+        self.reasoning_block_start = None;
+        self.turn_reasoning_traces.clear();
         if !self.display_messages.is_empty() {
             self.display_messages.clear();
             self.bump_display_messages_version();
@@ -352,6 +381,7 @@ impl App {
         compact_display_messages_for_storage(&mut messages);
         self.display_messages = messages;
         self.remote_side_pane_images = images;
+        self.invalidate_side_pane_images_signature();
         self.compacted_history_lazy = CompactedHistoryLazyState {
             total_messages,
             visible_messages,
@@ -360,7 +390,14 @@ impl App {
             pending_request_visible: None,
         };
         self.auto_scroll_paused = true;
-        self.scroll_offset = 0;
+        // Older messages are prepended above the current view. If the reader had
+        // an anchor captured (they scrolled up to trigger this load), leave the
+        // scroll position for the next render to resolve so the content under
+        // them stays put instead of teleporting to the new absolute top. Only
+        // fall back to the top when there is no anchor to honor.
+        if self.pending_history_anchor.is_none() {
+            self.scroll_offset = 0;
+        }
         self.bump_display_messages_version();
         self.note_runtime_memory_event_force(
             "compacted_history_loaded",
@@ -376,11 +413,77 @@ impl App {
         }
     }
 
+    /// Number of wrapped lines from the top of the chat viewport that should be
+    /// treated as the "near the top" zone that proactively loads older history.
+    /// Prefetching roughly one viewport ahead means scrolling up keeps flowing
+    /// instead of stalling at a hard wall and then jumping.
+    fn compacted_history_prefetch_threshold(&self) -> usize {
+        let viewport = crate::tui::ui::last_layout_snapshot()
+            .map(|layout| layout.messages_area.height as usize)
+            .unwrap_or(0);
+        // Trigger when within ~one viewport of the top, with a small floor so the
+        // behavior is sensible even before the first layout snapshot exists.
+        viewport.max(COMPACTED_HISTORY_LOAD_SCROLL_THRESHOLD)
+    }
+
+    /// Capture a viewport anchor describing the reader's current distance from
+    /// the bottom of the transcript, plus any leftover upward scroll intent that
+    /// could not be satisfied because the view was already at the top of the
+    /// currently-loaded content. The next render that includes the newly loaded
+    /// (prepended) history resolves this back into an absolute `scroll_offset`,
+    /// keeping the content under the reader stable across the load.
+    pub(super) fn capture_history_anchor(&mut self, overshoot: usize) {
+        // Don't clobber an anchor that is still waiting to be resolved; the
+        // original distance-from-bottom remains correct across further prepends.
+        if self.pending_history_anchor.is_some() {
+            return;
+        }
+        let total = crate::tui::ui::last_total_wrapped_lines();
+        if total == 0 {
+            return;
+        }
+        // The top of the viewport currently sits at absolute line `scroll_offset`
+        // within the pre-prepend transcript (length `total`). Its distance from
+        // the bottom is invariant when older lines are prepended, so capture it
+        // (plus any unsatisfied upward intent as `overshoot`) and let the next
+        // render map it back to an absolute offset against the larger total.
+        let scroll = self.scroll_offset.min(total);
+        let lines_from_bottom = total.saturating_sub(scroll).saturating_add(overshoot);
+        self.pending_history_anchor = Some(super::HistoryScrollAnchor {
+            lines_from_bottom,
+            base_total: total,
+        });
+    }
+
+    /// Adopt a resolved history anchor once a frame containing the newly loaded
+    /// content has rendered. Returns true when the scroll position changed.
+    pub(super) fn reconcile_history_anchor(&mut self) -> bool {
+        let Some(anchor) = self.pending_history_anchor else {
+            return false;
+        };
+        let total = crate::tui::ui::last_total_wrapped_lines();
+        // Wait until a frame with the prepended content has actually rendered
+        // (its total wrapped-line count differs from the captured base).
+        if total == 0 || total == anchor.base_total {
+            return false;
+        }
+        let resolved = crate::tui::ui::last_resolved_chat_scroll();
+        self.pending_history_anchor = None;
+        let changed = self.scroll_offset != resolved || !self.auto_scroll_paused;
+        self.scroll_offset = resolved;
+        self.auto_scroll_paused = true;
+        changed
+    }
+
     pub(super) fn maybe_queue_compacted_history_load(&mut self) {
+        self.maybe_queue_compacted_history_load_with_overshoot(0);
+    }
+
+    pub(super) fn maybe_queue_compacted_history_load_with_overshoot(&mut self, overshoot: usize) {
         if !self.auto_scroll_paused {
             return;
         }
-        if self.scroll_offset > COMPACTED_HISTORY_LOAD_SCROLL_THRESHOLD {
+        if self.scroll_offset > self.compacted_history_prefetch_threshold() {
             return;
         }
         if self.compacted_history_lazy.remaining_messages == 0 {
@@ -393,6 +496,12 @@ impl App {
         {
             return;
         }
+        // Throttle to one chunk per settled frame: while an anchor is still
+        // waiting to resolve on screen, hold off so prepends never compound into
+        // a visible jump.
+        if self.pending_history_anchor.is_some() {
+            return;
+        }
 
         let next_visible = self
             .compacted_history_lazy
@@ -402,6 +511,9 @@ impl App {
         if next_visible <= self.compacted_history_lazy.visible_messages {
             return;
         }
+
+        // Anchor the viewport before mutating so the prepend stays seamless.
+        self.capture_history_anchor(overshoot);
 
         if self.is_remote {
             self.compacted_history_lazy.pending_request_visible = Some(next_visible);
@@ -416,6 +528,12 @@ impl App {
 
     pub(super) fn take_pending_compacted_history_load(&mut self) -> Option<usize> {
         self.compacted_history_lazy.pending_request_visible.take()
+    }
+
+    /// Whether there are older compacted-history messages not yet loaded into the
+    /// display transcript.
+    pub(super) fn compacted_history_has_remaining(&self) -> bool {
+        self.compacted_history_lazy.remaining_messages > 0
     }
 
     pub(super) fn restore_pending_compacted_history_load(&mut self, visible_messages: usize) {

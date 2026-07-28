@@ -357,6 +357,7 @@ pub(in crate::tui::app) async fn connect_with_retry(
     event_stream: &mut EventStream,
     state: &mut RemoteRunState,
     session_to_resume: Option<&str>,
+    remote_working_dir: Option<&str>,
 ) -> Result<ConnectOutcome> {
     if let Some(outcome) =
         wait_for_reload_handoff_before_reconnect(app, terminal, event_stream, state).await?
@@ -373,6 +374,7 @@ pub(in crate::tui::app) async fn connect_with_retry(
         Some(client_instance_id.as_str()),
         client_has_local_history,
         allow_session_takeover,
+        remote_working_dir,
     );
     crate::logging::info(&format!(
         "Remote reconnect attempt: resume={:?}, reconnect_attempts={}, client_instance_id={}, local_history={}, allow_takeover={}",
@@ -601,10 +603,11 @@ pub(in crate::tui::app) async fn handle_post_connect<B: ratatui::backend::Backen
             terminal
                 .draw(|frame| crate::tui::ui::draw(frame, app))
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let session_id = app
-                .remote_session_id
-                .clone()
-                .unwrap_or_else(|| crate::id::new_id("ses"));
+            // Resolve the real session id (see `reload_handoff_session_id`):
+            // prefer the live id, then a deferred-history id, then the launch
+            // resume target, and only fabricate as a last resort. Fabricating
+            // eagerly here was the root cause of issue #328.
+            let session_id = app.reload_handoff_session_id();
             if (has_reload_ctx_for_session || !app.reload_info.is_empty())
                 && let Ok(jcode_dir) = crate::storage::jcode_dir()
             {
@@ -695,10 +698,17 @@ pub(in crate::tui::app) async fn handle_post_connect<B: ratatui::backend::Backen
         );
         remote.mark_history_loaded();
         app.clear_remote_startup_phase();
+        app.clear_remote_history_wait();
     } else if !remote.has_loaded_history() {
         app.set_remote_startup_phase(super::super::RemoteStartupPhase::LoadingSession);
+        // Start a fresh history-recovery budget for this connection so the
+        // watchdog can re-request the bootstrap History payload if it never
+        // arrives (otherwise the session is stuck on "loading session…" until
+        // the user runs /restart).
+        app.begin_remote_history_wait();
     } else {
         app.clear_remote_startup_phase();
+        app.clear_remote_history_wait();
     }
 
     // Dispatch restored work once the server history is in place. This must

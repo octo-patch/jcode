@@ -11,6 +11,7 @@ pub struct ContextSnapshot {
 pub mod backend;
 pub(crate) mod color_support;
 mod core;
+pub(crate) mod fuzzy;
 // Terminal image display + metadata helpers now live in the dependency-free
 // `jcode-terminal-image` crate (shared with the `read` tool). Re-exported here
 // so existing `crate::tui::image` / `crate::tui::image_metadata` paths keep working.
@@ -19,18 +20,32 @@ use jcode_terminal_image::metadata as image_metadata;
 pub mod info_widget;
 mod info_widget_layout;
 mod info_widget_overview;
-mod keybind;
+mod info_widget_settle;
+pub mod info_widget_stability;
+pub mod keybind;
 mod layout_utils;
 pub mod login_picker;
 pub mod markdown;
 mod memory_profile;
 pub mod mermaid;
-pub mod permissions;
+pub mod permissions {
+    pub use jcode_tui_permissions::*;
+}
+mod redraw_schedule;
+#[allow(unused_imports)]
+pub(crate) use redraw_schedule::{
+    REDRAW_DEEP_IDLE, REDRAW_DEEP_IDLE_AFTER, REDRAW_IDLE, REDRAW_PASSIVE_LIVENESS,
+    REDRAW_REMOTE_STARTUP, REDRAW_SWARM_SPINNER, idle_donut_active, last_full_frame_redraw_reason,
+    periodic_redraw_required, periodic_redraw_required_excluding_idle_animation, redraw_interval,
+    redraw_interval_with_policy,
+};
 mod remote_diff;
 pub mod screenshot;
+pub(crate) mod session_facts;
 pub mod session_picker;
 mod stream_buffer;
 pub mod test_harness;
+pub mod theme_detect;
 mod ui;
 mod ui_diff;
 pub mod usage_overlay;
@@ -111,8 +126,53 @@ pub fn disable_keyboard_enhancement() {
     );
 }
 
+/// Hash a rendered image's transcript anchor into `hasher`. Shared by the
+/// default and `App` implementations of `side_pane_images_signature` so both
+/// stay in lockstep.
+pub(crate) fn hash_rendered_image_anchor(
+    anchor: Option<&crate::session::RenderedImageAnchor>,
+    hasher: &mut impl std::hash::Hasher,
+) {
+    use std::hash::Hash;
+    match anchor {
+        None => 0u8.hash(hasher),
+        Some(crate::session::RenderedImageAnchor::ToolCall { id }) => {
+            1u8.hash(hasher);
+            id.hash(hasher);
+        }
+        Some(crate::session::RenderedImageAnchor::UserPrompt { ordinal }) => {
+            2u8.hash(hasher);
+            ordinal.hash(hasher);
+        }
+    }
+}
+
+/// Hash every field that affects inline image rendering. The production App
+/// memoizes this signature until its image set changes, so exact payload hashing
+/// happens on image updates rather than during scrolling. Correctness matters
+/// here: sampling can miss a same-length change and reuse a stale prepared frame.
+pub(crate) fn hash_rendered_image_signature_fields(
+    image: &crate::session::RenderedImage,
+    hasher: &mut impl std::hash::Hasher,
+) {
+    use std::hash::Hash;
+
+    image.media_type.hash(hasher);
+    image.data.hash(hasher);
+    image.label.hash(hasher);
+    hash_rendered_image_anchor(image.anchor.as_ref(), hasher);
+}
+
 /// Trait for TUI state consumed by the shared renderer.
+///
+/// This is a wide (114-method) presentation interface: the read-only surface the
+/// renderer needs from `App`. The methods are grouped into the domain sections
+/// below (transcript, input, scroll, stream/status, provider, session/server,
+/// workspace, diagram pane, diff pane, side panel, inline, overlay, copy
+/// selection, onboarding, misc). See `docs/TUISTATE_TRAIT_DECOMPOSITION.md` for
+/// the incremental plan to split these into composable sub-traits.
 pub trait TuiState {
+    // ---- Transcript ----
     fn display_messages(&self) -> &[DisplayMessage];
     fn display_user_message_count(&self) -> usize;
     /// Number of user prompts hidden before the first visible message because of
@@ -122,9 +182,25 @@ pub trait TuiState {
     }
     fn has_display_edit_tool_messages(&self) -> bool;
     fn side_pane_images(&self) -> Vec<crate::session::RenderedImage>;
+    /// Cheap signature of the current inline-image set: `(count, content_hash)`.
+    /// Used by the prepared-frame cache so the inline image section invalidates
+    /// when images are added/removed without cloning the payloads every frame.
+    /// The default implementation derives it from `side_pane_images`; overrides
+    /// can provide a cheaper path.
+    fn side_pane_images_signature(&self) -> (usize, u64) {
+        use std::hash::Hasher;
+        let images = self.side_pane_images();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for image in &images {
+            hash_rendered_image_signature_fields(image, &mut hasher);
+        }
+        (images.len(), hasher.finish())
+    }
     /// Version counter for display_messages (monotonic, increments on mutation)
     fn display_messages_version(&self) -> u64;
     fn streaming_text(&self) -> &str;
+
+    // ---- Input ----
     fn input(&self) -> &str;
     fn cursor_pos(&self) -> usize;
     fn is_processing(&self) -> bool;
@@ -132,14 +208,44 @@ pub trait TuiState {
     fn interleave_message(&self) -> Option<&str>;
     /// Messages sent as soft interrupt but not yet injected (shown in queue preview)
     fn pending_soft_interrupts(&self) -> &[String];
+
+    // ---- Scroll ----
     fn scroll_offset(&self) -> usize;
     /// Whether auto-scroll to bottom is paused (user scrolled up during streaming)
     fn auto_scroll_paused(&self) -> bool;
+    /// When older compacted history is being loaded in, this is the reader's
+    /// captured distance (in wrapped lines) from the bottom of the transcript.
+    /// The renderer uses it to keep the viewport anchored to the same content as
+    /// older messages are prepended above, instead of snapping to the new top.
+    fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
+        None
+    }
     /// Whether the elastic overscroll status line (revealed by scrolling past
     /// the bottom of the transcript) is currently shown.
     fn chat_overscroll_active(&self) -> bool {
         false
     }
+    /// Whether the overscroll status line is pinned permanently visible by
+    /// config (`display.overscroll_status = "on"`). A pinned line is part of
+    /// the stable layout, unlike the transient elastic reveal.
+    fn chat_overscroll_pinned(&self) -> bool {
+        false
+    }
+    /// Seconds remaining in the overscroll dwell window, used to render the
+    /// `(overscroll x.x)` countdown. `None` when not shown.
+    fn chat_overscroll_remaining(&self) -> Option<f32> {
+        None
+    }
+    /// Whether a mouse drag-selection is currently held at the top/bottom edge of
+    /// a pane and should keep auto-scrolling on every tick (browser-style). When
+    /// true the redraw loop must stay responsive even if the transcript is
+    /// otherwise idle, since the terminal sends no further events while the mouse
+    /// is held still.
+    fn copy_selection_edge_autoscroll_active(&self) -> bool {
+        false
+    }
+
+    // ---- Provider ----
     fn provider_name(&self) -> String;
     fn provider_model(&self) -> String;
     /// Upstream provider (e.g., which provider OpenRouter routed to)
@@ -150,14 +256,47 @@ pub trait TuiState {
     fn status_detail(&self) -> Option<String>;
     fn mcp_servers(&self) -> Vec<(String, usize)>;
     fn available_skills(&self) -> Vec<String>;
+    /// Authoritative active credential (OAuth vs API key) for a dual-auth
+    /// provider, as resolved from the live provider / remote server rather than
+    /// from the `JCODE_RUNTIME_PROVIDER` env var. The header must prefer this
+    /// over its own env-based heuristic: the TUI client process often does not
+    /// inherit `JCODE_RUNTIME_PROVIDER` (it is set inside the agent/server
+    /// process), so the env heuristic silently falls back to "auto prefers
+    /// OAuth" and the header claimed OAuth while the info widget correctly
+    /// reported an API key. Returns `None` when the credential cannot be
+    /// determined, in which case callers fall back to the cached `AuthStatus`.
+    fn active_dual_credential(
+        &self,
+        _provider: jcode_provider_core::ActiveProvider,
+    ) -> Option<crate::auth::ActiveCredential> {
+        None
+    }
+
+    // ---- Stream / status ----
     fn streaming_tokens(&self) -> (u64, u64);
     fn streaming_cache_tokens(&self) -> (Option<u64>, Option<u64>);
     /// Output tokens per second during streaming (for status bar)
     fn output_tps(&self) -> Option<f32>;
     fn streaming_tool_calls(&self) -> Vec<ToolCall>;
     fn elapsed(&self) -> Option<Duration>;
+    /// Time since the current connection phase (authenticating/connecting/
+    /// waiting for response/retrying) began. Used to decide when a connection
+    /// attempt has been suspiciously long and should render yellow, measured
+    /// per-attempt rather than inheriting the whole-turn elapsed time. Defaults
+    /// to `elapsed()` for impls that do not track per-phase timing.
+    fn connection_phase_elapsed(&self) -> Option<Duration> {
+        self.elapsed()
+    }
     fn status(&self) -> ProcessingStatus;
     fn command_suggestions(&self) -> Vec<(String, &'static str)>;
+    /// Invalidate any per-frame memo backing [`Self::command_suggestions`].
+    ///
+    /// Called once at the top of each rendered frame. The suggestion list is
+    /// read many times while composing a single frame; implementations may
+    /// cache within a frame but must not serve that cache across frames, since
+    /// the list also depends on mutable session state. Defaults to a no-op for
+    /// impls that do not cache.
+    fn advance_command_suggestions_epoch(&self) {}
     fn command_suggestion_selected(&self) -> usize {
         0
     }
@@ -166,6 +305,12 @@ pub trait TuiState {
     /// Progress of a currently-running batch tool call.
     fn batch_progress(&self) -> Option<crate::bus::BatchProgress>;
     fn time_since_activity(&self) -> Option<Duration>;
+    /// Whether the client terminal currently has focus. Decorative animations and
+    /// periodic idle redraws pause while unfocused so backgrounded windows/tabs do
+    /// not burn CPU. Defaults to true for state impls that do not track focus.
+    fn client_focused(&self) -> bool {
+        true
+    }
     /// Whether the provider/server has ended the visible assistant message while turn cleanup
     /// still finishes in the background.
     fn stream_message_ended(&self) -> bool {
@@ -177,6 +322,8 @@ pub trait TuiState {
     fn session_compaction_count(&self) -> usize {
         0
     }
+
+    // ---- Session / server ----
     /// Whether running in remote (client-server) mode
     fn is_remote_mode(&self) -> bool;
     /// Whether running in canary/self-dev mode
@@ -193,12 +340,27 @@ pub trait TuiState {
     fn server_display_name(&self) -> Option<String>;
     /// Server icon (e.g., "🔥", "🌫️") - only set in remote mode
     fn server_display_icon(&self) -> Option<String>;
+    /// Server binary version (e.g., "v0.25.19-dev (abc1234)") - remote mode only
+    fn server_display_version(&self) -> Option<String> {
+        None
+    }
     /// List of all session IDs on the server (remote mode only)
     fn server_sessions(&self) -> Vec<String>;
     /// Number of connected clients (remote mode only)
     fn connected_clients(&self) -> Option<usize>;
     /// Short-lived notice shown in the status line (e.g., model switch, toggle diff)
     fn status_notice(&self) -> Option<String>;
+    /// Distinct learned-keybinding nudge shown in its own pop-out color, e.g.
+    /// "you usually do X the slow way, press <key>". Separate from
+    /// [`status_notice`] so the UI can style it differently.
+    fn learn_hint(&self) -> Option<String> {
+        None
+    }
+    /// Inline hotkey feedback: "you just pressed X → does Y" for rarely-used
+    /// known chords, or "X isn't bound · nearest ..." for unknown chords.
+    fn hotkey_feedback(&self) -> Option<String> {
+        None
+    }
     /// First-use experimental feature warning for the currently active operation.
     fn active_experimental_feature_notice(&self) -> Option<String> {
         None
@@ -236,12 +398,50 @@ pub trait TuiState {
     }
     /// Context window limit in tokens (if known)
     fn context_limit(&self) -> Option<usize>;
+    /// Whether floating information widgets should be drawn for this state.
+    /// Implementations normally use the default; deterministic render fixtures
+    /// can suppress overlays without mutating process-global widget settings.
+    fn info_widget_overlays_enabled(&self) -> bool {
+        true
+    }
     /// Whether a newer client binary is available
     fn client_update_available(&self) -> bool;
     /// Whether a newer server binary is available (remote mode)
     fn server_update_available(&self) -> Option<bool>;
     /// Get info widget data (todos, client count, etc.)
     fn info_widget_data(&self) -> info_widget::InfoWidgetData;
+
+    /// Whether the inline swarm gallery band should be shown above the chat.
+    /// Active when `agents.swarm_spawn_mode = inline` and the swarm has members.
+    fn inline_swarm_gallery_active(&self) -> bool {
+        false
+    }
+    /// Members to render in the inline swarm gallery band.
+    fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+        Vec::new()
+    }
+    /// Members available for cards embedded beneath swarm spawn tool calls.
+    ///
+    /// This may be broader than `inline_swarm_members`: the gallery is scoped by
+    /// the current ownership tree, while a transcript card can be matched safely
+    /// using the exact spawned session ID recorded in the tool result.
+    fn swarm_members_for_transcript(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+        self.inline_swarm_members()
+    }
+    /// Selected agent index in the inline swarm panel (display order).
+    fn swarm_panel_selected(&self) -> usize {
+        0
+    }
+    /// Whether the inline swarm panel currently has keyboard focus.
+    fn swarm_panel_focused(&self) -> bool {
+        false
+    }
+    /// Whether the live swarm page currently replaces the transcript viewport.
+    fn swarm_panel_full_page(&self) -> bool {
+        false
+    }
+
+    // ---- Workspace ----
     /// Whether workspace mode is enabled for this client.
     fn workspace_mode_enabled(&self) -> bool {
         false
@@ -264,6 +464,7 @@ pub trait TuiState {
     /// Update cost calculation based on token usage (for API-key providers)
     fn update_cost(&mut self);
     /// Diagram display mode (none/margin/pinned)
+    // ---- Diagram pane ----
     fn diagram_mode(&self) -> crate::config::DiagramDisplayMode;
     /// Whether the diagram pane is focused (pinned mode)
     fn diagram_focus(&self) -> bool;
@@ -273,6 +474,8 @@ pub trait TuiState {
     fn diagram_scroll(&self) -> (i32, i32);
     /// Diagram pane width ratio percentage
     fn diagram_pane_ratio(&self) -> u8;
+    /// Whether the user has manually resized the diagram/side pane width.
+    fn diagram_pane_ratio_user_adjusted(&self) -> bool;
     /// Whether the diagram pane ratio is currently animating
     fn diagram_pane_animating(&self) -> bool;
     /// Whether the pinned diagram pane is visible
@@ -282,6 +485,7 @@ pub trait TuiState {
     /// Diagram zoom percentage (100 = normal)
     fn diagram_zoom(&self) -> u8;
     /// Scroll offset for pinned diff pane (line index)
+    // ---- Diff pane ----
     fn diff_pane_scroll(&self) -> usize;
     /// Horizontal pan offset for the shared right pane (side-panel diagrams)
     fn diff_pane_scroll_x(&self) -> i32;
@@ -290,9 +494,26 @@ pub trait TuiState {
     /// Whether the pinned diff pane is focused
     fn diff_pane_focus(&self) -> bool;
     /// Session-scoped side panel state managed by the side_panel tool
+    // ---- Side panel ----
     fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot;
     /// Whether to pin read images to a side pane
     fn pin_images(&self) -> bool;
+    /// Whether inline transcript images render expanded. When false, each
+    /// image collapses to a one-line label stub with a `show image` badge.
+    /// Persisted across restarts/resume via UI preferences.
+    fn inline_images_visible(&self) -> bool {
+        true
+    }
+    /// Per-image inline expand level for `image_id` (Fit when never expanded).
+    /// Cycled by clicking the per-image `expand` badge.
+    fn image_expand_level(&self, _image_id: u64) -> ImageExpandLevel {
+        ImageExpandLevel::Fit
+    }
+    /// Monotonic counter bumped whenever any image's expand level changes, so
+    /// prepared-frame caches that embed anchored image geometry invalidate.
+    fn expanded_images_version(&self) -> u64 {
+        0
+    }
     /// Remaining seconds before the pinned image side pane auto-hides.
     fn pinned_images_auto_hide_remaining_secs(&self) -> Option<u64> {
         None
@@ -304,6 +525,7 @@ pub trait TuiState {
     /// Whether to wrap lines in the pinned diff pane
     fn diff_line_wrap(&self) -> bool;
     /// Interactive inline UI state (picker-like flows shown above input)
+    // ---- Inline ----
     fn inline_interactive_state(&self) -> Option<&InlineInteractiveState>;
     /// Passive inline UI state (informational views shown above input)
     fn inline_view_state(&self) -> Option<&InlineViewState> {
@@ -316,6 +538,7 @@ pub trait TuiState {
             .or_else(|| self.inline_view_state().map(InlineUiStateRef::View))
     }
     /// Changelog overlay scroll offset (None = not showing)
+    // ---- Overlay ----
     fn changelog_scroll(&self) -> Option<usize>;
     /// Help overlay scroll offset (None = not showing)
     fn help_scroll(&self) -> Option<usize>;
@@ -332,10 +555,16 @@ pub trait TuiState {
     /// Usage overlay for /usage command
     fn usage_overlay(&self) -> Option<&std::cell::RefCell<usage_overlay::UsageOverlay>>;
     /// Working directory for this session
+    // ---- Misc ----
     fn working_dir(&self) -> Option<String>;
+    /// Current git branch of the working directory, if in a repo.
+    fn git_branch(&self) -> Option<String> {
+        None
+    }
     /// Monotonic clock for viewport animations
     fn now_millis(&self) -> u64;
     /// UI state for live copy badge highlighting / feedback
+    // ---- Copy selection ----
     fn copy_badge_ui(&self) -> crate::tui::CopyBadgeUiState;
     /// Whether modal in-app copy selection mode is active.
     fn copy_selection_mode(&self) -> bool;
@@ -344,6 +573,7 @@ pub trait TuiState {
     /// Persistent status for in-app copy selection mode.
     fn copy_selection_status(&self) -> Option<CopySelectionStatus>;
     /// Whether the first-run onboarding empty state is being previewed in this session.
+    // ---- Onboarding ----
     fn onboarding_preview_mode(&self) -> bool {
         false
     }
@@ -376,6 +606,12 @@ pub trait TuiState {
         if self.status_notice().is_some() {
             return true;
         }
+        if self.learn_hint().is_some() {
+            return true;
+        }
+        if self.hotkey_feedback().is_some() {
+            return true;
+        }
         if self.has_stashed_input() {
             return true;
         }
@@ -385,7 +621,7 @@ pub trait TuiState {
                 return true;
             }
             if let Some(cache_info) = self.cache_ttl_status()
-                && (cache_info.is_cold || cache_info.remaining_secs <= 60)
+                && (cache_info.is_cold || cache_info.expiring_soon())
             {
                 return true;
             }
@@ -402,7 +638,10 @@ pub fn debug_copy_selection_text_for_bench(range: CopySelectionRange) -> Option<
 pub(crate) fn connection_type_icon(connection_type: Option<&str>) -> Option<&'static str> {
     let normalized = connection_type?.trim().to_ascii_lowercase();
     if normalized.contains("websocket") || normalized == "ws" || normalized == "wss" {
-        Some("🕸️")
+        // 🔌 is a single emoji-default codepoint. The previous 🕸️ (U+1F578 +
+        // VS16) is text-default and rendered as a monochrome outline/tofu in
+        // macOS window titles (Ghostty/Terminal ignore the VS16 selector there).
+        Some("🔌")
     } else if normalized.contains("http") {
         Some("🌐")
     } else {
@@ -419,8 +658,56 @@ pub struct CacheTtlInfo {
     pub ttl_secs: u64,
     /// Whether the cache is expired (cold)
     pub is_cold: bool,
+    /// How long ago the cache went cold, in seconds (0 while warm)
+    pub cold_for_secs: u64,
     /// Estimated cached tokens (from last response's input tokens)
     pub cached_tokens: Option<u64>,
+}
+
+/// Compact human age like `30s`, `5m`, `1h 1m`, `2d 3h` for "went cold N ago"
+/// annotations. Keeps at most two units so it stays glanceable.
+pub(crate) fn format_compact_age(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{}s", secs);
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m", mins);
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return if rem_mins == 0 {
+            format!("{}h", hours)
+        } else {
+            format!("{}h {}m", hours, rem_mins)
+        };
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    if rem_hours == 0 {
+        format!("{}d", days)
+    } else {
+        format!("{}d {}h", days, rem_hours)
+    }
+}
+
+impl CacheTtlInfo {
+    /// How long before expiry the `⏳ cache ...` countdown should appear.
+    ///
+    /// A fixed 60s window is fine for a 5-minute TTL but far too easy to miss
+    /// on a 1-hour (or 24-hour) TTL where stepping away is exactly the failure
+    /// mode. Scale with the TTL (10%) but keep it within 60s..10min so short
+    /// TTLs keep their old behavior and long TTLs don't nag for hours.
+    pub fn warn_window_secs(&self) -> u64 {
+        (self.ttl_secs / 10).clamp(60, 600)
+    }
+
+    /// Whether the cache is warm but close enough to expiry that the
+    /// countdown should be shown (and idle redraws kept alive).
+    pub fn expiring_soon(&self) -> bool {
+        !self.is_cold && self.remaining_secs <= self.warn_window_secs()
+    }
 }
 
 /// Prompt cache TTL helpers now live in `crate::provider` (provider
@@ -580,15 +867,27 @@ pub enum OnboardingWelcomeKind {
     ///
     /// When `import` is `Some`, we detected importable external logins and are
     /// walking the user through them one at a time (a yes/no prompt per login).
-    /// When `None`, there was nothing to import and the card points the user at
-    /// the provider picker.
-    Login { import: Option<LoginImportPrompt> },
-    /// Ask whether to share prompt/transcript content with telemetry, with a
-    /// live decision countdown. `yes_highlighted` reflects the current choice.
-    TelemetryConsent {
-        yes_highlighted: bool,
-        seconds_left: u64,
+    /// When `None` and `importing` is false, there was nothing to import and the
+    /// card points the user at the provider picker. When `None` and `importing`
+    /// is true, the user just committed the import and it is running, so the card
+    /// shows an "Importing your logins..." progress state. When `error` is
+    /// `Some`, a prior import failed and the recovery copy explains what went
+    /// wrong plus the concrete next step.
+    Login {
+        import: Option<LoginImportPrompt>,
+        importing: bool,
+        error: Option<String>,
+        /// When a prior import failed and we detected a coding agent the user
+        /// recently used, its display label (e.g. "Codex"). The recovery screen
+        /// offers "Press H to have <label> help fix this". `None` hides that
+        /// option.
+        repair_agent_label: Option<String>,
     },
+    /// Ask the user whether to log in to OpenAI (no detected imports). A
+    /// highlightable Yes/No selector; `yes_highlighted` reflects the current
+    /// choice. Yes starts the OpenAI sign-in, No skips login and finishes
+    /// onboarding (the user can run `/login` later).
+    LoginOpenAi { yes_highlighted: bool },
     /// "Continue where you left off in <cli>?" with a highlightable Yes/No
     /// selector and a live decision countdown (seconds remaining).
     ContinuePrompt {
@@ -600,23 +899,67 @@ pub enum OnboardingWelcomeKind {
     Suggestions,
 }
 
-/// Render-friendly snapshot of the current step in the per-candidate login
-/// import walkthrough. Describes which detected login is being reviewed and
-/// which Yes/No option is currently highlighted.
+/// Render-friendly snapshot of the single-screen login-import checkbox list.
+/// Carries every detected login plus which ones are checked and which row the
+/// cursor is on, so the welcome card can draw the whole list at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginImportPrompt {
+    /// One entry per detected login, in display order.
+    pub rows: Vec<LoginImportRow>,
+    /// Index of the row the cursor is currently on.
+    pub cursor: usize,
+    /// When `true`, the navigable "Continue" pill is focused. On the summary
+    /// screen this is the preselected default; in choose mode it means focus is
+    /// on the pill rather than a login row, so Enter commits the import.
+    pub continue_focused: bool,
+    /// `false` = the default summary screen (detected logins listed read-only,
+    /// with Continue / Choose pills). `true` = the per-login checkbox list.
+    pub choosing: bool,
+    /// Which summary pill is focused (only meaningful when `choosing` is false).
+    pub summary_pill: ImportSummaryPill,
+    /// `Some` while the telemetry settings sub-page is open, holding the
+    /// highlighted choice.
+    pub telemetry: Option<TelemetryChoice>,
+    /// Whether the environment (JCODE_NO_TELEMETRY / DO_NOT_TRACK) already
+    /// forces telemetry off, so the sub-page should say so.
+    pub telemetry_env_forced_off: bool,
+    /// How many rows are currently checked for import.
+    pub checked_count: usize,
+    /// Seconds left before the screen auto-imports all checked logins.
+    pub seconds_left: u64,
+}
+
+/// The three actions on the import summary screen, left to right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportSummaryPill {
+    /// Import everything we detected (default).
+    Continue,
+    /// Open the per-login checkbox list to import fewer logins.
+    ImportLess,
+    /// Open the telemetry settings sub-page.
+    Telemetry,
+}
+
+/// The highlighted option on the telemetry settings sub-page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryChoice {
+    /// Usage stats plus prompt/transcript content.
+    Everything,
+    /// Usage stats and crash reports only.
+    NoContent,
+    /// Nothing at all.
+    Nothing,
+}
+
+/// One row in the login-import checkbox list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginImportRow {
     /// Human-readable provider summary (e.g. "OpenAI/Codex").
     pub provider_summary: String,
     /// Where the credentials came from (e.g. "Codex auth.json").
     pub source_name: String,
-    /// 1-based position of this candidate.
-    pub position: usize,
-    /// Total number of detected candidates.
-    pub total: usize,
-    /// Whether the "Yes" option is currently highlighted (vs. "No").
-    pub yes_highlighted: bool,
-    /// Seconds left before this candidate auto-commits its default.
-    pub seconds_left: u64,
+    /// Whether this login is checked for import.
+    pub checked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,7 +1112,15 @@ impl PickerKind {
                 let provider = route.map(|option| option.provider.as_str()).unwrap_or("");
                 let method = route.map(|option| option.api_method.as_str()).unwrap_or("");
                 let detail = route.map(|option| option.detail.as_str()).unwrap_or("");
-                format!("{} {} {} {}", entry.name, provider, method, detail)
+                // Include the pretty name so a query like "opus 4.8" matches
+                // the row even though the underlying id is `claude-opus-4-8`.
+                let pretty =
+                    crate::tui::app::helpers::model_names::pretty_known_model_family(&entry.name)
+                        .unwrap_or_default();
+                format!(
+                    "{} {} {} {} {}",
+                    entry.name, pretty, provider, method, detail
+                )
             }
         }
     }
@@ -1108,238 +1459,29 @@ pub struct PickerOption {
     pub estimated_reference_cost_micros: Option<u64>,
 }
 
-pub(crate) const REDRAW_IDLE: Duration = Duration::from_millis(250);
-pub(crate) const REDRAW_DEEP_IDLE: Duration = Duration::from_millis(5000);
-pub(crate) const REDRAW_REMOTE_STARTUP: Duration = Duration::from_millis(1000);
-pub(crate) const REDRAW_PASSIVE_LIVENESS: Duration = Duration::from_millis(1000);
-pub(crate) const REDRAW_DEEP_IDLE_AFTER: Duration = Duration::from_secs(30);
-
-fn idle_donut_active_with_policy(
-    state: &dyn TuiState,
-    policy: &crate::perf::TuiPerfPolicy,
-) -> bool {
-    if state.remote_startup_phase_active() {
-        return false;
-    }
-
-    // The onboarding welcome screen draws the same live donut, but it also
-    // shows a welcome/login card so `display_messages()` is not empty.  Keep the
-    // animation loop running smoothly while that screen is up (even past the
-    // deep-idle threshold) so the donut spins as an attention grab instead of
-    // only repainting on input events.
-    if state.onboarding_welcome_active() {
-        return policy.enable_decorative_animations
-            && crate::config::config().display.idle_animation
-            && policy.tier.idle_animation_enabled();
-    }
-
-    // The idle donut is decorative.  Leaving many dormant tabs/sessions open
-    // should not keep every TUI repainting forever, especially when those tabs
-    // are hidden behind a terminal multiplexer or kitty single-instance window.
-    if state
-        .time_since_activity()
-        .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-
-    policy.enable_decorative_animations
-        && crate::config::config().display.idle_animation
-        && policy.tier.idle_animation_enabled()
-        && state.display_messages().is_empty()
-        && !state.is_processing()
-        && state.streaming_text().is_empty()
-        && state.queued_messages().is_empty()
-}
-
-pub(crate) fn idle_donut_active(state: &dyn TuiState) -> bool {
-    let policy = crate::perf::tui_policy();
-    idle_donut_active_with_policy(state, &policy)
-}
-
-fn rate_limit_countdown_redraw_active(state: &dyn TuiState) -> bool {
-    state
-        .rate_limit_remaining()
-        .map(|remaining| remaining <= Duration::from_secs(60))
-        .unwrap_or(false)
-}
-
-fn full_frame_status_animation_active_with_policy(
-    state: &dyn TuiState,
-    policy: &crate::perf::TuiPerfPolicy,
-) -> bool {
-    if !policy.enable_decorative_animations {
-        return false;
-    }
-
-    // These animations are rendered as part of the full status line, not by the
-    // spinner-only cell renderer in app/run_shell.rs, so they need the normal
-    // active redraw loop while visible.
-    matches!(state.status(), ProcessingStatus::RunningTool(_))
-        || rate_limit_countdown_redraw_active(state)
-        || crate::build::read_build_progress().is_some()
-}
-
-fn primary_status_spinner_fast_path_available_with_policy(
-    state: &dyn TuiState,
-    policy: &crate::perf::TuiPerfPolicy,
-) -> bool {
-    policy.enable_decorative_animations
-        && state.is_processing()
-        && app::run_shell::status_uses_primary_spinner(&state.status())
-        && state.streaming_text().is_empty()
-        && !state.centered_mode()
-        && !state.has_pending_mouse_scroll_animation()
-        && !state.remote_startup_phase_active()
-}
-
-fn primary_status_spinner_needs_full_redraw_with_policy(
-    state: &dyn TuiState,
-    policy: &crate::perf::TuiPerfPolicy,
-) -> bool {
-    policy.enable_decorative_animations
-        && state.is_processing()
-        && app::run_shell::status_uses_primary_spinner(&state.status())
-        && state.streaming_text().is_empty()
-        && !primary_status_spinner_fast_path_available_with_policy(state, policy)
-}
-
-fn fps_to_duration(fps: u32) -> Duration {
-    Duration::from_millis((1000 / fps.max(1)) as u64)
-}
-
-pub(crate) fn redraw_interval_with_policy(
-    state: &dyn TuiState,
-    policy: &crate::perf::TuiPerfPolicy,
-) -> Duration {
-    let animation_interval = fps_to_duration(policy.animation_fps);
-    let fast_interval = fps_to_duration(policy.redraw_fps);
-
-    let deep_idle = state
-        .time_since_activity()
-        .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
-        .unwrap_or(false);
-
-    if deep_idle
-        && !state.is_processing()
-        && state.streaming_text().is_empty()
-        && !state.has_pending_mouse_scroll_animation()
-        && !state.remote_startup_phase_active()
-        && !rate_limit_countdown_redraw_active(state)
-        && crate::build::read_build_progress().is_none()
-        && !state.onboarding_welcome_active()
-    {
-        return REDRAW_DEEP_IDLE;
-    }
-
-    if idle_donut_active_with_policy(state, policy) {
-        return match policy.tier {
-            crate::perf::PerformanceTier::Minimal => fast_interval,
-            _ => animation_interval,
-        };
-    }
-
-    if full_frame_status_animation_active_with_policy(state, policy) {
-        return match policy.tier {
-            crate::perf::PerformanceTier::Minimal => REDRAW_IDLE,
-            _ => fast_interval,
-        };
-    }
-
-    if primary_status_spinner_needs_full_redraw_with_policy(state, policy) {
-        return match policy.tier {
-            crate::perf::PerformanceTier::Minimal => REDRAW_IDLE,
-            _ => fast_interval,
-        };
-    }
-
-    if !state.has_pending_mouse_scroll_animation()
-        && state.streaming_text().is_empty()
-        && (state.is_processing() || rate_limit_countdown_redraw_active(state))
-    {
-        return REDRAW_PASSIVE_LIVENESS;
-    }
-
-    if state.is_processing()
-        || !state.streaming_text().is_empty()
-        || state.status_notice().is_some()
-        || state.has_pending_mouse_scroll_animation()
-        || state.has_notification()
-        || rate_limit_countdown_redraw_active(state)
-    {
-        return match policy.tier {
-            crate::perf::PerformanceTier::Minimal => REDRAW_IDLE,
-            _ => fast_interval,
-        };
-    }
-
-    if state.remote_startup_phase_active() {
-        return REDRAW_REMOTE_STARTUP;
-    }
-
-    if deep_idle {
-        REDRAW_DEEP_IDLE
-    } else {
-        REDRAW_IDLE
-    }
-}
-
-pub(crate) fn redraw_interval(state: &dyn TuiState) -> Duration {
-    let policy = crate::perf::tui_policy();
-    redraw_interval_with_policy(state, &policy)
-}
-
-pub(crate) fn periodic_redraw_required(state: &dyn TuiState) -> bool {
-    let policy = crate::perf::tui_policy();
-
-    let deep_idle = state
-        .time_since_activity()
-        .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
-        .unwrap_or(false);
-
-    if deep_idle
-        && !state.is_processing()
-        && state.streaming_text().is_empty()
-        && !state.has_pending_mouse_scroll_animation()
-        && !state.remote_startup_phase_active()
-        && !rate_limit_countdown_redraw_active(state)
-        && crate::build::read_build_progress().is_none()
-        && !state.onboarding_welcome_active()
-    {
-        return false;
-    }
-
-    if idle_donut_active_with_policy(state, &policy) {
-        return true;
-    }
-
-    if full_frame_status_animation_active_with_policy(state, &policy) {
-        return true;
-    }
-
-    if state.is_processing()
-        || !state.streaming_text().is_empty()
-        || state.status_notice().is_some()
-        || state.has_pending_mouse_scroll_animation()
-        || state.chat_overscroll_active()
-        || state.has_notification()
-        || rate_limit_countdown_redraw_active(state)
-        || state.remote_startup_phase_active()
-    {
-        return true;
-    }
-
-    false
-}
-
-pub(crate) fn subscribe_metadata() -> (Option<String>, Option<bool>) {
+pub(crate) fn subscribe_metadata(
+    remote_working_dir: Option<&str>,
+) -> (Option<String>, Option<bool>) {
     let working_dir = std::env::current_dir().ok();
-    let working_dir_str = working_dir.as_ref().map(|p| p.display().to_string());
+    resolve_subscribe_metadata(
+        working_dir.as_deref(),
+        remote_working_dir,
+        jcode_selfdev_types::client_selfdev_requested(),
+    )
+}
 
-    let mut selfdev = jcode_selfdev_types::client_selfdev_requested();
-    if !selfdev && let Some(ref dir) = working_dir {
-        let mut current = Some(dir.as_path());
+pub(crate) fn resolve_subscribe_metadata(
+    client_working_dir: Option<&std::path::Path>,
+    remote_working_dir: Option<&str>,
+    client_selfdev_requested: bool,
+) -> (Option<String>, Option<bool>) {
+    let working_dir_str = remote_working_dir
+        .map(str::to_string)
+        .or_else(|| client_working_dir.map(|p| p.display().to_string()));
+
+    let mut selfdev = client_selfdev_requested;
+    if !selfdev && let Some(dir) = client_working_dir {
+        let mut current = Some(dir);
         while let Some(path) = current {
             if crate::build::is_jcode_repo(path) {
                 selfdev = true;
@@ -1357,6 +1499,7 @@ pub fn render_frame(frame: &mut Frame<'_>, state: &dyn TuiState) {
     ui::draw(frame, state);
 }
 
+pub use ui::inline_image_ui::ImageExpandLevel;
 pub use ui::{
     PinnedDiagramLiveDebugSnapshot, PinnedDiagramProbeRect, SidePanelDebugStats,
     SidePanelMermaidProbe, SidePanelMermaidProbeRect, debug_probe_pinned_diagram,
@@ -1439,7 +1582,7 @@ pub fn prewarm_focused_side_panel(
 mod tests {
     use super::{
         CacheTtlInfo, KvCacheProblemKind, connection_type_icon, detect_kv_cache_problem,
-        keyboard_enhancement_flags, scheduled_notification_text,
+        keyboard_enhancement_flags, resolve_subscribe_metadata, scheduled_notification_text,
     };
     use crate::ambient::AmbientStatus;
     use crate::tui::info_widget::AmbientWidgetData;
@@ -1450,6 +1593,7 @@ mod tests {
             remaining_secs: 240,
             ttl_secs: 300,
             is_cold: false,
+            cold_for_secs: 0,
             cached_tokens: Some(12_000),
         }
     }
@@ -1459,8 +1603,39 @@ mod tests {
             remaining_secs: 0,
             ttl_secs: 300,
             is_cold: true,
+            cold_for_secs: 90,
             cached_tokens: Some(12_000),
         }
+    }
+
+    #[test]
+    fn subscribe_metadata_prefers_remote_working_dir_override() {
+        let local_dir = std::path::Path::new("/client/project");
+        let (working_dir, selfdev) =
+            resolve_subscribe_metadata(Some(local_dir), Some("/server/project"), false);
+
+        assert_eq!(working_dir.as_deref(), Some("/server/project"));
+        assert_eq!(selfdev, None);
+    }
+
+    #[test]
+    fn subscribe_metadata_uses_client_cwd_without_override() {
+        let local_dir = std::path::Path::new("/client/project");
+        let (working_dir, _selfdev) = resolve_subscribe_metadata(Some(local_dir), None, false);
+
+        assert_eq!(working_dir.as_deref(), Some("/client/project"));
+    }
+
+    #[test]
+    fn format_compact_age_is_glanceable() {
+        use super::format_compact_age;
+        assert_eq!(format_compact_age(0), "0s");
+        assert_eq!(format_compact_age(45), "45s");
+        assert_eq!(format_compact_age(60), "1m");
+        assert_eq!(format_compact_age(3_660), "1h 1m");
+        assert_eq!(format_compact_age(7_200), "2h");
+        assert_eq!(format_compact_age(90_000), "1d 1h");
+        assert_eq!(format_compact_age(172_800), "2d");
     }
 
     #[test]
@@ -1603,13 +1778,31 @@ mod tests {
 
     #[test]
     fn connection_type_icon_uses_protocol_specific_icons() {
-        assert_eq!(connection_type_icon(Some("websocket")), Some("🕸️"));
-        assert_eq!(connection_type_icon(Some("wss")), Some("🕸️"));
+        assert_eq!(connection_type_icon(Some("websocket")), Some("🔌"));
+        assert_eq!(connection_type_icon(Some("wss")), Some("🔌"));
         assert_eq!(connection_type_icon(Some("https")), Some("🌐"));
         assert_eq!(connection_type_icon(Some("https/sse")), Some("🌐"));
         assert_eq!(connection_type_icon(Some("http")), Some("🌐"));
         assert_eq!(connection_type_icon(Some("unknown")), None);
         assert_eq!(connection_type_icon(None), None);
+    }
+
+    #[test]
+    fn connection_type_icons_avoid_vs16_sequences() {
+        // macOS window/tab title fonts ignore the VS16 emoji-presentation
+        // selector, so title icons must be single emoji-default codepoints.
+        for connection in ["websocket", "wss", "https", "https/sse", "http"] {
+            let icon = connection_type_icon(Some(connection)).unwrap();
+            assert_eq!(
+                icon.chars().count(),
+                1,
+                "connection icon for '{connection}' must be a single codepoint, got {icon:?}"
+            );
+            assert!(
+                !icon.contains('\u{FE0F}'),
+                "connection icon for '{connection}' must not need VS16, got {icon:?}"
+            );
+        }
     }
 
     #[test]

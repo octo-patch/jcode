@@ -87,13 +87,105 @@ pub mod linux {
             return result;
         }
 
-        // Get the parent's stdin fd link target so we can verify children
-        // share the same pipe (not just any pipe on fd 0)
+        // Walk the descendant tree (children, grandchildren, ...) so wrapper
+        // chains like `sh -> wrapper -> reader` are detected even when the
+        // intermediate process is not itself reading stdin. At each hop we keep
+        // the existing same-stdin-pipe gate: a descendant only counts if it
+        // shares fd 0 with `pid`, so unrelated background processes that happen
+        // to read their own stdin do not trigger a false positive.
         let parent_stdin_link = std::fs::read_link(format!("/proc/{}/fd/0", pid))
             .ok()
             .map(|p| p.to_string_lossy().to_string());
 
-        // Check child processes
+        // Bound the traversal so a pathological/deep tree cannot turn this
+        // few-hundred-ms poll into an expensive scan, and guard against cycles.
+        const MAX_DEPTH: usize = 32;
+        const MAX_VISITED: usize = 512;
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        visited.insert(pid);
+        // (pid, depth) work queue for a breadth-first descent.
+        let mut queue: std::collections::VecDeque<(u32, usize)> = direct_children(pid)
+            .into_iter()
+            .map(|child| (child, 1usize))
+            .collect();
+
+        while let Some((child_pid, depth)) = queue.pop_front() {
+            if !visited.insert(child_pid) || visited.len() > MAX_VISITED {
+                continue;
+            }
+
+            // Only descendants sharing the same stdin pipe are relevant.
+            if let Some(ref parent_link) = parent_stdin_link {
+                let child_link = std::fs::read_link(format!("/proc/{}/fd/0", child_pid))
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string());
+                if child_link.as_deref() != Some(parent_link) {
+                    continue;
+                }
+            }
+
+            if check_inner(child_pid, true) == StdinState::Reading {
+                return StdinState::Reading;
+            }
+
+            if depth < MAX_DEPTH {
+                for grandchild in direct_children(child_pid) {
+                    queue.push_back((grandchild, depth + 1));
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Return the direct child PIDs of `pid` using the kernel's
+    /// `/proc/<pid>/task/<tid>/children` interface, which lists only the
+    /// immediate children of each thread as a space-separated list. This avoids
+    /// scanning the entire `/proc` directory and reading every process's
+    /// `status` file just to filter on `PPid`.
+    ///
+    /// Requires `CONFIG_PROC_CHILDREN` (standard on modern Linux). If the file
+    /// is unavailable we fall back to a `/proc` scan so behavior is preserved on
+    /// older kernels.
+    pub(crate) fn direct_children(pid: u32) -> Vec<u32> {
+        // A process's children are tracked per-thread, so union across all
+        // threads of `pid`.
+        let mut children = Vec::new();
+        // Distinguish "interface works and the process has no children" (the
+        // common leaf-process case) from "interface unavailable". Falling back
+        // to the full /proc scan on a merely-empty result reintroduced the
+        // exact per-poll whole-/proc scan this function exists to avoid
+        // (issue #392 A1): every childless polled process triggered a scan of
+        // every PID's status file on each 500ms stdin poll.
+        let mut children_interface_readable = false;
+        if let Ok(threads) = std::fs::read_dir(format!("/proc/{}/task", pid)) {
+            for thread in threads.flatten() {
+                let tid = thread.file_name();
+                let Some(tid) = tid.to_str() else { continue };
+                if let Ok(list) =
+                    std::fs::read_to_string(format!("/proc/{}/task/{}/children", pid, tid))
+                {
+                    children_interface_readable = true;
+                    for child in list.split_whitespace() {
+                        if let Ok(child_pid) = child.parse::<u32>() {
+                            children.push(child_pid);
+                        }
+                    }
+                }
+            }
+        }
+
+        if children_interface_readable {
+            return children;
+        }
+
+        // Fallback for kernels without CONFIG_PROC_CHILDREN: scan /proc once.
+        // This preserves the original behavior on those systems.
+        children_via_proc_scan(pid)
+    }
+
+    fn children_via_proc_scan(pid: u32) -> Vec<u32> {
+        let mut children = Vec::new();
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.flatten() {
                 if let Ok(name) = entry.file_name().into_string()
@@ -105,26 +197,14 @@ pub mod linux {
                         if let Some(ppid_str) = line.strip_prefix("PPid:\t")
                             && ppid_str.trim().parse::<u32>().ok() == Some(pid)
                         {
-                            if let Some(ref parent_link) = parent_stdin_link {
-                                let child_link =
-                                    std::fs::read_link(format!("/proc/{}/fd/0", child_pid))
-                                        .ok()
-                                        .map(|p| p.to_string_lossy().to_string());
-                                if child_link.as_deref() != Some(parent_link) {
-                                    continue;
-                                }
-                            }
-                            let child_result = check_inner(child_pid, true);
-                            if child_result == StdinState::Reading {
-                                return StdinState::Reading;
-                            }
+                            children.push(child_pid);
+                            break;
                         }
                     }
                 }
             }
         }
-
-        result
+        children
     }
 }
 
@@ -279,7 +359,7 @@ mod macos {
 mod windows {
     use super::*;
 
-    pub fn check(pid: u32) -> StdinState {
+    pub fn check(_pid: u32) -> StdinState {
         // Windows: use NtQueryInformationThread to check thread state
         // A process blocked on ReadFile/ReadConsole on stdin will have
         // its thread in a Wait state with a wait reason of UserRequest

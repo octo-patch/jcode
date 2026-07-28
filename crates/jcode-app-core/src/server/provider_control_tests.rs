@@ -9,13 +9,80 @@ use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 
+async fn recv_final_catalog_notification(rx: &mut mpsc::UnboundedReceiver<ServerEvent>) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match rx
+                .recv()
+                .await
+                .expect("client event channel should stay open")
+            {
+                ServerEvent::Notification {
+                    notification_type:
+                        NotificationType::Message {
+                            scope: Some(scope), ..
+                        },
+                    message,
+                    ..
+                } if scope == "catalog_activity" && message.contains("Model ready:") => {
+                    break message;
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("expected final auth catalog notification")
+}
+
+#[test]
+fn compact_auth_catalog_activity_reports_changed_and_unchanged_in_two_lines() {
+    let changed = ModelCatalogRefreshSummary {
+        model_count_before: 33,
+        model_count_after: 37,
+        models_added: 14,
+        models_removed: 10,
+        route_count_before: 33,
+        route_count_after: 38,
+        routes_added: 24,
+        routes_removed: 19,
+        routes_changed: 3,
+        ..ModelCatalogRefreshSummary::default()
+    };
+    let changed_message =
+        format_auth_catalog_refresh_complete(Some("OpenAI"), Some("gpt-5.6-sol"), &changed, false);
+    assert_eq!(changed_message.lines().count(), 2);
+    assert!(changed_message.contains("OpenAI catalog changed"));
+    assert!(changed_message.contains("models +14/-10"));
+    assert!(changed_message.contains("routes +24/-19/~3"));
+
+    let unchanged = ModelCatalogRefreshSummary {
+        model_count_before: 37,
+        model_count_after: 37,
+        route_count_before: 38,
+        route_count_after: 38,
+        ..ModelCatalogRefreshSummary::default()
+    };
+    let unchanged_message = format_auth_catalog_refresh_complete(
+        Some("OpenAI"),
+        Some("gpt-5.6-sol"),
+        &unchanged,
+        false,
+    );
+    assert_eq!(unchanged_message.lines().count(), 2);
+    assert!(unchanged_message.contains("OpenAI catalog unchanged: 37 models, 38 routes"));
+}
+
 #[derive(Default)]
 struct AuthChangeMockState {
     logged_in: StdRwLock<bool>,
     selected_model: StdRwLock<Option<String>>,
     route_provider: StdRwLock<String>,
     route_api_method: StdRwLock<String>,
+    routes_override: StdRwLock<Option<Vec<ModelRoute>>>,
     expose_selected_model_in_routes: StdRwLock<bool>,
+    auth_refresh_delay_ms: AtomicUsize,
+    auth_refresh_pending: AtomicUsize,
     complete_calls: AtomicUsize,
     complete_models: StdMutex<Vec<String>>,
 }
@@ -77,6 +144,9 @@ impl Provider for AuthChangeMockProvider {
     }
 
     fn available_models_display(&self) -> Vec<String> {
+        if let Some(routes) = self.state.routes_override.read().unwrap().as_ref() {
+            return routes.iter().map(|route| route.model.clone()).collect();
+        }
         let mut models = if *self.state.logged_in.read().unwrap() {
             vec!["logged-in-model".to_string(), "second-model".to_string()]
         } else {
@@ -113,6 +183,9 @@ impl Provider for AuthChangeMockProvider {
     }
 
     fn model_routes(&self) -> Vec<ModelRoute> {
+        if let Some(routes) = self.state.routes_override.read().unwrap().as_ref() {
+            return routes.clone();
+        }
         let provider = self.state.route_provider.read().unwrap().clone();
         let api_method = self.state.route_api_method.read().unwrap().clone();
         self.available_models_display()
@@ -129,8 +202,25 @@ impl Provider for AuthChangeMockProvider {
     }
 
     fn on_auth_changed(&self) {
-        *self.state.logged_in.write().unwrap() = true;
-        crate::bus::Bus::global().publish_models_updated();
+        let delay_ms = self.state.auth_refresh_delay_ms.load(Ordering::Acquire);
+        if delay_ms == 0 {
+            *self.state.logged_in.write().unwrap() = true;
+            crate::bus::Bus::global().publish_models_updated();
+            return;
+        }
+
+        self.state.auth_refresh_pending.store(1, Ordering::Release);
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms as u64)).await;
+            *state.logged_in.write().unwrap() = true;
+            state.auth_refresh_pending.store(0, Ordering::Release);
+            crate::bus::Bus::global().publish_models_updated();
+        });
+    }
+
+    fn auth_model_refresh_pending(&self) -> bool {
+        self.state.auth_refresh_pending.load(Ordering::Acquire) > 0
     }
 
     fn fork(&self) -> Arc<dyn Provider> {
@@ -140,27 +230,48 @@ impl Provider for AuthChangeMockProvider {
     }
 }
 
+/// Shared process-wide lock: env vars are global, so a private mutex here would
+/// race every other env-mutating test (issue #593).
 fn lock_env() -> StdMutexGuard<'static, ()> {
-    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap()
+    crate::storage::lock_test_env()
 }
 
 struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
+    _temp_home: tempfile::TempDir,
     _lock: StdMutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
+    /// Save and clear the given env vars, and redirect `JCODE_HOME` to a fresh
+    /// empty temp dir for the lifetime of the guard.
+    ///
+    /// The temp home keeps these tests hermetic: provider activation reads
+    /// on-disk model catalog caches (`~/.jcode/cache/<profile>_models.json`) to
+    /// pick a profile's newest default model, so without an isolated home the
+    /// host's real caches leak in and a stale or non-chat model (e.g. Groq's
+    /// `canopylabs/orpheus-*` TTS) can be auto-selected, breaking the test on
+    /// developer machines while passing on clean CI.
     fn save(keys: &[&'static str]) -> Self {
         let lock = lock_env();
-        let saved = keys
+        let mut all_keys: Vec<&'static str> = keys.to_vec();
+        if !all_keys.contains(&"JCODE_HOME") {
+            all_keys.push("JCODE_HOME");
+        }
+        let saved = all_keys
             .iter()
             .map(|key| (*key, std::env::var(key).ok()))
             .collect();
-        for key in keys {
+        for key in &all_keys {
             crate::env::remove_var(key);
         }
-        Self { saved, _lock: lock }
+        let temp_home = tempfile::tempdir().expect("create temp JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp_home.path());
+        Self {
+            saved,
+            _temp_home: temp_home,
+            _lock: lock,
+        }
     }
 }
 
@@ -189,13 +300,12 @@ async fn notify_auth_changed_emits_available_models_updated_after_provider_updat
         Arc::clone(&agent),
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
-    let mut bus_rx = crate::bus::Bus::global().subscribe();
-    while bus_rx.try_recv().is_ok() {}
 
     handle_notify_auth_changed(
         42,
         None,
         None,
+        false,
         &provider,
         &provider,
         &sessions,
@@ -251,31 +361,125 @@ async fn notify_auth_changed_emits_available_models_updated_after_provider_updat
             && route.api_method == "mock-auth"
     }));
 
-    let final_activity = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match bus_rx.recv().await.expect("bus should stay open") {
-                crate::bus::BusEvent::UiActivity(activity)
-                    if activity.kind == crate::bus::UiActivityKind::Catalog
-                        && activity.session_id.as_deref() == Some(session_id.as_str())
-                        && activity.message.contains("Auth Model Catalog Updated") =>
-                {
-                    break activity;
-                }
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("expected final auth catalog activity");
-    assert!(final_activity.message.contains("Added models:"));
-    assert!(final_activity.message.contains("`logged-in-model`"));
-    assert!(final_activity.message.contains("`second-model`"));
+    let final_message = recv_final_catalog_notification(&mut client_event_rx).await;
+    assert_eq!(final_message.lines().count(), 2);
+    assert!(final_message.contains("catalog changed"));
+    assert!(final_message.contains("models +2/-1"));
+    assert!(final_message.contains("routes +2/-1/~0"));
+    assert!(final_message.contains("**Model ready:** `logged-in-model`"));
+    assert!(final_message.contains("Use `/model`"));
+}
+
+#[tokio::test]
+async fn notify_auth_changed_finishes_when_provider_work_finishes_without_debounce_tail() {
+    let _guard = EnvGuard::save(&[]);
+    crate::bus::reset_models_updated_publish_state_for_tests();
+    let provider_impl = AuthChangeMockProvider::new();
+    provider_impl
+        .state
+        .auth_refresh_delay_ms
+        .store(80, Ordering::Release);
+    let provider: Arc<dyn Provider> = Arc::new(provider_impl);
+    let registry = Registry::empty();
+    let agent = Arc::new(Mutex::new(Agent::new(provider.clone(), registry)));
+    let session_id = { agent.lock().await.session_id().to_string() };
+    let sessions: SessionAgents = Arc::new(RwLock::new(HashMap::from([(
+        "timed-session".to_string(),
+        Arc::clone(&agent),
+    )])));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    let started = std::time::Instant::now();
+    handle_notify_auth_changed(
+        420,
+        None,
+        None,
+        false,
+        &provider,
+        &provider,
+        &sessions,
+        session_id.as_str(),
+        &agent,
+        &client_event_tx,
+    )
+    .await;
+
+    let final_message = recv_final_catalog_notification(&mut client_event_rx).await;
+    let elapsed = started.elapsed();
+
     assert!(
-        final_activity
-            .message
-            .contains("Selected model: `logged-in-model`")
+        elapsed >= std::time::Duration::from_millis(70),
+        "refresh completed before provider work: {elapsed:?}"
     );
-    assert!(final_activity.message.contains("Use `/model`"));
+    assert!(
+        elapsed < std::time::Duration::from_millis(300),
+        "refresh retained an avoidable debounce tail: {elapsed:?}"
+    );
+    assert_eq!(final_message.lines().count(), 2);
+    assert!(final_message.contains("logged-in-model"));
+}
+
+#[tokio::test]
+async fn newer_auth_refresh_supersedes_older_final_completion_for_the_same_session() {
+    let _guard = EnvGuard::save(&[]);
+    crate::bus::reset_models_updated_publish_state_for_tests();
+    let provider_impl = AuthChangeMockProvider::new();
+    provider_impl
+        .state
+        .auth_refresh_delay_ms
+        .store(80, Ordering::Release);
+    let provider: Arc<dyn Provider> = Arc::new(provider_impl);
+    let agent = Arc::new(Mutex::new(Agent::new(provider.clone(), Registry::empty())));
+    let session_id = { agent.lock().await.session_id().to_string() };
+    let sessions: SessionAgents = Arc::new(RwLock::new(HashMap::from([(
+        "overlap-session".to_string(),
+        Arc::clone(&agent),
+    )])));
+    let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+
+    handle_notify_auth_changed(
+        421,
+        None,
+        None,
+        false,
+        &provider,
+        &provider,
+        &sessions,
+        session_id.as_str(),
+        &agent,
+        &first_tx,
+    )
+    .await;
+    handle_notify_auth_changed(
+        422,
+        None,
+        None,
+        false,
+        &provider,
+        &provider,
+        &sessions,
+        session_id.as_str(),
+        &agent,
+        &second_tx,
+    )
+    .await;
+
+    let final_message = recv_final_catalog_notification(&mut second_rx).await;
+    assert!(final_message.contains("logged-in-model"));
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    while let Ok(event) = first_rx.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                ServerEvent::Notification {
+                    notification_type: NotificationType::Message { scope: Some(scope), .. },
+                    ..
+                } if scope == "catalog_activity"
+            ),
+            "superseded refresh emitted a second final catalog notification"
+        );
+    }
 }
 
 #[tokio::test]
@@ -304,6 +508,7 @@ async fn notify_auth_changed_defers_busy_session_refresh_until_idle() {
         43,
         None,
         None,
+        false,
         &current_provider,
         &current_provider,
         &sessions,
@@ -357,7 +562,7 @@ async fn notify_auth_changed_with_azure_hint_applies_runtime_model_without_compl
         "JCODE_OPENROUTER_MODEL",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]);
     crate::env::set_var("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com");
     crate::env::set_var("AZURE_OPENAI_MODEL", "azure-deployment");
@@ -381,6 +586,7 @@ async fn notify_auth_changed_with_azure_hint_applies_runtime_model_without_compl
         44,
         Some("Azure OpenAI".to_string()),
         None,
+        false,
         &provider,
         &provider,
         &sessions,
@@ -453,7 +659,7 @@ fn cerebras_auth_hint_applies_openai_compatible_runtime_profile() {
         "JCODE_OPENROUTER_MODEL",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]);
 
     let request =
@@ -508,7 +714,7 @@ async fn notify_auth_changed_typed_cerebras_event_controls_user_visible_catalog_
         "JCODE_OPENROUTER_MODEL",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]);
 
     crate::bus::reset_models_updated_publish_state_for_tests();
@@ -522,8 +728,6 @@ async fn notify_auth_changed_typed_cerebras_event_controls_user_visible_catalog_
         Arc::clone(&agent),
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
-    let mut bus_rx = crate::bus::Bus::global().subscribe();
-    while bus_rx.try_recv().is_ok() {}
 
     let mut auth = crate::protocol::AuthChanged::new("cerebras");
     auth.credential_source = Some(crate::protocol::AuthCredentialSource::ApiKeyFile);
@@ -537,6 +741,7 @@ async fn notify_auth_changed_typed_cerebras_event_controls_user_visible_catalog_
         45,
         Some("openai".to_string()),
         Some(auth),
+        false,
         &provider,
         &provider,
         &sessions,
@@ -551,51 +756,24 @@ async fn notify_auth_changed_typed_cerebras_event_controls_user_visible_catalog_
         Some(ServerEvent::Done { id: 45 })
     ));
 
-    let final_activity = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match bus_rx.recv().await.expect("bus should stay open") {
-                crate::bus::BusEvent::UiActivity(activity)
-                    if activity.kind == crate::bus::UiActivityKind::Catalog
-                        && activity.session_id.as_deref() == Some(session_id.as_str())
-                        && activity.message.contains("Auth Model Catalog Updated") =>
-                {
-                    break activity;
-                }
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("expected final auth catalog activity");
+    let final_message = recv_final_catalog_notification(&mut client_event_rx).await;
 
     assert!(
-        final_activity
-            .message
-            .contains("Cerebras credentials are active"),
+        final_message.contains("Cerebras catalog changed"),
         "typed auth event should control user-visible provider label, got: {}",
-        final_activity.message
+        final_message
     );
     assert!(
-        !final_activity
-            .message
-            .contains("OpenAI credentials are active"),
+        !final_message.contains("OpenAI catalog changed"),
         "stale legacy provider identity leaked into user-visible auth message: {}",
-        final_activity.message
+        final_message
     );
     assert!(
-        final_activity
-            .message
-            .contains("Auth Model Catalog Warning"),
+        final_message.contains("some routes missing"),
         "typed auth event should warn when matching provider routes are missing: {}",
-        final_activity.message
+        final_message
     );
-    assert!(
-        final_activity
-            .message
-            .contains("Expected selectable Cerebras model routes"),
-        "warning should identify the expected provider: {}",
-        final_activity.message
-    );
+    assert_eq!(final_message.lines().count(), 2);
     assert_eq!(
         std::env::var("JCODE_OPENROUTER_CACHE_NAMESPACE").as_deref(),
         Ok("cerebras")
@@ -617,7 +795,7 @@ async fn notify_auth_changed_switches_from_stale_model_to_matching_provider_rout
         "JCODE_OPENROUTER_MODEL",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]);
 
     crate::bus::reset_models_updated_publish_state_for_tests();
@@ -633,9 +811,7 @@ async fn notify_auth_changed_switches_from_stale_model_to_matching_provider_rout
         "test-session".to_string(),
         Arc::clone(&agent),
     )])));
-    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
-    let mut bus_rx = crate::bus::Bus::global().subscribe();
-    while bus_rx.try_recv().is_ok() {}
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
     let mut auth = crate::protocol::AuthChanged::new("cerebras");
     auth.credential_source = Some(crate::protocol::AuthCredentialSource::ApiKeyFile);
@@ -649,6 +825,7 @@ async fn notify_auth_changed_switches_from_stale_model_to_matching_provider_rout
         46,
         Some("openai".to_string()),
         Some(auth),
+        false,
         &provider,
         &provider,
         &sessions,
@@ -658,49 +835,89 @@ async fn notify_auth_changed_switches_from_stale_model_to_matching_provider_rout
     )
     .await;
 
-    let final_activity = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match bus_rx.recv().await.expect("bus should stay open") {
-                crate::bus::BusEvent::UiActivity(activity)
-                    if activity.kind == crate::bus::UiActivityKind::Catalog
-                        && activity.session_id.as_deref() == Some(session_id.as_str())
-                        && activity.message.contains("Auth Model Catalog Updated") =>
-                {
-                    break activity;
-                }
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("expected final auth catalog activity");
+    let final_message = recv_final_catalog_notification(&mut client_event_rx).await;
 
     assert!(
-        final_activity
-            .message
-            .contains("Cerebras credentials are active"),
+        final_message.contains("Cerebras catalog changed"),
         "{}",
-        final_activity.message
+        final_message
     );
     assert!(
-        final_activity
-            .message
-            .contains("Selected model: `gpt-oss-120b`"),
+        final_message.contains("**Model ready:** `gpt-oss-120b`"),
         "final auth catalog update should switch away from stale OpenAI model: {}",
-        final_activity.message
+        final_message
     );
     assert!(
-        !final_activity.message.contains("Selected model: `gpt-5.5`"),
+        !final_message.contains("**Model ready:** `gpt-5.5`"),
         "stale selected model leaked into final auth update: {}",
-        final_activity.message
+        final_message
     );
     assert!(
-        !final_activity
-            .message
-            .contains("Auth Model Catalog Warning"),
+        !final_message.contains("some routes missing"),
         "successful recovery should not warn: {}",
-        final_activity.message
+        final_message
     );
+}
+
+#[tokio::test]
+async fn onboarding_auth_refresh_prefers_global_gpt_5_6_route_over_fable() {
+    let _guard = EnvGuard::save(&[
+        "JCODE_RUNTIME_PROVIDER",
+        "JCODE_ACTIVE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
+    ]);
+    crate::bus::reset_models_updated_publish_state_for_tests();
+
+    let provider = Arc::new(AuthChangeMockProvider::new());
+    *provider.state.routes_override.write().unwrap() = Some(vec![
+        ModelRoute {
+            model: "claude-fable-5".to_string(),
+            provider: "Anthropic".to_string(),
+            api_method: "claude-oauth".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        },
+        ModelRoute {
+            model: "gpt-5.5".to_string(),
+            provider: "OpenAI".to_string(),
+            api_method: "openai-api-key".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        },
+        ModelRoute {
+            model: "gpt-5.6-sol".to_string(),
+            provider: "OpenAI".to_string(),
+            api_method: "openai-api-key".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        },
+    ]);
+    let provider: Arc<dyn Provider> = provider;
+    let agent = Arc::new(Mutex::new(Agent::new(provider.clone(), Registry::empty())));
+    let session_id = { agent.lock().await.session_id().to_string() };
+    let sessions: SessionAgents = Arc::new(RwLock::new(HashMap::new()));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    handle_notify_auth_changed(
+        49,
+        Some("claude".to_string()),
+        None,
+        true,
+        &provider,
+        &provider,
+        &sessions,
+        session_id.as_str(),
+        &agent,
+        &client_event_tx,
+    )
+    .await;
+
+    recv_final_catalog_notification(&mut client_event_rx).await;
+
+    assert_eq!(agent.lock().await.provider_model(), "gpt-5.6-sol");
 }
 
 #[tokio::test]
@@ -718,11 +935,15 @@ async fn notify_auth_changed_does_not_override_manual_model_selected_during_refr
         "JCODE_OPENROUTER_MODEL",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]);
 
     crate::bus::reset_models_updated_publish_state_for_tests();
     let provider = Arc::new(AuthChangeMockProvider::new());
+    provider
+        .state
+        .auth_refresh_delay_ms
+        .store(80, Ordering::Release);
     *provider.state.selected_model.write().unwrap() = Some("stale-model".to_string());
     *provider.state.route_provider.write().unwrap() = "Cerebras".to_string();
     *provider.state.route_api_method.write().unwrap() = "openai-compatible:cerebras".to_string();
@@ -740,8 +961,6 @@ async fn notify_auth_changed_does_not_override_manual_model_selected_during_refr
         Arc::clone(&agent),
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
-    let mut bus_rx = crate::bus::Bus::global().subscribe();
-    while bus_rx.try_recv().is_ok() {}
 
     let mut auth = crate::protocol::AuthChanged::new("cerebras");
     auth.credential_source = Some(crate::protocol::AuthCredentialSource::ApiKeyFile);
@@ -755,6 +974,7 @@ async fn notify_auth_changed_does_not_override_manual_model_selected_during_refr
         48,
         None,
         Some(auth),
+        false,
         &provider,
         &provider,
         &sessions,
@@ -789,36 +1009,17 @@ async fn notify_auth_changed_does_not_override_manual_model_selected_during_refr
             .expect("manual model switch should succeed");
     }
 
-    let final_activity = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match bus_rx.recv().await.expect("bus should stay open") {
-                crate::bus::BusEvent::UiActivity(activity)
-                    if activity.kind == crate::bus::UiActivityKind::Catalog
-                        && activity.session_id.as_deref() == Some(session_id.as_str())
-                        && activity.message.contains("Auth Model Catalog Updated") =>
-                {
-                    break activity;
-                }
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("expected final auth catalog activity");
+    let final_message = recv_final_catalog_notification(&mut client_event_rx).await;
 
     assert!(
-        final_activity
-            .message
-            .contains("Selected model: `user-picked-model`"),
+        final_message.contains("**Model ready:** `user-picked-model`"),
         "late auth reconciliation must not override manual model selection: {}",
-        final_activity.message
+        final_message
     );
     assert!(
-        !final_activity
-            .message
-            .contains("Selected model: `logged-in-model`"),
+        !final_message.contains("**Model ready:** `logged-in-model`"),
         "late auth auto-selection overrode manual choice: {}",
-        final_activity.message
+        final_message
     );
 }
 
@@ -861,11 +1062,15 @@ async fn auth_model_first_prompt_e2e_state_space_is_bounded_by_selection_source(
             "JCODE_OPENROUTER_MODEL",
             "JCODE_RUNTIME_PROVIDER",
             "JCODE_ACTIVE_PROVIDER",
-            "JCODE_FORCE_PROVIDER",
+            "JCODE_INITIAL_PROVIDER_EXPLICIT",
         ]);
 
         crate::bus::reset_models_updated_publish_state_for_tests();
         let provider_concrete = Arc::new(AuthChangeMockProvider::new());
+        provider_concrete
+            .state
+            .auth_refresh_delay_ms
+            .store(80, Ordering::Release);
         *provider_concrete.state.selected_model.write().unwrap() = Some("stale-model".to_string());
         *provider_concrete.state.route_provider.write().unwrap() = "Cerebras".to_string();
         *provider_concrete.state.route_api_method.write().unwrap() =
@@ -884,8 +1089,6 @@ async fn auth_model_first_prompt_e2e_state_space_is_bounded_by_selection_source(
             Arc::clone(&agent),
         )])));
         let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
-        let mut bus_rx = crate::bus::Bus::global().subscribe();
-        while bus_rx.try_recv().is_ok() {}
 
         let mut auth = crate::protocol::AuthChanged::new("cerebras");
         auth.credential_source = Some(crate::protocol::AuthCredentialSource::ApiKeyFile);
@@ -899,6 +1102,7 @@ async fn auth_model_first_prompt_e2e_state_space_is_bounded_by_selection_source(
             148,
             None,
             Some(auth),
+            false,
             &provider,
             &provider,
             &sessions,
@@ -973,30 +1177,15 @@ async fn auth_model_first_prompt_e2e_state_space_is_bounded_by_selection_source(
             }
         }
 
-        let final_activity = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match bus_rx.recv().await.expect("bus should stay open") {
-                    crate::bus::BusEvent::UiActivity(activity)
-                        if activity.kind == crate::bus::UiActivityKind::Catalog
-                            && activity.session_id.as_deref() == Some(session_id.as_str())
-                            && activity.message.contains("Auth Model Catalog Updated") =>
-                    {
-                        break activity;
-                    }
-                    _ => continue,
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{}: expected final auth catalog activity", scenario.name));
+        let final_message = recv_final_catalog_notification(&mut client_event_rx).await;
         assert!(
-            final_activity.message.contains(&format!(
-                "Selected model: `{}`",
+            final_message.contains(&format!(
+                "**Model ready:** `{}`",
                 scenario.expected_first_prompt_model
             )),
             "{}: final activity selected wrong model: {}",
             scenario.name,
-            final_activity.message
+            final_message
         );
 
         let first_prompt_output = if let Some(output) = first_prompt_output {
@@ -1045,7 +1234,7 @@ async fn notify_auth_changed_switches_only_current_session_model() {
         "JCODE_OPENROUTER_MODEL",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]);
 
     crate::bus::reset_models_updated_publish_state_for_tests();
@@ -1087,6 +1276,7 @@ async fn notify_auth_changed_switches_only_current_session_model() {
         47,
         Some("openai".to_string()),
         Some(auth),
+        false,
         &current_provider,
         &current_provider,
         &sessions,

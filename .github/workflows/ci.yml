@@ -48,6 +48,15 @@ jobs:
       - name: Run clippy with warnings denied
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Enforce Cargo.lock is up to date
+        shell: bash
+        # Adding a dependency without regenerating Cargo.lock breaks every
+        # `--locked` build. Only the Windows jobs pass `--locked`, so such a
+        # commit passes 8 of 9 CI jobs and fails Windows at "Build release
+        # binary", skipping all of its validation steps. This catches it in
+        # seconds, on the job that already owns dependency hygiene.
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       - name: Enforce warning budget
         shell: bash
         run: scripts/check_warning_budget.sh
@@ -68,41 +77,64 @@ jobs:
         shell: bash
         run: python3 scripts/check_swallowed_error_budget.py
 
-  mobile-simulator:
-    name: Mobile Simulator (Linux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ssh-key: ${{ secrets.DEPLOY_KEY }}
-          submodules: recursive
+      - name: Enforce crate dependency boundaries
+        shell: bash
+        run: python3 scripts/check_dependency_boundaries.py
 
-      - name: Configure SSH for cargo git dependencies
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+      - name: Enforce wildcard re-export ratchet
+        shell: bash
+        run: python3 scripts/check_wildcard_reexport_budget.py
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Frame-cost gate for desktop2. `build_scene` is a pure function of its
+      # model and `states::NODES` enumerates the app's visual states, so frame
+      # cost is something CI can evaluate rather than something a person has to
+      # notice by using the app and reporting that it feels slow.
+      #
+      # The decisive assertion is about work, not time: an unchanged frame must
+      # not lay the transcript out again. That is exact, so it fires on a
+      # contended CI runner exactly as it does locally, unlike a wall-clock
+      # budget which has to carry enough slack to hide real regressions.
+      #
+      # Runs on the default profile so it reuses this job's existing build
+      # artifacts rather than compiling a second dependency tree.
+      - name: Enforce desktop2 frame budget
+        shell: bash
+        run: "cargo test -p jcode-desktop2 profile:: -- --test-threads=1"
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: mobile-simulator-ubuntu
-
-      - name: Run mobile core and simulator tests
+      - name: Enforce no unused dependencies
         shell: bash
         run: |
-          python3 .github/scripts/run_with_timeout.py 600 \
-            cargo test -p jcode-mobile-core -p jcode-mobile-sim
+          cargo install cargo-machete --locked
+          cargo machete
 
-      - name: Run mobile simulator CLI smoke
-        shell: bash
-        run: scripts/mobile_simulator_smoke.sh pairing_ready "hello ci simulator"
+  release-automation:
+    name: Release Automation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test Discord release announcements
+        run: python3 -m unittest -v scripts/test_post_discord_release.py
+
+      - name: Compile release automation scripts
+        run: python3 -m py_compile scripts/post_discord_release.py scripts/test_post_discord_release.py
 
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
+    # Some dependencies (e.g. convert_case 0.10.0 via derive_more/crossterm, and
+    # proc-macro2/quote) accidentally ship a `rust-toolchain.toml` *inside their
+    # published crate*. When cargo builds such a crate its CWD is that crate dir,
+    # so the rustup proxy honours the file: convert_case pins `channel = "1.83.0"`
+    # and proc-macro2 requests `components = ["rust-src"]`. That made every
+    # Build & Test job (a) race two parallel `rust-src` downloads and (b) later
+    # try to compile convert_case with rustc 1.83.0, failing with E0514/E0599.
+    # RUSTUP_TOOLCHAIN takes precedence over any rust-toolchain.toml override, so
+    # pinning it here makes every step use this job's installed stable toolchain.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     strategy:
       fail-fast: false
       matrix:
@@ -127,15 +159,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-        continue-on-error: true
-        id: sccache
+          # Pre-install rust-src in the (serial) toolchain step. Some build-script
+          # / proc-macro units trigger an on-demand `rustup component add rust-src`,
+          # and when several parallel cargo/rustc processes request it at once they
+          # race on the shared `~/.rustup/downloads/*.partial` file and fail with
+          # "could not rename ... No such file or directory". Fetching it once here
+          # removes the race. (Was failing every Build & Test job.)
+          components: rust-src
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.os }}
+          # Suffix bumped to evict caches that held 1.83.0 / <unknown rustc>
+          # artifacts produced before RUSTUP_TOOLCHAIN=stable pinned the job.
+          key: ${{ matrix.os }}-stablepin
 
       - name: Install mold linker (Linux)
         if: runner.os == 'Linux'
@@ -154,9 +190,13 @@ jobs:
           rustflags = ["-C", "link-arg=-fuse-ld=mold"]
           EOF
           fi
-          if command -v sccache &>/dev/null && sccache --start-server 2>/dev/null; then
-            export RUSTC_WRAPPER=sccache
-          fi
+          # NOTE: intentionally NOT exporting RUSTC_WRAPPER=sccache here. Only this
+          # step used sccache while the later `cargo test --no-run` steps did not,
+          # so sccache emitted rlibs/rmetas stamped `<unknown rustc version>` that
+          # the non-sccache test compile then rejected with E0514
+          # ("compiled by an incompatible version of rustc"). rust-cache already
+          # caches target/ across runs, so a clean, wrapper-consistent build is
+          # both correct and fast enough.
           export RUSTC="$(rustup which rustc)"
           CARGO_BIN="$(rustup which cargo)"
           "$CARGO_BIN" build --release --target ${{ matrix.target }}
@@ -167,6 +207,55 @@ jobs:
           python3 .github/scripts/run_with_timeout.py 900 \
             "$(rustup which cargo)" test --target ${{ matrix.target }} --lib --bins --no-run
 
+      - name: Run deterministic retention-readiness cohort
+        shell: bash
+        run: |
+          # A cold jcode-app-core test harness compiles heavy optional provider
+          # dependencies and can exceed three minutes on hosted runners. The
+          # cohort itself runs in under a second once the lib test is built.
+          python3 .github/scripts/run_with_timeout.py 600 \
+            "$(rustup which cargo)" test --target ${{ matrix.target }} \
+            -p jcode-app-core --lib retention_readiness -- --nocapture
+
+      - name: Run TUI library tests (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        # These were previously only compiled (`--no-run` above), so test-only
+        # breakage reached master with CI green: three `ServerEvent::MessageEnd`
+        # call sites stayed unit variants after the enum gained a field, and the
+        # whole target failed to compile unnoticed (see #592).
+        #
+        # Run serially. Many of these tests share process-global state (model
+        # catalog, ambient cache, render state) and fail on ordering under
+        # parallelism, while passing reliably one-at-a-time: 1977 pass serially
+        # versus 2-4 varying failures in parallel. Scoping that state is tracked
+        # in #592; until then serial execution is the honest signal, and costs
+        # ~30s once the target is already built above.
+        #
+        # Skip the tests that need a real desktop environment: the copy-badge
+        # tests drive an actual clipboard ("Failed to copy" on a headless
+        # runner) and two render tests depend on terminal color support. They
+        # are covered locally; excluding them keeps the gate honest instead of
+        # permanently red. Tracked in #592.
+        run: |
+          python3 .github/scripts/run_with_timeout.py 600 \
+            "$(rustup which cargo)" test --target ${{ matrix.target }} \
+            -p jcode-tui --lib -- --test-threads=1 \
+            --skip copy_badge_shortcut \
+            --skip test_prompt_entry_shimmer_color_moves_across_positions \
+            --skip right_fact_stack_uses_neutral_gray_except_for_context_usage
+
+      - name: Compile integration test binaries
+        shell: bash
+        # Build the integration-test binaries up front (not counted against the
+        # run steps' execution budgets). The e2e suite in particular is heavy
+        # (burst-spawn concurrency), and folding compilation into its 900s run
+        # budget was pushing slower hosted ubuntu/macos runners over the limit.
+        run: |
+          python3 .github/scripts/run_with_timeout.py 900 \
+            "$(rustup which cargo)" test --target ${{ matrix.target }} \
+            --test provider_matrix --test e2e --no-run
+
       - name: Run provider matrix tests
         shell: bash
         run: |
@@ -176,7 +265,10 @@ jobs:
       - name: Run e2e tests
         shell: bash
         run: |
-          python3 .github/scripts/run_with_timeout.py 900 \
+          # e2e is fast (~1-2 min of execution); the generous budget only guards
+          # against an occasional slow hosted runner. Compilation is already done
+          # in the dedicated compile step above.
+          python3 .github/scripts/run_with_timeout.py 600 \
             "$(rustup which cargo)" test --target ${{ matrix.target }} --test e2e
 
       - name: Check PowerShell script syntax (Windows)
@@ -267,7 +359,14 @@ jobs:
             'build_shell_command_uses_cmd_and_executes_command',
             'pipe_name_is_stable_and_normalizes_case_and_separators',
             'pipe_name_falls_back_when_stem_is_empty',
-            'stream_pair_round_trips_bytes'
+            'busy_pipe_is_reported_as_a_live_socket_path',
+            'stream_pair_round_trips_bytes',
+            'split_stream_supports_concurrent_read_and_write',
+            'test_cancel_command_idle_reports_nothing_to_cancel',
+            'test_menu_number_rejected_as_api_key',
+            'test_command_palette_suppressed_while_api_key_prompt_pending',
+            'test_ctrl_c_with_active_copy_selection_copies_instead_of_quitting',
+            'test_ctrl_c_in_copy_mode_without_selection_still_falls_through'
           )
 
           foreach ($testName in $tests) {
@@ -276,6 +375,19 @@ jobs:
               -TimeoutSeconds 300 `
               -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '--lib', $testName, '--', '--nocapture')
           }
+
+      - name: Run Windows hotkey and power tests
+        shell: pwsh
+        run: |
+          & ./scripts/invoke_cargo_with_timeout.ps1 `
+            -Name 'Windows setup-hints tests' `
+            -TimeoutSeconds 300 `
+            -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '-p', 'jcode-setup-hints', '--lib', '--', '--nocapture')
+
+          & ./scripts/invoke_cargo_with_timeout.ps1 `
+            -Name 'Windows power-inhibit tests' `
+            -TimeoutSeconds 900 `
+            -CargoArgs @('test', '--locked', '--target', 'x86_64-pc-windows-msvc', '-p', 'jcode-base', '--no-default-features', '--lib', 'power_inhibit::tests::windows_', '--', '--nocapture')
 
       - name: Run Windows e2e smoke tests
         shell: pwsh
@@ -325,6 +437,12 @@ jobs:
             throw 'Built Windows binary failed to run --version'
           }
 
+      - name: Run Windows installer lifecycle tests
+        shell: pwsh
+        run: |
+          & ./scripts/test_windows_launcher_install.ps1
+          & ./scripts/test_windows_setup_evaluation.ps1
+
       - name: Verify installer using local artifact
         shell: pwsh
         run: |
@@ -333,7 +451,9 @@ jobs:
             throw 'Could not determine Cargo.toml version'
           }
 
-          $version = 'v' + $cargoVersion.Matches[0].Groups[1].Value
+          # CI builds are development builds. Build metadata independently derives
+          # this identity from the root package version and appends `-dev`.
+          $version = 'v' + $cargoVersion.Matches[0].Groups[1].Value + '-dev'
           & ./.github/scripts/verify_windows_install.ps1 `
             -ArtifactExePath 'target/x86_64-pc-windows-msvc/release/jcode.exe' `
             -Version $version
@@ -351,6 +471,22 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  setup-friction:
+    name: Setup Friction Eval (Linux installer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install probe shells
+        run: sudo apt-get update && sudo apt-get install -y fish zsh
+
+      - name: Installer conversion telemetry tests
+        run: bash scripts/test_install_conversion.sh
+
+      - name: Setup friction scorecard
+        run: bash scripts/setup_friction_eval.sh
 
   powershell-syntax:
     name: PowerShell Syntax

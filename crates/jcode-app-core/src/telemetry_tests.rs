@@ -1,13 +1,11 @@
 use super::*;
 use crate::storage::lock_test_env;
-use std::sync::{Mutex, OnceLock};
 
+/// Shared process-wide lock: telemetry state is reached through env vars, which
+/// are global, so a private mutex here would race every other env-mutating test
+/// (issue #593).
 fn lock_telemetry_test_state() -> std::sync::MutexGuard<'static, ()> {
-    static TELEMETRY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TELEMETRY_TEST_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock_test_env()
 }
 
 #[test]
@@ -129,6 +127,7 @@ fn test_session_end_event_serialization() {
         feature_selfdev_used: false,
         feature_background_used: false,
         feature_subagent_used: true,
+        feature_todo_used: true,
         unique_mcp_servers: 2,
         session_success: true,
         abandoned_before_response: false,
@@ -168,6 +167,11 @@ fn test_session_end_event_serialization() {
         tool_cat_goal: 0,
         tool_cat_mcp: 1,
         tool_cat_other: 0,
+        tool_cat_todo: 2,
+        todo_gate_ownership_count: 1,
+        todo_gate_hill_count: 1,
+        todo_gate_completion_count: 0,
+        todo_gate_spike_count: 0,
         command_login_used: false,
         command_model_used: true,
         command_usage_used: false,
@@ -228,6 +232,12 @@ fn test_session_end_event_serialization() {
     assert_eq!(json["executed_tool_calls"], 5);
     assert_eq!(json["transport_https"], 2);
     assert_eq!(json["tool_cat_write"], 2);
+    assert_eq!(json["tool_cat_todo"], 2);
+    assert_eq!(json["feature_todo_used"], true);
+    assert_eq!(json["todo_gate_ownership_count"], 1);
+    assert_eq!(json["todo_gate_hill_count"], 1);
+    assert_eq!(json["todo_gate_completion_count"], 0);
+    assert_eq!(json["todo_gate_spike_count"], 0);
     assert_eq!(json["workflow_coding_used"], true);
     assert_eq!(json["active_days_30d"], 9);
     assert_eq!(json["transport_persistent_ws_reuse"], 5);

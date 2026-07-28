@@ -35,8 +35,7 @@ fn build_harness_context(
         .path
         .as_deref()
         .map(|path| resolve_path_arg(ctx, path))
-        .or_else(|| ctx.working_dir.clone())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .or_else(|| ctx.working_dir.clone())?;
     let total_messages = session.messages.len().max(1);
     let compaction_cutoff = session
         .compaction
@@ -112,7 +111,9 @@ fn collect_tool_exposures(session: &Session) -> Vec<ToolExposureObservation> {
     for (message_index, msg) in session.messages.iter().enumerate() {
         for block in &msg.content {
             match block {
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     tool_map.insert(
                         id.clone(),
                         ToolCall {
@@ -120,6 +121,7 @@ fn collect_tool_exposures(session: &Session) -> Vec<ToolExposureObservation> {
                             name: name.clone(),
                             input: input.clone(),
                             intent: None,
+                            thought_signature: None,
                         },
                     );
                 }
@@ -136,6 +138,7 @@ fn collect_tool_exposures(session: &Session) -> Vec<ToolExposureObservation> {
                             name: "tool".to_string(),
                             input: Value::Null,
                             intent: None,
+                            thought_signature: None,
                         });
                     observations.push(ToolExposureObservation {
                         tool,

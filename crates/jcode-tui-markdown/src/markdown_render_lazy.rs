@@ -5,19 +5,25 @@ pub fn render_markdown_lazy(
     max_width: Option<usize>,
     visible_range: std::ops::Range<usize>,
 ) -> Vec<Line<'static>> {
-    let text = escape_currency_dollars(text);
+    let text = jcode_render_core::normalize_latex_math(text);
+    let text = escape_currency_dollars(&text);
     let text = preserve_line_oriented_softbreaks(&text);
     let text = text.as_str();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let side_only = diagram_side_only();
     let deferred_mermaid_mode = deferred_mermaid_render_context_enabled();
     let spacing_mode = effective_markdown_spacing_mode();
+    let latex_mode = config_snapshot().latex_rendering;
     let mut centered_blocks = CenteredStructuredBlockState::default();
 
     // Style stack for nested formatting
     let mut bold = false;
     let mut italic = false;
+    // True while inside an emphasis run that opened with the reasoning sentinel.
+    // Smart-punctuation (e.g. apostrophes) splits a single reasoning line into
+    // multiple text events; only the first carries the sentinel, so we latch the
+    // dim/italic styling for the whole emphasis span.
+    let mut reasoning_emphasis = false;
     let mut strike = false;
     let mut in_code_block = false;
     let mut code_block_lang: Option<String> = None;
@@ -93,7 +99,10 @@ pub fn render_markdown_lazy(
             Event::End(TagEnd::Strong) => bold = false,
 
             Event::Start(Tag::Emphasis) => italic = true,
-            Event::End(TagEnd::Emphasis) => italic = false,
+            Event::End(TagEnd::Emphasis) => {
+                italic = false;
+                reasoning_emphasis = false;
+            }
 
             Event::Start(Tag::Strikethrough) => strike = true,
             Event::End(TagEnd::Strikethrough) => strike = false,
@@ -362,19 +371,9 @@ pub fn render_markdown_lazy(
                 code_block_content.clear();
             }
             Event::End(TagEnd::CodeBlock) => {
-                let is_mermaid = mermaid_rendering_enabled()
-                    && code_block_lang
-                        .as_ref()
-                        .map(|l| mermaid::is_mermaid_lang(l))
-                        .unwrap_or(false);
+                let is_mermaid = should_render_mermaid_block(code_block_lang.as_deref());
 
                 if is_mermaid {
-                    if !mermaid_should_register_active() && !mermaid::image_protocol_available() {
-                        lines.push(mermaid_sidebar_placeholder(
-                            "↗ mermaid diagram (image protocols unavailable)",
-                        ));
-                        continue;
-                    }
                     let terminal_width = max_width.and_then(|w| u16::try_from(w).ok());
                     let result = if deferred_mermaid_mode {
                         mermaid::render_mermaid_deferred_with_registration(
@@ -394,19 +393,14 @@ pub fn render_markdown_lazy(
                         ))
                     };
                     match result {
-                        Some(mermaid::RenderResult::Image { .. }) if side_only => {
-                            lines.push(mermaid_sidebar_placeholder("↗ mermaid diagram (sidebar)"));
-                        }
                         Some(other) => {
                             let mermaid_lines = mermaid::result_to_lines(other, max_width);
                             lines.extend(mermaid_lines);
                         }
                         None => {
-                            lines.push(mermaid_sidebar_placeholder(if side_only {
-                                "↻ mermaid diagram rendering in sidebar..."
-                            } else {
-                                "↻ rendering mermaid diagram..."
-                            }));
+                            lines.push(mermaid_sidebar_placeholder(
+                                MERMAID_PENDING_PLACEHOLDER_TEXT,
+                            ));
                         }
                     }
                 } else {
@@ -505,12 +499,36 @@ pub fn render_markdown_lazy(
                     continue;
                 }
                 if in_table {
-                    current_cell.push('$');
-                    current_cell.push_str(&math);
-                    current_cell.push('$');
+                    match latex_mode {
+                        LatexRenderingMode::None => current_cell.push_str(&format!("${math}$")),
+                        LatexRenderingMode::Unicode | LatexRenderingMode::Image => {
+                            current_cell.push_str(&jcode_render_core::render_inline_latex(&math));
+                        }
+                    }
                 } else {
                     ensure_blockquote_prefix(&mut current_spans, blockquote_depth);
-                    current_spans.push(math_inline_span(&math));
+                    match latex_mode {
+                        LatexRenderingMode::None => current_spans.push(raw_math_inline_span(&math)),
+                        LatexRenderingMode::Unicode => current_spans.push(math_inline_span(&math)),
+                        LatexRenderingMode::Image
+                            if blockquote_depth == 0
+                                && list_stack.is_empty()
+                                && !in_definition_list
+                                && !in_footnote_definition =>
+                        {
+                            if let Some(image_lines) = latex_image_lines(&math, false, max_width) {
+                                flush_current_line_with_alignment(
+                                    &mut lines,
+                                    &mut current_spans,
+                                    None,
+                                );
+                                lines.extend(image_lines);
+                            } else {
+                                current_spans.push(math_inline_span(&math));
+                            }
+                        }
+                        LatexRenderingMode::Image => current_spans.push(math_inline_span(&math)),
+                    }
                 }
             }
 
@@ -532,12 +550,29 @@ pub fn render_markdown_lazy(
                     ),
                 );
                 if in_table {
-                    current_cell.push_str("$$");
-                    current_cell.push_str(&math);
-                    current_cell.push_str("$$");
+                    match latex_mode {
+                        LatexRenderingMode::None => current_cell.push_str(&format!("$${math}$$")),
+                        LatexRenderingMode::Unicode | LatexRenderingMode::Image => {
+                            current_cell.push_str(&jcode_render_core::render_inline_latex(&math));
+                        }
+                    }
                 } else {
                     let block_start = lines.len();
-                    for line in math_display_lines(&math) {
+                    let rendered = match latex_mode {
+                        LatexRenderingMode::None => raw_math_display_lines(&math),
+                        LatexRenderingMode::Unicode => math_display_lines(&math),
+                        LatexRenderingMode::Image
+                            if blockquote_depth == 0
+                                && list_stack.is_empty()
+                                && !in_definition_list
+                                && !in_footnote_definition =>
+                        {
+                            latex_image_lines(&math, true, max_width)
+                                .unwrap_or_else(|| math_display_lines(&math))
+                        }
+                        LatexRenderingMode::Image => math_display_lines(&math),
+                    };
+                    for line in rendered {
                         lines.push(with_blockquote_prefix(line, blockquote_depth));
                     }
                     record_centered_independent_block(
@@ -569,7 +604,24 @@ pub fn render_markdown_lazy(
                 } else {
                     let is_thinking_duration =
                         text.starts_with("Thought for ") && text.ends_with('s');
-                    let mut style = if is_thinking_duration {
+                    // The sentinel can appear at the start and/or end of the line
+                    // (and smart-punctuation may split it across events), so latch
+                    // on its presence anywhere and strip every occurrence.
+                    let has_sentinel = text.contains(crate::REASONING_SENTINEL);
+                    if has_sentinel {
+                        // Latch for the rest of this emphasis span so smart-
+                        // punctuation splits keep the dim/italic styling.
+                        reasoning_emphasis = true;
+                    }
+                    let is_reasoning = reasoning_emphasis;
+                    let stripped;
+                    let text: &str = if has_sentinel {
+                        stripped = text.replace(crate::REASONING_SENTINEL, "");
+                        &stripped
+                    } else {
+                        &text
+                    };
+                    let mut style = if is_thinking_duration || is_reasoning {
                         Style::default().fg(md_dim_color()).italic()
                     } else {
                         match (bold, italic) {

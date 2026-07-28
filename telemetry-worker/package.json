@@ -2,8 +2,10 @@
   "name": "jcode-telemetry",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "npx wrangler dev",
+    "test": "node --test test/worker.test.mjs",
     "deploy": "npx wrangler deploy",
     "migrate:expand": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0001_expand_events.sql",
     "migrate:transport": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0002_transport_metrics.sql",
@@ -16,8 +18,20 @@
     "migrate:feedback-text": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0009_feedback_text.sql",
     "migrate:daily-active": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0010_daily_active_users.sql",
     "migrate:daily-active-backfill": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0011_backfill_daily_active_recent.sql",
+    "migrate:daily-active-ci": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0012_daily_active_ci_flag.sql",
     "health": "npx wrangler d1 execute jcode-telemetry --remote --file=health.sql",
-    "dau": "npx wrangler d1 execute jcode-telemetry --remote --file=dau.sql"
+    "health:size": "curl -s https://telemetry.jcode.sh/v1/health",
+    "dau": "npx wrangler d1 execute jcode-telemetry --remote --file=dau.sql",
+    "users": "npx wrangler d1 execute jcode-telemetry --remote --file=users.sql",
+    "migrate:detail-fields": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0013_detail_table_turn_session_fields.sql",
+    "migrate:dau-full-backfill": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0014_full_history_dau_backfill.sql",
+    "migrate:auth-failure-reason": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0015_auth_failure_reason.sql",
+    "migrate:web-subscription": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0016_web_subscription_analytics.sql",
+    "migrate:discovery": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0017_discovery_telemetry.sql",
+    "migrate:web-quality": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0018_web_quality_telemetry.sql",
+    "migrate:install-conversion": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0020_install_conversion_funnel.sql",
+    "migrate:todo-telemetry": "npx wrangler d1 execute jcode-telemetry --remote --file=migrations/0021_todo_telemetry.sql",
+    "conversion": "npx wrangler d1 execute jcode-telemetry --remote --file=conversion.sql"
   },
   "devDependencies": {
     "wrangler": "^4"

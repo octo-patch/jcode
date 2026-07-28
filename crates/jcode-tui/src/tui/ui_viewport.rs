@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt::Write as _;
 use unicode_width::UnicodeWidthStr;
 
 #[cfg(target_os = "macos")]
@@ -9,6 +10,26 @@ pub(crate) const COPY_BADGE_ALT_LABEL: &str = "Alt";
 pub(crate) fn copy_badge_alt_label() -> String {
     let config = crate::config::config();
     copy_badge_alt_label_from_config(&config.display.copy_badge_alt_label)
+}
+
+/// Build one Ratatui cell symbol that starts at the bottom-right of a reserved
+/// math region, moves to its top-left, invokes Handterm's native LaTeX APC, and
+/// restores the cursor where Ratatui expects it after printing one cell.
+fn handterm_native_latex_cell_symbol(source: &str, rows: u16, cols: u16) -> Option<String> {
+    let apc = crate::tui::markdown::encode_handterm_latex_apc(source)?;
+    let mut symbol = String::with_capacity(apc.len() + 32);
+    symbol.push_str("\x1b[s");
+    if rows > 1 {
+        write!(symbol, "\x1b[{}A", rows - 1).ok()?;
+    }
+    if cols > 1 {
+        write!(symbol, "\x1b[{}D", cols - 1).ok()?;
+    }
+    symbol.push_str(&apc);
+    // Crossterm's backend records this as one printed cell. Restore the actual
+    // terminal cursor and advance once so its state matches that accounting.
+    symbol.push_str("\x1b[u\x1b[1C");
+    Some(symbol)
 }
 
 fn copy_badge_alt_label_from_config(configured: &str) -> String {
@@ -25,81 +46,74 @@ pub(crate) fn copy_badge_alt_badge() -> String {
 }
 
 fn copy_badge_shortcut_width(key_label: &str) -> usize {
-    UnicodeWidthStr::width(format!("{} [⇧] [{key_label}]", copy_badge_alt_badge()).as_str())
+    // Includes the single separator space rendered between the row content and
+    // the first badge.
+    UnicodeWidthStr::width(format!(" {} [⇧] [{key_label}]", copy_badge_alt_badge()).as_str())
+}
+
+/// Display width reserved for the inline expand-edit badge (`[Alt] [⇧] [E] …`).
+/// The badge text differs between the collapsed (` expand`) and just-activated
+/// (` ✓ Expanded`) states, so callers pass the suffix that will actually render.
+pub(crate) fn expand_badge_reserved_width(badge_text: &str) -> usize {
+    UnicodeWidthStr::width(format!(" {} [⇧] [E]{badge_text}", copy_badge_alt_badge()).as_str())
 }
 
 fn lower_bound(values: &[usize], target: usize) -> usize {
     values.partition_point(|&v| v < target)
 }
 
-fn selection_bg_for(base_bg: Option<Color>) -> Color {
-    let fallback = rgb(32, 38, 48);
-    blend_color(base_bg.unwrap_or(fallback), accent_color(), 0.34)
-}
+/// Appended-row jump size (in rows) above which the tail-follow viewport slides
+/// to the bottom over several frames instead of snapping. Small appends
+/// (paced streaming) snap as before; only block insertions animate.
+const TAIL_CATCHUP_MIN_JUMP: usize = 4;
 
-fn selection_fg_for(base_fg: Option<Color>) -> Option<Color> {
-    base_fg.map(|fg| blend_color(fg, Color::White, 0.15))
-}
+/// Maximum rows the tail-follow viewport advances per rendered frame while
+/// catching up. At animation cadence (~30-60fps) even a full-screen insertion
+/// settles within a few hundred milliseconds.
+const TAIL_CATCHUP_MAX_STEP: usize = 3;
 
-fn highlight_line_selection(
-    line: &Line<'static>,
-    start_col: usize,
-    end_col: usize,
-) -> Line<'static> {
-    if end_col <= start_col {
-        return line.clone();
+/// Resolve the scroll position while following the live tail. Normally this is
+/// just `max_scroll`, but when a large block lands at once (committed message,
+/// tool result) the bottom-anchored viewport would teleport everything upward
+/// in a single frame - the "big pop". Instead, advance from the previous
+/// frame's resolved position by a bounded step so the new content slides into
+/// view. Disabled on tiers without decorative animations.
+fn resolve_tail_follow_scroll(max_scroll: usize, viewport_height: usize) -> usize {
+    if super::take_tail_follow_snap_request() {
+        super::set_tail_catchup_active(false);
+        return max_scroll;
     }
-
-    let mut rebuilt: Vec<Span<'static>> = Vec::new();
-    let mut current_text = String::new();
-    let mut current_style: Option<Style> = None;
-    let mut col = 0usize;
-
-    let flush = |rebuilt: &mut Vec<Span<'static>>, text: &mut String, style: &mut Option<Style>| {
-        if !text.is_empty() {
-            let span = match style.take() {
-                Some(style) => Span::styled(std::mem::take(text), style),
-                None => Span::raw(std::mem::take(text)),
-            };
-            rebuilt.push(span);
-        }
-    };
-
-    for span in &line.spans {
-        let mut selected_style = span.style.bg(selection_bg_for(span.style.bg));
-        if let Some(fg) = selection_fg_for(span.style.fg) {
-            selected_style = selected_style.fg(fg);
-        }
-        for ch in span.content.chars() {
-            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            let selected = if width == 0 {
-                col > start_col && col <= end_col
-            } else {
-                col < end_col && col.saturating_add(width) > start_col
-            };
-
-            let style = if selected { selected_style } else { span.style };
-
-            if current_style == Some(style) {
-                current_text.push(ch);
-            } else {
-                flush(&mut rebuilt, &mut current_text, &mut current_style);
-                current_text.push(ch);
-                current_style = Some(style);
-            }
-
-            col = col.saturating_add(width);
-        }
+    if !crate::perf::tui_policy().enable_decorative_animations {
+        super::set_tail_catchup_active(false);
+        return max_scroll;
     }
-
-    flush(&mut rebuilt, &mut current_text, &mut current_style);
-
-    Line {
-        spans: rebuilt,
-        style: line.style,
-        alignment: line.alignment,
+    let prev = super::last_resolved_chat_scroll();
+    // Only animate forward catch-up from an established position. Backward
+    // motion (content shrank) and first frames snap directly.
+    if prev == 0 || max_scroll <= prev {
+        super::set_tail_catchup_active(false);
+        return max_scroll;
+    }
+    let jump = max_scroll - prev;
+    // Never let the live tail drift more than a viewport behind (e.g. a huge
+    // paste); cap the lag so the catch-up is at most one screen.
+    let max_lag = viewport_height.max(TAIL_CATCHUP_MIN_JUMP);
+    if jump <= TAIL_CATCHUP_MIN_JUMP {
+        super::set_tail_catchup_active(false);
+        return max_scroll;
+    }
+    let floor = max_scroll.saturating_sub(max_lag);
+    let next = prev.max(floor).saturating_add(TAIL_CATCHUP_MAX_STEP);
+    if next >= max_scroll {
+        super::set_tail_catchup_active(false);
+        max_scroll
+    } else {
+        super::set_tail_catchup_active(true);
+        next
     }
 }
+
+use super::selection_highlight::highlight_line_selection;
 
 pub(crate) fn truncate_line_in_place_to_width(line: &mut Line<'static>, max_width: usize) {
     let mut remaining = max_width;
@@ -136,6 +150,75 @@ pub(crate) fn truncate_line_in_place_to_width(line: &mut Line<'static>, max_widt
     line.spans = kept;
 }
 
+/// Remove trailing plain spaces from a line so an appended badge sits exactly
+/// one separator space after the content, regardless of how the source line
+/// was rendered (code block headers end with a space, blockquote lines don't).
+pub(crate) fn trim_line_trailing_spaces(line: &mut Line<'static>) {
+    while let Some(last) = line.spans.last_mut() {
+        let trimmed = last.content.trim_end_matches(' ');
+        if trimmed.len() == last.content.len() {
+            break;
+        }
+        if trimmed.is_empty() {
+            line.spans.pop();
+        } else {
+            last.content = std::borrow::Cow::Owned(trimmed.to_string());
+            break;
+        }
+    }
+}
+
+/// Prepare a line to host an inline badge within `max_content_width` cells.
+/// When the content already fits, only trailing spaces are trimmed (the badge
+/// separator space is accounted for in the reserved width). When the content
+/// must be cut, end it with a dim ellipsis so the truncation is visible
+/// instead of silently swallowing words.
+pub(crate) fn truncate_line_for_copy_badge(line: &mut Line<'static>, max_content_width: usize) {
+    if line.width() <= max_content_width {
+        trim_line_trailing_spaces(line);
+        return;
+    }
+    truncate_line_in_place_to_width(line, max_content_width.saturating_sub(1));
+    trim_line_trailing_spaces(line);
+    line.spans
+        .push(Span::styled("…", Style::default().fg(dim_color())));
+}
+
+/// Choose the wrapped line that hosts an inline copy badge for a copy target
+/// spanning `block_start..block_end`.
+///
+/// Prefers the target's natural badge line (the `┌─ lang` header for code
+/// blocks), but when that line is too wide to fit the badge without cutting
+/// content (e.g. a full-width blockquote line), falls back to the first
+/// visible line of the block with enough free width. Returns the natural line
+/// when nothing fits; the caller then truncates with a visible ellipsis.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pick_copy_badge_line(
+    preferred: usize,
+    block_start: usize,
+    block_end: usize,
+    scroll: usize,
+    visible_end: usize,
+    visible_lines: &[Line<'_>],
+    content_width: usize,
+    reserved: usize,
+) -> usize {
+    let fits = |abs_line: usize| -> bool {
+        if abs_line < scroll || abs_line >= visible_end {
+            return false;
+        }
+        visible_lines
+            .get(abs_line - scroll)
+            .is_some_and(|line| line.width().saturating_add(reserved) <= content_width)
+    };
+    if fits(preferred) {
+        return preferred;
+    }
+    (block_start.max(scroll)..block_end.min(visible_end))
+        .find(|&abs_line| abs_line != preferred && fits(abs_line))
+        .unwrap_or(preferred)
+}
+
 pub(crate) fn copy_badge_reserved_width(
     key: char,
     copy_badge_ui: &crate::tui::app::CopyBadgeUiState,
@@ -143,8 +226,10 @@ pub(crate) fn copy_badge_reserved_width(
 ) -> usize {
     let mut reserved = copy_badge_shortcut_width("A");
     if copy_badge_ui.feedback_for_key(key, now).is_some() {
-        // Includes the trailing spacer inserted between feedback and the shortcut badges.
-        reserved = reserved.saturating_add(UnicodeWidthStr::width(" ✓ Copied! "));
+        // Feedback text plus the spacer between it and the shortcut badges.
+        // The separator before the feedback is already counted in
+        // `copy_badge_shortcut_width`.
+        reserved = reserved.saturating_add(UnicodeWidthStr::width("✓ Copied! "));
     }
     reserved
 }
@@ -176,23 +261,39 @@ pub(super) fn compute_visible_margins(
                 used = used.saturating_add(1).min(area.width);
             }
 
+            // Compute the true free space on each side from the line's *rendered*
+            // alignment. This matters even in left-aligned mode: the header lines
+            // (`server:`/`client:`/model/version, auth status, mcp list, changelog
+            // box, etc.) are always centered regardless of mode, so a centered line
+            // of width `used` leaves only ~half the slack on the right. Reporting
+            // the full `area.width - used` here would let a right-side info widget
+            // overlap the centered header text.
+            let total_margin = area.width.saturating_sub(used);
+            let default_alignment = if centered {
+                Alignment::Center
+            } else {
+                Alignment::Left
+            };
+            let effective_alignment = lines[row].alignment.unwrap_or(default_alignment);
+            let (left_margin, right_margin) = match effective_alignment {
+                Alignment::Left => (0, total_margin),
+                Alignment::Center => {
+                    let left = total_margin / 2;
+                    let right = total_margin.saturating_sub(left);
+                    (left, right)
+                }
+                Alignment::Right => (total_margin, 0),
+            };
+
             if centered {
-                let total_margin = area.width.saturating_sub(used);
-                let effective_alignment = lines[row].alignment.unwrap_or(Alignment::Center);
-                let (left_margin, right_margin) = match effective_alignment {
-                    Alignment::Left => (0, total_margin),
-                    Alignment::Center => {
-                        let left = total_margin / 2;
-                        let right = total_margin.saturating_sub(left);
-                        (left, right)
-                    }
-                    Alignment::Right => (total_margin, 0),
-                };
                 left_widths.push(left_margin);
                 right_widths.push(right_margin);
             } else {
+                // Left-aligned mode never places left-side widgets (content is
+                // flush-left), so the left gap is reported as 0; the right gap
+                // still respects per-line alignment so widgets clear the header.
                 left_widths.push(0);
-                right_widths.push(area.width.saturating_sub(used));
+                right_widths.push(right_margin);
             }
         } else if centered {
             let half = area.width / 2;
@@ -208,6 +309,7 @@ pub(super) fn compute_visible_margins(
         right_widths,
         left_widths,
         centered,
+        ..Default::default()
     }
 }
 
@@ -267,12 +369,33 @@ pub(super) fn draw_messages(
     super::set_last_max_scroll(max_scroll);
     update_user_prompt_positions(wrapped_user_prompt_starts);
 
+    // When older compacted history is being loaded in, the app hands us the
+    // reader's distance-from-bottom instead of an absolute offset. Distance from
+    // the bottom is invariant under a top-side prepend, so resolving it against
+    // the *current* total keeps the same content under the reader and the load
+    // is seamless (no jump to the new absolute top).
+    let anchored_scroll = app
+        .pending_history_anchor_lines_from_bottom()
+        .map(|lines_from_bottom| {
+            total_lines
+                .saturating_sub(lines_from_bottom)
+                .min(max_scroll)
+        });
     let user_scroll = app.scroll_offset().min(max_scroll);
-    let scroll = if app.auto_scroll_paused() {
+    let scroll = if let Some(anchored) = anchored_scroll {
+        super::set_tail_catchup_active(false);
+        anchored
+    } else if app.auto_scroll_paused() {
+        super::set_tail_catchup_active(false);
         user_scroll.min(max_scroll)
     } else {
-        max_scroll
+        resolve_tail_follow_scroll(max_scroll, viewport_height)
     };
+
+    // Publish the resolved geometry so scroll handlers and the anchor-reconcile
+    // tick can adopt the exact on-screen position after a prepend.
+    super::set_last_total_wrapped_lines(total_lines);
+    super::set_last_resolved_chat_scroll(scroll);
 
     let prompt_preview_lines = if crate::config::config().display.prompt_preview && scroll > 0 {
         compute_prompt_preview_line_count(
@@ -349,6 +472,14 @@ pub(super) fn draw_messages(
         right_widths: vec![0; prompt_preview_lines as usize],
         left_widths: vec![0; prompt_preview_lines as usize],
         centered: content_margins.centered,
+        // Bind row `r` of the margin to transcript line `scroll_top + r` so info
+        // widgets are residents of the transcript: they ride with the content they
+        // were placed next to, whether the user is scrolling or new lines are
+        // appending while pinned at the bottom. The prompt-preview band at the top
+        // is synthetic (not part of the scrolled transcript), so offset by it to
+        // keep the content rows aligned.
+        scroll_top: scroll.saturating_sub(prompt_preview_lines as usize),
+        ..Default::default()
     };
     margins
         .right_widths
@@ -361,6 +492,51 @@ pub(super) fn draw_messages(
     }
     while margins.left_widths.len() < viewport_height {
         margins.left_widths.push(0);
+    }
+
+    // Image placeholders are blank lines, so the margin scan above sees their
+    // rows as fully free and would happily dock an info widget on top of the
+    // picture. Carve every visible image region (and its label line) out of
+    // the free-width profile. A region with unknown width (mermaid crop = 0)
+    // occupies the full row.
+    {
+        let img_start = prepared
+            .image_regions
+            .partition_point(|region| region.end_line <= scroll);
+        let img_end = prepared
+            .image_regions
+            .partition_point(|region| region.abs_line_idx < visible_end);
+        for region in &prepared.image_regions[img_start..img_end] {
+            let occupied = if region.width == 0 {
+                content_area.width
+            } else {
+                region.width.min(content_area.width)
+            };
+            let leftover = content_area.width.saturating_sub(occupied);
+            // Non-centered mode draws the image flush left, leaving all the
+            // slack on the right; centered mode splits it across both sides.
+            let free_right = if margins.centered {
+                leftover / 2
+            } else {
+                leftover
+            };
+            // Include the label line directly above the region so a widget
+            // can't sit flush against the image top either.
+            let row_first = region.abs_line_idx.saturating_sub(1).max(scroll);
+            let row_last = region.end_line.min(visible_end);
+            for abs_line in row_first..row_last {
+                let row = prompt_preview_lines as usize + (abs_line - scroll);
+                if let Some(width) = margins.right_widths.get_mut(row) {
+                    *width = (*width).min(free_right);
+                }
+                if margins.centered
+                    && let Some(width) = margins.left_widths.get_mut(row)
+                {
+                    // Centered images leave half the slack on each side.
+                    *width = (*width).min(free_right);
+                }
+            }
+        }
     }
 
     record_copy_viewport_frame_snapshot(
@@ -389,7 +565,19 @@ pub(super) fn draw_messages(
             copied_notice: target.kind.copied_notice(),
             content: target.content.clone(),
         });
-        badge_assignments.push((target.badge_line, key));
+        // Prefer a line in the block with enough free width so the badge
+        // doesn't cut off content (full-width blockquote lines especially).
+        let badge_line = pick_copy_badge_line(
+            target.badge_line,
+            target.start_line,
+            target.end_line,
+            scroll,
+            visible_end,
+            &visible_lines,
+            content_area.width as usize,
+            copy_badge_reserved_width(key, &copy_badge_ui, copy_badge_now),
+        );
+        badge_assignments.push((badge_line, key));
     }
     reserve_copy_badge_margins(
         &mut margins,
@@ -545,11 +733,20 @@ pub(super) fn draw_messages(
                 } else {
                     " expand"
                 };
-                let reserved = UnicodeWidthStr::width(
-                    format!(" {} [⇧] [E] expand", copy_badge_alt_badge()).as_str(),
-                );
+                let reserved = expand_badge_reserved_width(badge_text);
                 let max_content_width = (content_area.width as usize).saturating_sub(reserved);
-                truncate_line_in_place_to_width(line, max_content_width);
+                truncate_line_for_copy_badge(line, max_content_width);
+
+                // Reserve the badge's width in the info-widget margin profile so a
+                // floating widget (e.g. the KV cache panel) docks far enough left to
+                // clear the appended `[Alt] [⇧] [E] expand` block instead of being
+                // squeezed into a too-narrow slot that wraps/collides with it. The
+                // margin row for `visible_lines[rel_idx]` is offset by the synthetic
+                // prompt-preview band, matching the image-region carve above.
+                let margin_row = prompt_preview_lines as usize + rel_idx;
+                if let Some(width) = margins.right_widths.get_mut(margin_row) {
+                    *width = (*width).saturating_sub(reserved as u16);
+                }
 
                 let alt_style = if copy_badge_ui.alt_is_active(copy_badge_now) {
                     Style::default().fg(queued_color()).bold()
@@ -592,7 +789,11 @@ pub(super) fn draw_messages(
         if let Some(line) = visible_lines.get_mut(rel_idx) {
             let reserved = copy_badge_reserved_width(key, &copy_badge_ui, copy_badge_now);
             let max_content_width = (content_area.width as usize).saturating_sub(reserved);
-            truncate_line_in_place_to_width(line, max_content_width);
+            // Trims trailing spaces so the badge sits exactly one separator
+            // space after the content; ends with a dim ellipsis when the
+            // content genuinely has to be cut.
+            truncate_line_for_copy_badge(line, max_content_width);
+            line.spans.push(Span::raw(" "));
 
             let alt_style = if copy_badge_ui.alt_is_active(copy_badge_now) {
                 Style::default().fg(queued_color()).bold()
@@ -617,9 +818,9 @@ pub(super) fn draw_messages(
                     Style::default().fg(Color::Red).bold()
                 };
                 let feedback_text = if success {
-                    " ✓ Copied!"
+                    "✓ Copied!"
                 } else {
-                    " ✗ Copy failed"
+                    "✗ Copy failed"
                 };
                 line.spans.push(Span::styled(feedback_text, feedback_style));
                 line.spans.push(Span::raw(" "));
@@ -671,11 +872,37 @@ pub(super) fn draw_messages(
         }
     }
 
+    // Never draw image-placeholder marker text to the terminal. The marker
+    // row only exists to carry `(hash, rows, cols)` into the prepare step,
+    // which has already turned it into `prepared.image_regions`. Historically
+    // it was drawn styled black-on-black and relied on staying invisible, but
+    // terminal features can defeat that (kitty's translucent background /
+    // contrast compositing, selection highlighting), leaking raw
+    // "IIMG:<hash>:..." junk into the transcript whenever the image itself
+    // is not painted over it (cold cache after a reload, prewarm in flight,
+    // pinned mode). Video export is the one consumer that intentionally
+    // scans printable markers out of the buffer, so it keeps them.
+    if !crate::tui::mermaid::is_video_export_mode() {
+        let marker_start = prepared
+            .image_regions
+            .partition_point(|region| region.abs_line_idx < scroll);
+        for region in &prepared.image_regions[marker_start..] {
+            if region.abs_line_idx >= visible_end {
+                break;
+            }
+            let rel_idx = region.abs_line_idx - scroll;
+            if let Some(line) = visible_lines.get_mut(rel_idx) {
+                *line = Line::default();
+            }
+        }
+    }
+
     frame.render_widget(Paragraph::new(visible_lines), content_area);
 
     let centered = app.centered_mode();
     let diagram_mode = app.diagram_mode();
-    if diagram_mode != crate::config::DiagramDisplayMode::Pinned {
+    let pinned_diagrams = diagram_mode == crate::config::DiagramDisplayMode::Pinned;
+    {
         let visible_image_start = prepared
             .image_regions
             .partition_point(|region| region.end_line <= scroll);
@@ -688,8 +915,56 @@ pub(super) fn draw_messages(
             let hash = region.hash;
             let total_height = region.height;
             let image_end = region.end_line;
+            let is_fit = region.render == jcode_tui_messages::ImageRegionRender::Fit;
+
+            if let Some(native_latex) = crate::tui::markdown::handterm_native_latex_for_hash(hash) {
+                // Native math writes real terminal cells rather than an overlay,
+                // so draw it only when the complete reserved region is visible.
+                // The ordinary paragraph pass has already cleared every cell in
+                // the region; placing the APC in the bottom-right cell guarantees
+                // it executes after those clears in Ratatui's row-major diff.
+                if abs_idx >= scroll
+                    && image_end <= visible_end
+                    && region.height == native_latex.rows
+                    && region.width == native_latex.cols
+                    && native_latex.cols <= content_area.width
+                {
+                    let top = content_area.y + (abs_idx - scroll) as u16;
+                    let x = content_area.x + native_latex.cols.saturating_sub(1);
+                    let y = top + native_latex.rows.saturating_sub(1);
+                    if let Some(symbol) = handterm_native_latex_cell_symbol(
+                        &native_latex.source,
+                        native_latex.rows,
+                        native_latex.cols,
+                    ) && let Some(cell) = frame.buffer_mut().cell_mut((x, y))
+                    {
+                        cell.set_symbol(&symbol)
+                            .set_fg(ratatui::style::Color::Rgb(100, 160, 255));
+                    }
+                }
+                continue;
+            }
+            // Pinned mode only redirects mermaid diagrams (Crop) to the side
+            // pane; inline raster images (Fit) always render in the flow.
+            if pinned_diagrams && !is_fit {
+                continue;
+            }
+
+            // Inline raster images are prepared lazily and off-thread: only
+            // the ones actually on screen get decoded/scaled, and a cold image
+            // schedules background prep instead of stalling this frame.
+            let fit_ready = if is_fit && image_end > scroll && abs_idx < visible_end {
+                super::inline_image_ui::ensure_drawable(hash, content_area.width, total_height)
+            } else {
+                true
+            };
 
             if image_end > scroll && abs_idx < visible_end {
+                if is_fit && !fit_ready {
+                    // Background prep in flight; leave the blank placeholder
+                    // rows this frame. A repaint is nudged on completion.
+                    continue;
+                }
                 let marker_visible = abs_idx >= scroll && abs_idx < visible_end;
 
                 if marker_visible {
@@ -704,14 +979,42 @@ pub(super) fn draw_messages(
                             width: content_area.width,
                             height: render_height,
                         };
-                        let rows = crate::tui::mermaid::render_image_widget(
-                            hash,
-                            image_area,
-                            frame.buffer_mut(),
-                            centered,
-                            false,
-                        );
-                        if rows == 0 {
+                        let rows = if is_fit {
+                            // Stable fit: scale once to the placeholder box and
+                            // reuse the transmitted pixels for every frame.
+                            // Kitty re-addresses terminal-retained pixels;
+                            // other protocols crop a pre-scaled source so the
+                            // visible slice never changes the image's scale.
+                            if crate::tui::mermaid::render_image_widget_fit_stable(
+                                hash,
+                                image_area,
+                                frame.buffer_mut(),
+                                content_area.width,
+                                total_height,
+                                0,
+                                centered,
+                                true,
+                            ) {
+                                image_area.height
+                            } else {
+                                crate::tui::mermaid::render_image_widget_fit(
+                                    hash,
+                                    image_area,
+                                    frame.buffer_mut(),
+                                    centered,
+                                    true,
+                                )
+                            }
+                        } else {
+                            crate::tui::mermaid::render_image_widget(
+                                hash,
+                                image_area,
+                                frame.buffer_mut(),
+                                centered,
+                                false,
+                            )
+                        };
+                        if rows == 0 && !is_fit {
                             frame.render_widget(
                                 Paragraph::new(Line::from(Span::styled(
                                     "↗ mermaid diagram unavailable",
@@ -734,15 +1037,77 @@ pub(super) fn draw_messages(
                             width: content_area.width,
                             height: render_height,
                         };
-                        crate::tui::mermaid::render_image_widget(
-                            hash,
-                            image_area,
-                            frame.buffer_mut(),
-                            centered,
-                            true,
-                        );
+                        if is_fit {
+                            // Top scrolled off: keep the same scaled pixels and
+                            // skip the hidden rows instead of rescaling into the
+                            // smaller visible portion on every protocol.
+                            let skip_rows = (visible_start - abs_idx) as u16;
+                            if !crate::tui::mermaid::render_image_widget_fit_stable(
+                                hash,
+                                image_area,
+                                frame.buffer_mut(),
+                                content_area.width,
+                                total_height,
+                                skip_rows,
+                                centered,
+                                true,
+                            ) {
+                                crate::tui::mermaid::render_image_widget_fit(
+                                    hash,
+                                    image_area,
+                                    frame.buffer_mut(),
+                                    centered,
+                                    true,
+                                );
+                            }
+                        } else {
+                            crate::tui::mermaid::render_image_widget(
+                                hash,
+                                image_area,
+                                frame.buffer_mut(),
+                                centered,
+                                true,
+                            );
+                        }
                     }
                 }
+            }
+        }
+
+        // Look-ahead prefetch: warm inline raster images within a margin band
+        // above/below the viewport so they are already decoded+scaled by the
+        // time they scroll into view, killing the first-scroll "blank then
+        // pop" hitch. Cheap and non-blocking: prefetch dedups against in-flight
+        // and already-warm state, and only the background worker does real
+        // work. Margin scales with viewport height so faster scrolls (which
+        // cover more rows per frame) get a deeper warm band.
+        if content_area.height > 0 {
+            const PREFETCH_VIEWPORTS: usize = 2;
+            let margin_lines = (content_area.height as usize)
+                .saturating_mul(PREFETCH_VIEWPORTS)
+                .max(1);
+            let prefetch_start = scroll.saturating_sub(margin_lines);
+            let prefetch_end = visible_end.saturating_add(margin_lines);
+            let band_start = prepared
+                .image_regions
+                .partition_point(|region| region.end_line <= prefetch_start);
+            let band_end = prepared
+                .image_regions
+                .partition_point(|region| region.abs_line_idx < prefetch_end);
+            for region in &prepared.image_regions[band_start..band_end] {
+                // Only inline raster images use the prewarm pipeline; mermaid
+                // crops build their own state at draw time. In pinned mode the
+                // raster images still render in the flow, so always prefetch.
+                if region.render != jcode_tui_messages::ImageRegionRender::Fit {
+                    continue;
+                }
+                // Skip the ones already on screen; the draw pass above warmed
+                // them via ensure_drawable.
+                let on_screen = region.end_line > scroll && region.abs_line_idx < visible_end;
+                if on_screen {
+                    continue;
+                }
+                super::inline_image_ui::prefetch(region.hash, content_area.width, region.height);
             }
         }
     }
@@ -883,7 +1248,41 @@ pub(super) fn draw_messages(
         );
     }
 
+    // Derive the dock-gating "reliable" width profile for *new* info widgets:
+    // the intersection of a small look-ahead windowed minimum (so a fresh widget
+    // won't be covered by a wide line one scroll line later) and the settlement
+    // profile (only transcript lines whose negative space has stopped changing
+    // may host a new widget - never the streaming tail or a re-rendering
+    // region). Pinned residents still size to the instantaneous widths.
+    margins.right_reliable = windowed_min(&margins.right_widths, INFO_WIDGET_LOOKAHEAD_ROWS);
+    if margins.centered {
+        margins.left_reliable = windowed_min(&margins.left_widths, INFO_WIDGET_LOOKAHEAD_ROWS);
+    }
+    info_widget::apply_settlement(&mut margins, content_area.width);
+
     margins
+}
+
+/// Look-ahead window (in rows) used to compute the "reliable" margin profile that
+/// gates where new info widgets may dock. Small by design: it only needs to cover
+/// the distance content travels in the few frames between a widget being placed and
+/// a nearby long line scrolling into its rows.
+const INFO_WIDGET_LOOKAHEAD_ROWS: usize = 2;
+
+/// Per-index minimum over `[i-window, i+window]`. Returns an empty vec for empty
+/// input (callers treat empty reliable profiles as "no look-ahead").
+fn windowed_min(widths: &[u16], window: usize) -> Vec<u16> {
+    if widths.is_empty() {
+        return Vec::new();
+    }
+    let n = widths.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let lo = i.saturating_sub(window);
+        let hi = (i + window).min(n - 1);
+        out.push(widths[lo..=hi].iter().copied().min().unwrap_or(0));
+    }
+    out
 }
 
 fn compute_prompt_preview_line_count(
@@ -942,6 +1341,84 @@ fn compute_max_scroll_with_prompt_preview(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn handterm_native_latex_cell_symbol_moves_invokes_and_restores_cursor() {
+        assert_eq!(
+            super::handterm_native_latex_cell_symbol(r"\frac{a}{b}", 3, 2).as_deref(),
+            Some("\x1b[s\x1b[2A\x1b[1D\x1b_L;\\frac{a}{b}\x1b\\\x1b[u\x1b[1C")
+        );
+        assert_eq!(
+            super::handterm_native_latex_cell_symbol("x", 1, 1).as_deref(),
+            Some("\x1b[s\x1b_L;x\x1b\\\x1b[u\x1b[1C")
+        );
+        assert!(super::handterm_native_latex_cell_symbol("x\x1by", 1, 1).is_none());
+    }
+
+    #[test]
+    fn tail_follow_small_appends_snap_to_bottom() {
+        // Streaming-sized appends (<= min jump) snap directly; no animation.
+        crate::tui::ui::set_last_resolved_chat_scroll(100);
+        let scroll = super::resolve_tail_follow_scroll(103, 30);
+        assert_eq!(scroll, 103);
+        assert!(!crate::tui::ui::tail_catchup_active());
+    }
+
+    #[test]
+    fn tail_follow_large_append_slides_in_bounded_steps() {
+        // A 12-row jump advances by at most TAIL_CATCHUP_MAX_STEP per frame
+        // and reports an active catch-up until it reaches the bottom.
+        crate::tui::ui::set_last_resolved_chat_scroll(100);
+        let first = super::resolve_tail_follow_scroll(112, 30);
+        assert!(first < 112, "must not snap: {first}");
+        assert!(
+            first - 100 <= super::TAIL_CATCHUP_MAX_STEP,
+            "step bounded: {first}"
+        );
+        assert!(crate::tui::ui::tail_catchup_active());
+
+        // Subsequent frames converge to the bottom and clear the flag.
+        let mut scroll = first;
+        let mut guard = 0;
+        while scroll < 112 {
+            crate::tui::ui::set_last_resolved_chat_scroll(scroll);
+            scroll = super::resolve_tail_follow_scroll(112, 30);
+            guard += 1;
+            assert!(guard < 50, "catch-up must converge");
+        }
+        assert_eq!(scroll, 112);
+        assert!(!crate::tui::ui::tail_catchup_active());
+    }
+
+    #[test]
+    fn explicit_tail_follow_request_skips_content_catch_up_animation() {
+        crate::tui::ui::set_last_resolved_chat_scroll(40);
+        crate::tui::ui::request_tail_follow_snap();
+
+        let scroll = super::resolve_tail_follow_scroll(80, 30);
+
+        assert_eq!(scroll, 80);
+        assert!(!crate::tui::ui::tail_catchup_active());
+    }
+
+    #[test]
+    fn tail_follow_caps_lag_to_one_viewport() {
+        // A huge append (way beyond a screen) starts at most one viewport
+        // behind the bottom so the catch-up never replays pages of content.
+        crate::tui::ui::set_last_resolved_chat_scroll(100);
+        let scroll = super::resolve_tail_follow_scroll(400, 30);
+        assert!(scroll >= 400 - 30, "lag capped to viewport: {scroll}");
+        assert!(crate::tui::ui::tail_catchup_active());
+    }
+
+    #[test]
+    fn tail_follow_backward_motion_snaps() {
+        // Content shrank (commit collapsed reasoning): snap, don't animate.
+        crate::tui::ui::set_last_resolved_chat_scroll(100);
+        let scroll = super::resolve_tail_follow_scroll(80, 30);
+        assert_eq!(scroll, 80);
+        assert!(!crate::tui::ui::tail_catchup_active());
+    }
+
     #[test]
     fn default_copy_badge_alt_label_matches_platform() {
         #[cfg(target_os = "macos")]

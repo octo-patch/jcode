@@ -1,14 +1,13 @@
 use super::{
-    ClientConnectionInfo, ClientDebugState, FileAccess, SessionInterruptQueues, SwarmEvent,
-    SwarmEventType, SwarmMember, VersionedPlan, record_swarm_event,
-    remove_session_channel_subscriptions, remove_session_file_touches, remove_session_from_swarm,
+    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEvent,
+    SwarmEventType, SwarmMember, VersionedPlan, record_swarm_event, remove_background_tool_signal,
+    remove_session_channel_subscriptions, remove_session_from_swarm,
     remove_session_interrupt_queue, unregister_session_event_sender, update_member_status,
 };
 use crate::agent::Agent;
 use anyhow::Result;
 use jcode_agent_runtime::InterruptSignal;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -62,8 +61,7 @@ pub(super) async fn cleanup_client_connection(
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
-    file_touches: &Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: &Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: &FileTouchService,
     channel_subscriptions: &ChannelSubscriptions,
     channel_subscriptions_by_session: &ChannelSubscriptions,
     client_debug_state: &Arc<RwLock<ClientDebugState>>,
@@ -109,9 +107,7 @@ pub(super) async fn cleanup_client_connection(
     }
 
     {
-        let mut sessions_guard = sessions.write().await;
-        if let Some(agent_arc) = sessions_guard.remove(client_session_id) {
-            drop(sessions_guard);
+        if let Some(agent_arc) = super::remove_session_entry(sessions, client_session_id).await {
             let lock_result =
                 tokio::time::timeout(std::time::Duration::from_secs(2), agent_arc.lock()).await;
 
@@ -213,6 +209,8 @@ pub(super) async fn cleanup_client_connection(
                 (None, None)
             }
         };
+        crate::session_metrics::forget(client_session_id);
+        crate::session_effort::forget_session_effort(client_session_id);
 
         if let Some(ref swarm_id) = swarm_id {
             record_swarm_event(
@@ -243,14 +241,14 @@ pub(super) async fn cleanup_client_connection(
             channel_subscriptions_by_session,
         )
         .await;
-        remove_session_file_touches(client_session_id, file_touches, files_touched_by_session)
-            .await;
+        file_touch.clear_session(client_session_id).await;
     }
 
     {
         let mut signals = shutdown_signals.write().await;
         signals.remove(client_session_id);
     }
+    remove_background_tool_signal(client_session_id);
     remove_session_interrupt_queue(soft_interrupt_queues, client_session_id).await;
 
     if let Some(handle) = processing_task.take() {

@@ -136,7 +136,7 @@ pub fn hot_update(session_id: &str) -> Result<()> {
 
     match update::check_for_update_blocking() {
         Ok(Some(release)) => {
-            let current = jcode_build_meta::VERSION;
+            let current = jcode_build_meta::version();
             update::print_centered(&format!(
                 "Update available: {} -> {}",
                 current, release.tag_name
@@ -152,6 +152,7 @@ pub fn hot_update(session_id: &str) -> Result<()> {
             }) {
                 Ok(path) => {
                     update::print_centered(&format!("✓ Installed {}", release.tag_name));
+                    reload_server_after_update("installed update");
 
                     let is_selfdev = crate::cli::selfdev::client_selfdev_requested();
                     let exe = build::client_update_candidate(is_selfdev)
@@ -174,20 +175,27 @@ pub fn hot_update(session_id: &str) -> Result<()> {
                     return Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err));
                 }
                 Err(e) => {
-                    update::print_centered(&format!("✗ Download failed: {}", e));
-                    update::print_centered("Resuming session with current version...");
+                    update::print_centered(&format!(
+                        "✗ Download failed: {}",
+                        update::summarize_update_error(&format!("{:#}", e))
+                    ));
                 }
             }
         }
         Ok(None) => {
+            if repair_stale_shared_server_after_update_check() {
+                reload_server_after_update("repaired stale server target");
+            }
             update::print_centered(&format!(
                 "Already up to date ({})",
-                jcode_build_meta::VERSION
+                jcode_build_meta::version()
             ));
         }
         Err(e) => {
-            update::print_centered(&format!("✗ Update check failed: {}", e));
-            update::print_centered("Resuming session with current version...");
+            update::print_centered(&format!(
+                "✗ Update check failed: {}",
+                update::summarize_update_error(&format!("{:#}", e))
+            ));
         }
     }
 
@@ -210,18 +218,46 @@ pub fn get_repo_dir() -> Option<std::path::PathBuf> {
     build::get_repo_dir()
 }
 
+/// Minimum interval between `git fetch` update probes across all jcode
+/// processes. Every source-build client spawn used to fetch unconditionally,
+/// so spawning N clients at once ran N concurrent `git fetch` + ssh sessions
+/// against the remote. One probe per interval per machine is plenty; a marker
+/// file's mtime coordinates it (same pattern as the session-backup pruner).
+const UPDATE_FETCH_INTERVAL_SECS: u64 = 15 * 60;
+
+fn claim_update_fetch_slot() -> bool {
+    let Ok(base) = crate::storage::jcode_dir() else {
+        // Cannot coordinate without a home dir; fall back to probing.
+        return true;
+    };
+    let marker = base.join("update-fetch.stamp");
+    if let Ok(metadata) = std::fs::metadata(&marker)
+        && let Ok(modified) = metadata.modified()
+        && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
+        && age.as_secs() < UPDATE_FETCH_INTERVAL_SECS
+    {
+        return false;
+    }
+    // Touch before fetching so a spawn burst collapses to ~one fetch.
+    std::fs::write(&marker, b"").is_ok()
+}
+
 pub fn check_for_updates() -> Option<bool> {
     let repo_dir = get_repo_dir()?;
 
-    let fetch = ProcessCommand::new("git")
-        .args(["fetch", "-q"])
-        .current_dir(&repo_dir)
-        .output()
-        .ok()?;
+    if claim_update_fetch_slot() {
+        let fetch = ProcessCommand::new("git")
+            .args(["fetch", "-q"])
+            .current_dir(&repo_dir)
+            .output()
+            .ok()?;
 
-    if !fetch.status.success() {
-        return None;
+        if !fetch.status.success() {
+            return None;
+        }
     }
+    // When the fetch slot was claimed by another recent process, still answer
+    // from the (fresh enough) local refs instead of skipping the check.
 
     let behind = ProcessCommand::new("git")
         .args(["rev-list", "--count", "HEAD..@{u}"])
@@ -305,7 +341,7 @@ pub fn run_update() -> Result<()> {
             Ok(Some(release)) => {
                 update::print_centered(&format!(
                     "Downloading {} \u{2192} {}...",
-                    jcode_build_meta::VERSION,
+                    jcode_build_meta::version(),
                     release.tag_name
                 ));
                 let _path =
@@ -317,16 +353,23 @@ pub fn run_update() -> Result<()> {
                         ));
                     })?;
                 update::print_centered(&format!("✅ Updated to {}", release.tag_name));
+                reload_server_after_update("installed update");
                 update::print_centered("Restart jcode to use the new version.");
             }
             Ok(None) => {
+                if repair_stale_shared_server_after_update_check() {
+                    reload_server_after_update("repaired stale server target");
+                }
                 update::print_centered(&format!(
                     "Already up to date ({})",
-                    jcode_build_meta::VERSION
+                    jcode_build_meta::version()
                 ));
             }
             Err(e) => {
-                anyhow::bail!("Update check failed: {}", e);
+                anyhow::bail!(
+                    "Update check failed: {}",
+                    update::summarize_update_error(&format!("{:#}", e))
+                );
             }
         }
         return Ok(());
@@ -363,4 +406,67 @@ pub fn run_update() -> Result<()> {
     update::print_centered(&format!("Successfully updated to {}", hash.trim()));
 
     Ok(())
+}
+
+fn repair_stale_shared_server_after_update_check() -> bool {
+    match build::repair_stale_shared_server_channel() {
+        Ok(build::SharedServerRepair::Repaired {
+            previous,
+            repaired_to,
+        }) => {
+            crate::logging::info(&format!(
+                "update: repaired stale shared-server channel {:?} -> {}",
+                previous, repaired_to
+            ));
+            update::print_centered(&format!(
+                "Repaired stale server reload target: {}",
+                repaired_to
+            ));
+            true
+        }
+        Ok(build::SharedServerRepair::AlreadyCurrent) => false,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "update: failed to repair stale shared-server channel: {}",
+                error
+            ));
+            false
+        }
+    }
+}
+
+fn reload_server_after_update(reason: &str) {
+    let exe = build::client_update_candidate(false)
+        .map(|(path, _)| path)
+        .or_else(|| std::env::current_exe().ok());
+    let Some(exe) = exe else {
+        crate::logging::warn("update: could not find jcode binary to reload stale server");
+        return;
+    };
+
+    let output = ProcessCommand::new(&exe)
+        .args(["--no-update", "server", "reload", "--force"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            crate::logging::info(&format!(
+                "update: requested server reload after {} via {:?}",
+                reason, exe
+            ));
+        }
+        Ok(output) => {
+            crate::logging::warn(&format!(
+                "update: server reload after {} failed with status {:?}: {}",
+                reason,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "update: failed to request server reload after {} via {:?}: {}",
+                reason, exe, error
+            ));
+        }
+    }
 }

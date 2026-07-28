@@ -9,6 +9,7 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Continue working".to_string(),
                 status: "pending".to_string(),
@@ -17,6 +18,7 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -43,13 +45,14 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
         assert!(app.queued_messages().is_empty());
         assert!(app.display_messages().iter().any(|msg| {
             msg.content
-                .contains("/poke queued. Re-checking incomplete todos after this turn")
+                .contains("Poke queued. We'll re-check for unfinished todos after this turn")
         }));
 
         crate::todo::save_todos(
             &app.session.id,
             &[
                 crate::todo::TodoItem {
+                    group: None,
                     id: "todo-1".to_string(),
                     content: "Continue working".to_string(),
                     status: "pending".to_string(),
@@ -58,8 +61,10 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
                     assigned_to: None,
                     confidence: None,
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
                 crate::todo::TodoItem {
+                    group: None,
                     id: "todo-2".to_string(),
                     content: "Handle the newly discovered follow-up".to_string(),
                     status: "pending".to_string(),
@@ -68,6 +73,7 @@ fn test_remote_poke_queues_when_turn_is_in_progress() {
                     assigned_to: None,
                     confidence: None,
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
             ],
         )
@@ -107,7 +113,7 @@ fn test_remote_ctrl_p_toggles_auto_poke() {
         assert_eq!(app.status_notice(), Some("Poke: ON".to_string()));
         assert!(app.display_messages().iter().any(|msg| {
             msg.content
-                .contains("Auto-poke enabled. No incomplete todos found right now.")
+                .contains("Auto-poke enabled. Nothing unfinished right now")
         }));
     });
 }
@@ -148,6 +154,7 @@ fn test_remote_interrupted_auto_poke_requeues_after_deferred_poke() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Resume after interrupt".to_string(),
                 status: "pending".to_string(),
@@ -156,6 +163,7 @@ fn test_remote_interrupted_auto_poke_requeues_after_deferred_poke() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -186,7 +194,7 @@ fn test_handle_server_event_tool_start_flushes_streaming_text_before_tool_messag
 
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
-    app.streaming_text = "Let me inspect those files first.".to_string();
+    app.streaming.streaming_text = "Let me inspect those files first.".to_string();
 
     app.handle_server_event(
         crate::protocol::ServerEvent::ToolStart {
@@ -196,7 +204,7 @@ fn test_handle_server_event_tool_start_flushes_streaming_text_before_tool_messag
         &mut remote,
     );
 
-    assert!(app.streaming_text.is_empty());
+    assert!(app.streaming.streaming_text.is_empty());
     assert_eq!(app.display_messages().len(), 1);
     assert_eq!(app.display_messages()[0].role, "assistant");
     assert_eq!(
@@ -504,6 +512,7 @@ fn test_observe_marks_large_tool_results() {
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "large.txt"}),
         intent: None,
+        thought_signature: None,
     };
     let output = "x".repeat(48_000);
     app.observe_tool_result(&tool_call, &output, false, Some("read"));
@@ -531,6 +540,7 @@ fn test_observe_repaint_does_not_leave_severity_badge_artifact() {
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "large.txt"}),
         intent: None,
+        thought_signature: None,
     };
 
     let large_output = "x".repeat(48_000);
@@ -734,6 +744,7 @@ fn test_handle_server_event_notification_background_task_scope_uses_card_renderi
             notification_type: crate::protocol::NotificationType::Message {
                 scope: Some("background_task".to_string()),
                 channel: None,
+                tldr: None,
             },
             message: "**Background task** `abc123` · `bash` · ✗ failed · 7.1s · exit 1\n\n```text\n[stderr] line one\n[stderr] line two\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"abc123\"`".to_string(),
         },
@@ -760,6 +771,112 @@ fn test_handle_server_event_notification_background_task_scope_uses_card_renderi
         "background-task notifications should not render as generic swarm items:\n{}",
         text
     );
+}
+
+#[test]
+fn test_swarm_completion_notification_inserts_agent_snapshot_without_report_prose() {
+    let _render_lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    let session_id = "session_cow_snapshot";
+    app.remote_swarm_members = vec![crate::protocol::SwarmMemberStatus {
+        session_id: session_id.to_string(),
+        friendly_name: Some("cow".to_string()),
+        status: "completed".to_string(),
+        detail: None,
+        task_label: Some("card demo".to_string()),
+        role: Some("agent".to_string()),
+        is_headless: Some(true),
+        live_attachments: Some(0),
+        status_age_secs: Some(0),
+        output_tail: None,
+        report_back_to_session_id: Some("coordinator".to_string()),
+        todo_progress: Some((3, 3)),
+        todo_items: Vec::new(),
+        runtime: crate::protocol::SwarmMemberRuntime {
+            model: Some("openai:gpt-5.6-sol".to_string()),
+            provider: Some("OpenAI".to_string()),
+            auth_method: Some("OAuth".to_string()),
+            effort: Some("high".to_string()),
+            elapsed_secs: Some(35),
+        },
+    }];
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Notification {
+            from_session: session_id.to_string(),
+            from_name: Some("cow".to_string()),
+            notification_type: crate::protocol::NotificationType::Message {
+                scope: Some("swarm".to_string()),
+                channel: None,
+                tldr: Some("Demo completed".to_string()),
+            },
+            message: "Demo completed; README first heading is jcode.".to_string(),
+        },
+        &mut remote,
+    );
+
+    let last = app
+        .display_messages()
+        .last()
+        .expect("missing completed agent snapshot");
+    assert_eq!(
+        last.title.as_deref(),
+        Some(crate::tui::ui::SWARM_AGENT_SNAPSHOT_TITLE)
+    );
+    assert!(!last.content.contains("Demo completed"));
+
+    let rendered =
+        crate::tui::ui::render_swarm_message(last, 100, crate::config::DiffDisplayMode::Off)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    assert_eq!(
+        rendered.trim(),
+        "🐄 ✓ card demo · Completed",
+        "completed transcript snapshots should stay stable and one-line"
+    );
+    assert!(!rendered.contains("README first heading"));
+}
+
+#[test]
+fn test_swarm_await_notification_inserts_only_compact_summary() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Notification {
+            from_session: "swarm".to_string(),
+            from_name: Some("swarm await".to_string()),
+            notification_type: crate::protocol::NotificationType::Message {
+                scope: Some("swarm_await".to_string()),
+                channel: None,
+                tldr: None,
+            },
+            message: "🐝 **Swarm await finished**\n\nAll members done. All 1 members are done: elephant\n\nMember statuses:\n  ✓ elephant (completed)\n\nCompletion reports:\n\n--- elephant (completed) ---\nCompact card demo finished.\n\nValidation:\nParser tests pass."
+                .to_string(),
+        },
+        &mut remote,
+    );
+
+    let last = app
+        .display_messages()
+        .last()
+        .expect("missing compact swarm await summary");
+    assert_eq!(last.title.as_deref(), Some("🐝 Swarm await"));
+    assert_eq!(last.content, "✓ 1/1");
+    assert!(!last.content.contains("elephant"));
+    assert!(!last.content.contains("Validation"));
 }
 
 #[test]
@@ -798,6 +915,7 @@ fn test_background_task_markdown_renders_card_even_if_role_was_lost() {
 fn test_handle_remote_disconnect_flushes_streaming_text_and_sets_reconnect_state() {
     let mut app = create_test_app();
     app.is_processing = true;
+    app.auth_catalog_refresh_pending = true;
     app.status = ProcessingStatus::Streaming;
     app.current_message_id = Some(7);
     app.rate_limit_pending_message = Some(PendingRemoteMessage {
@@ -809,16 +927,17 @@ fn test_handle_remote_disconnect_flushes_streaming_text_and_sets_reconnect_state
         retry_attempts: 0,
         retry_at: None,
     });
-    app.streaming_text = "partial response being streamed".to_string();
+    app.streaming.streaming_text = "partial response being streamed".to_string();
 
     let mut state = remote::RemoteRunState::default();
     remote::handle_disconnect(&mut app, &mut state, None);
 
     assert!(!app.is_processing);
+    assert!(!app.auth_catalog_refresh_pending);
     assert!(matches!(app.status, ProcessingStatus::Idle));
     assert!(app.current_message_id.is_none());
     assert!(app.rate_limit_pending_message.is_none());
-    assert!(app.streaming_text.is_empty());
+    assert!(app.streaming.streaming_text.is_empty());
     assert_eq!(state.disconnect_msg_idx, Some(1));
     assert_eq!(state.reconnect_attempts, 1);
     assert!(state.disconnect_start.is_some());

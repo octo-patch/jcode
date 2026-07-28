@@ -124,7 +124,7 @@ pub fn render_image_widget(
         .get()
         .and_then(|p| p.as_ref())
         .map(|picker| image_area.width as u32 * picker.font_size().0 as u32);
-    let cached = get_cached_diagram(hash, min_cached_width);
+    let cached = get_cached_diagram_prefer_width(hash, min_cached_width);
     let (img_width, path) = if let Some(cached) = cached {
         (cached.width, Some(cached.path))
     } else {
@@ -202,7 +202,7 @@ pub fn render_image_widget(
                     .ok()
                     .and_then(|mut map| {
                         let prev = map.get(&hash).cloned();
-                        map.insert(hash, state_key.clone());
+                        super::bounded_bookkeeping_insert(&mut map, hash, state_key.clone());
                         prev
                     })
                     .map(|prev| prev == state_key)
@@ -239,6 +239,7 @@ pub fn render_image_widget(
         if let Ok(mut dbg) = MERMAID_DEBUG.lock() {
             dbg.stats.image_state_misses += 1;
         }
+        let source_bytes = img.as_bytes().len();
         let protocol = picker.new_resize_protocol(img);
 
         let mut state = IMAGE_STATE
@@ -249,6 +250,7 @@ pub fn render_image_widget(
             ImageState {
                 protocol,
                 source_path: path.clone(),
+                source_bytes,
                 last_area: Some(render_area),
                 resize_mode: ResizeMode::Crop,
                 last_crop_top: false,
@@ -352,7 +354,7 @@ fn render_image_widget_fit_inner(
             .and_then(|p| p.as_ref())
             .map(|picker| image_area.width as u32 * picker.font_size().0 as u32)
     };
-    let cached = get_cached_diagram(hash, min_cached_width);
+    let cached = get_cached_diagram_prefer_width(hash, min_cached_width);
     let (img_width, path) = if let Some(cached) = cached {
         (cached.width, Some(cached.path))
     } else {
@@ -421,7 +423,7 @@ fn render_image_widget_fit_inner(
                     .ok()
                     .and_then(|mut map| {
                         let prev = map.get(&hash).cloned();
-                        map.insert(hash, state_key.clone());
+                        super::bounded_bookkeeping_insert(&mut map, hash, state_key.clone());
                         prev
                     })
                     .map(|prev| prev == state_key)
@@ -464,6 +466,7 @@ fn render_image_widget_fit_inner(
         } else {
             Resize::Fit(None)
         };
+        let source_bytes = img.as_bytes().len();
         let protocol = picker.new_resize_protocol(img);
 
         let mut state = IMAGE_STATE
@@ -474,6 +477,7 @@ fn render_image_widget_fit_inner(
             ImageState {
                 protocol,
                 source_path: path.clone(),
+                source_bytes,
                 last_area: Some(render_area),
                 resize_mode: target_mode,
                 last_crop_top: false,

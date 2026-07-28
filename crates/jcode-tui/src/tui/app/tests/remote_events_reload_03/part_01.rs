@@ -163,6 +163,7 @@ fn test_handle_server_event_history_with_interruption_queues_continuation() {
             connection_type: Some("websocket".to_string()),
             status_detail: None,
             upstream_provider: None,
+            resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
@@ -238,6 +239,7 @@ fn test_handle_server_event_history_uses_server_owned_reload_recovery_directive(
         connection_type: Some("websocket".to_string()),
         status_detail: None,
         upstream_provider: None,
+        resolved_credential: None,
         reasoning_effort: None,
         service_tier: None,
         compaction_mode: crate::config::CompactionMode::Reactive,
@@ -315,6 +317,7 @@ fn test_handle_server_event_history_without_interruption_does_not_queue() {
             connection_type: Some("https/sse".to_string()),
             status_detail: None,
             upstream_provider: None,
+            resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
@@ -377,6 +380,7 @@ fn test_handle_server_event_history_after_reload_reports_no_continuation_needed(
             connection_type: Some("websocket".to_string()),
             status_detail: None,
             upstream_provider: None,
+            resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
@@ -677,6 +681,7 @@ fn test_handle_server_event_history_restores_side_panel_snapshot() {
             connection_type: Some("websocket".to_string()),
             status_detail: None,
             upstream_provider: None,
+            resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
@@ -704,7 +709,7 @@ fn test_handle_server_event_history_restores_active_resume_processing_state() {
     let _guard = rt.enter();
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
 
-    app.handle_server_event(
+    let needs_redraw = app.handle_server_event(
         crate::protocol::ServerEvent::History {
             id: 1,
             session_id: "ses_resume_active".to_string(),
@@ -733,6 +738,7 @@ fn test_handle_server_event_history_restores_active_resume_processing_state() {
             connection_type: Some("websocket".to_string()),
             status_detail: None,
             upstream_provider: None,
+            resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
@@ -745,6 +751,7 @@ fn test_handle_server_event_history_restores_active_resume_processing_state() {
         &mut remote,
     );
 
+    assert!(needs_redraw, "resumed session history must redraw immediately");
     assert!(app.is_processing());
     assert!(app.processing_started.is_some());
     assert!(app.time_since_activity().is_some());

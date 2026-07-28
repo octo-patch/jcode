@@ -3,11 +3,48 @@ use crate::tui::{TuiState, detect_kv_cache_problem, ui};
 
 impl App {
     pub(super) fn current_skills_snapshot(&self) -> std::sync::Arc<crate::skill::SkillRegistry> {
-        self.registry
+        // Global skills from the shared registry plus this session's
+        // project-local overlay, resolved fresh from the session working dir
+        // (issue #457). The overlay never enters the shared registry.
+        let global = self
+            .registry
             .skills()
             .try_read()
             .map(|skills| std::sync::Arc::new(skills.clone()))
-            .unwrap_or_else(|_| self.skills.clone())
+            .unwrap_or_else(|_| self.skills.clone());
+        let working_dir = self
+            .session
+            .working_dir
+            .as_deref()
+            .map(std::path::Path::new);
+        std::sync::Arc::new(crate::skill::SkillRegistry::effective_for_working_dir(
+            &global,
+            working_dir,
+        ))
+    }
+
+    /// Re-read skills from disk for the active session working directory and
+    /// sync the TUI-side registry snapshot.
+    ///
+    /// The agent-side `skill_manage reload_all` tool updates only the server
+    /// process's `SkillRegistry`; the TUI keeps an independent copy that was
+    /// otherwise refreshed only at startup or on a slash-command miss. Calling
+    /// this before rendering `/skills` (and on demand elsewhere) keeps newly
+    /// added skills visible without a session restart (issue #431).
+    pub(super) fn refresh_skills_snapshot(&mut self) {
+        // Only GLOBAL skills go into the shared registry and the cached
+        // snapshot; the project-local overlay is composed per read in
+        // `current_skills_snapshot` so it stays session-scoped (issue #457).
+        if let Ok(reloaded) = crate::skill::SkillRegistry::load_global() {
+            self.skills = std::sync::Arc::new(reloaded.clone());
+            if let Ok(mut shared) = self.registry.skills().try_write() {
+                *shared = reloaded;
+            }
+            self.invalidate_command_candidates_cache();
+            // The header lists loaded skills; refresh it now rather than
+            // waiting out the header cache TTL.
+            crate::tui::ui::prepare::invalidate_header_prep_cache();
+        }
     }
 
     pub fn cursor_pos(&self) -> usize {
@@ -22,8 +59,17 @@ impl App {
         self.is_processing || self.pending_queued_dispatch || self.split_launch_in_flight()
     }
 
+    /// Keep a power inhibitor held while a turn is processing/streaming so the
+    /// machine does not idle-sleep mid-stream. No-op on unsupported platforms
+    /// or when `[power].prevent_sleep_while_streaming` is disabled (#452).
+    pub(super) fn sync_sleep_guard(&mut self) {
+        let enabled = crate::config::config().power.prevent_sleep_while_streaming;
+        self.power_inhibitor
+            .set_active(enabled && self.is_processing());
+    }
+
     pub fn streaming_text(&self) -> &str {
-        &self.streaming_text
+        &self.streaming.streaming_text
     }
 
     pub fn active_skill(&self) -> Option<&str> {
@@ -44,7 +90,10 @@ impl App {
     }
 
     pub fn streaming_tokens(&self) -> (u64, u64) {
-        (self.streaming_input_tokens, self.streaming_output_tokens)
+        (
+            self.streaming.streaming_input_tokens,
+            self.streaming.streaming_output_tokens,
+        )
     }
 
     pub(super) fn build_turn_footer(&self, duration: Option<f32>) -> Option<String> {
@@ -56,16 +105,16 @@ impl App {
         if let Some(tps) = self.compute_streaming_tps() {
             parts.push(format!("{:.1} tps", tps));
         }
-        if self.streaming_input_tokens > 0 || self.streaming_output_tokens > 0 {
+        if self.streaming.streaming_input_tokens > 0 || self.streaming.streaming_output_tokens > 0 {
             parts.push(format!(
                 "↑{} ↓{}",
-                format_tokens(self.streaming_input_tokens),
-                format_tokens(self.streaming_output_tokens)
+                format_tokens(self.streaming.streaming_input_tokens),
+                format_tokens(self.streaming.streaming_output_tokens)
             ));
         }
         if let Some(cache) = format_cache_footer(
-            self.streaming_cache_read_tokens,
-            self.streaming_cache_creation_tokens,
+            self.streaming.streaming_cache_read_tokens,
+            self.streaming.streaming_cache_creation_tokens,
         ) {
             parts.push(cache);
         }
@@ -78,10 +127,10 @@ impl App {
     }
 
     pub(super) fn has_streaming_footer_stats(&self) -> bool {
-        self.streaming_input_tokens > 0
-            || self.streaming_output_tokens > 0
-            || self.streaming_cache_read_tokens.is_some()
-            || self.streaming_cache_creation_tokens.is_some()
+        self.streaming.streaming_input_tokens > 0
+            || self.streaming.streaming_output_tokens > 0
+            || self.streaming.streaming_cache_read_tokens.is_some()
+            || self.streaming.streaming_cache_creation_tokens.is_some()
             || self.compute_streaming_tps().is_some()
     }
 
@@ -93,7 +142,15 @@ impl App {
         self.last_api_completed_provider = Some(<Self as TuiState>::provider_name(self));
         self.last_api_completed_model = Some(<Self as TuiState>::provider_model(self));
         self.last_turn_input_tokens = {
-            let input = self.streaming_input_tokens;
+            // Effective prompt size (input + cache read + creation): for
+            // split-accounting providers bare input is only the uncached
+            // remainder, and this figure feeds the cache countdown/cold
+            // indicators as "what gets resent".
+            let input = crate::tui::info_widget::effective_prompt_tokens(
+                self.streaming.streaming_input_tokens,
+                self.streaming.streaming_cache_read_tokens.unwrap_or(0),
+                self.streaming.streaming_cache_creation_tokens.unwrap_or(0),
+            );
             if input > 0 { Some(input) } else { None }
         };
 
@@ -124,9 +181,9 @@ impl App {
             &provider,
             upstream_provider,
             user_turn_count,
-            self.streaming_input_tokens,
-            self.streaming_cache_read_tokens,
-            self.streaming_cache_creation_tokens,
+            self.streaming.streaming_input_tokens,
+            self.streaming.streaming_cache_read_tokens,
+            self.streaming.streaming_cache_creation_tokens,
             cache_ttl.as_ref(),
         );
 
@@ -134,12 +191,13 @@ impl App {
             // Collect context for debugging
             let session_id = self.session_id().to_string();
             let model = <Self as TuiState>::provider_model(self);
-            let input_tokens = self.streaming_input_tokens;
-            let output_tokens = self.streaming_output_tokens;
+            let input_tokens = self.streaming.streaming_input_tokens;
+            let output_tokens = self.streaming.streaming_output_tokens;
 
             // Format as Option to distinguish None vs Some(0)
-            let cache_creation_dbg = format!("{:?}", self.streaming_cache_creation_tokens);
-            let cache_read_dbg = format!("{:?}", self.streaming_cache_read_tokens);
+            let cache_creation_dbg =
+                format!("{:?}", self.streaming.streaming_cache_creation_tokens);
+            let cache_read_dbg = format!("{:?}", self.streaming.streaming_cache_read_tokens);
 
             // Count message types in conversation
             let mut user_msgs = 0;
@@ -249,10 +307,13 @@ impl App {
             return Some(d);
         }
         if self.is_processing() {
-            return self
+            let elapsed = self
                 .visible_turn_started
                 .or(self.processing_started)
                 .map(|t| t.elapsed());
+            if elapsed.is_some() {
+                return elapsed;
+            }
         }
         self.split_launch_in_flight()
             .then(|| self.pending_split_started_at.map(|t| t.elapsed()))
@@ -292,6 +353,8 @@ impl App {
         if positions.is_empty() {
             return;
         }
+        // An explicit jump should win over a still-settling history prepend.
+        self.pending_history_anchor = None;
 
         let current = self.scroll_offset;
 
@@ -317,8 +380,16 @@ impl App {
 
         if let Some(pos) = target {
             self.scroll_offset = pos;
+        } else {
+            // No earlier prompt is loaded. If older compacted history exists,
+            // pull it in (anchored) and jump to the very top so the next press
+            // continues into the freshly loaded prompts instead of stalling.
+            if self.compacted_history_has_remaining() {
+                self.scroll_offset = 0;
+                self.auto_scroll_paused = true;
+                self.maybe_queue_compacted_history_load();
+            }
         }
-        // If no prompt above, stay where we are
     }
 
     /// Scroll to the next user prompt (scroll down - later in conversation)
@@ -327,6 +398,7 @@ impl App {
         if positions.is_empty() || !self.auto_scroll_paused {
             return;
         }
+        self.pending_history_anchor = None;
 
         let current = self.scroll_offset;
 
@@ -353,6 +425,7 @@ impl App {
         if positions.is_empty() {
             return;
         }
+        self.pending_history_anchor = None;
 
         // positions are in document order (top to bottom), we want most-recent first
         let target_idx = positions.len().saturating_sub(rank);

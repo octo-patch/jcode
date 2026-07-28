@@ -1,4 +1,9 @@
 use super::*;
+
+#[test]
+fn manager_without_project_dir_does_not_use_process_cwd() {
+    assert!(MemoryManager::new().get_project_dir().is_none());
+}
 use crate::message::{ContentBlock, Message, Role};
 use serde_json::json;
 use std::fs;
@@ -163,6 +168,91 @@ fn pending_memory_per_session_isolation() {
 }
 
 #[test]
+fn pending_memory_suppresses_payload_when_all_ids_already_known() {
+    let _guard = PENDING_MEMORY_TEST_LOCK
+        .lock()
+        .expect("pending memory test lock poisoned");
+    clear_all_pending_memory();
+
+    let sid = "test-session-known";
+    mark_memories_known(sid, &["mem-x".to_string(), "mem-y".to_string()], "test");
+
+    // Wait out the short-term signature/set suppression windows by using
+    // distinct payload text; the id-level known check must trigger on its own.
+    set_pending_memory_with_ids(
+        sid,
+        "brand new formatting of old knowledge".to_string(),
+        2,
+        vec!["mem-y".to_string(), "mem-x".to_string()],
+    );
+    assert!(
+        take_pending_memory(sid).is_none(),
+        "payload made entirely of already-known memories must not inject"
+    );
+
+    // A payload with at least one genuinely new memory still injects.
+    set_pending_memory_with_ids(
+        sid,
+        "mix of old and new".to_string(),
+        2,
+        vec!["mem-x".to_string(), "mem-new".to_string()],
+    );
+    assert!(
+        take_pending_memory(sid).is_some(),
+        "payload containing an unknown memory should inject"
+    );
+
+    clear_all_pending_memory();
+}
+
+#[test]
+fn injected_memory_dedup_expires_after_ttl() {
+    let _guard = PENDING_MEMORY_TEST_LOCK
+        .lock()
+        .expect("pending memory test lock poisoned");
+    clear_all_pending_memory();
+
+    let sid = "test-session-ttl";
+    mark_memories_injected(sid, &["mem-ttl".to_string()]);
+    assert!(is_memory_injected(sid, "mem-ttl"));
+
+    // Backdate past the TTL: the memory may surface again.
+    backdate_injected_memory_for_test(sid, "mem-ttl", Duration::from_secs(46 * 60));
+    assert!(
+        !is_memory_injected(sid, "mem-ttl"),
+        "injected-memory dedup must expire after the TTL"
+    );
+    assert!(!is_memory_injected_any("mem-ttl"));
+
+    clear_all_pending_memory();
+}
+
+#[test]
+fn mark_memories_known_blocks_reinjection_like_injection() {
+    let _guard = PENDING_MEMORY_TEST_LOCK
+        .lock()
+        .expect("pending memory test lock poisoned");
+    clear_all_pending_memory();
+
+    let sid = "test-session-self-echo";
+    let other = "test-session-other";
+
+    // Simulates extraction: the memory came from sid's own transcript.
+    mark_memories_known(sid, &["mem-echo".to_string()], "extracted from transcript");
+
+    assert!(
+        is_memory_injected(sid, "mem-echo"),
+        "known memory must count as injected for its source session"
+    );
+    assert!(
+        !is_memory_injected(other, "mem-echo"),
+        "other sessions are unaffected by another session's known-marking"
+    );
+
+    clear_all_pending_memory();
+}
+
+#[test]
 fn format_context_includes_roles_and_tools() {
     let messages = vec![
         Message::user("Hello world"),
@@ -172,6 +262,7 @@ fn format_context_includes_roles_and_tools() {
                 id: "tool-1".to_string(),
                 name: "memory".to_string(),
                 input: json!({"action": "list"}),
+                thought_signature: None,
             }],
             timestamp: None,
             tool_duration_ms: None,
@@ -206,6 +297,7 @@ fn extraction_context_keeps_tool_io_details() {
                 id: "tool-1".to_string(),
                 name: "memory".to_string(),
                 input: json!({"action": "list"}),
+                thought_signature: None,
             }],
             timestamp: None,
             tool_duration_ms: None,
@@ -533,9 +625,12 @@ fn retrieval_candidates_include_local_skills() {
     with_temp_home(|home| {
         // memory no longer reaches into skill directly; register the skill
         // synthetic-entry provider (as cli::startup does in production) so the
-        // memory<-skill integration this test exercises is wired up.
+        // memory<-skill integration this test exercises is wired up. The
+        // shared snapshot is global-only (issue #457), so production composes
+        // the process-cwd project overlay on top.
         crate::memory::register_synthetic_entry_provider(|| {
-            crate::skill::SkillRegistry::shared_snapshot()
+            let global = crate::skill::SkillRegistry::shared_snapshot();
+            crate::skill::SkillRegistry::effective_for_working_dir(&global, None)
                 .list()
                 .into_iter()
                 .map(|skill| skill.as_memory_entry())
@@ -620,4 +715,156 @@ fn score_and_filter_prioritizes_matching_skill_memories() {
     assert_eq!(ranked.len(), 2);
     assert_eq!(ranked[0].0.id, "skill:todo-planning-skill");
     assert!(ranked[0].1 > ranked[1].1);
+}
+
+#[test]
+fn hybrid_fuse_rescues_lexical_match_dense_would_miss() {
+    // A memory that is the obvious lexical answer (shares the rare identifier
+    // `find_similar_hybrid`) but is given a deliberately ORTHOGONAL embedding so
+    // pure dense cosine ranks it last. BM25 must rescue it into the top result.
+    let target = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "The function find_similar_hybrid fuses dense and bm25 with RRF.",
+    )
+    .with_embedding(vec![0.0, 1.0]);
+
+    let distractor_a = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "Unrelated note about coffee brewing temperatures.",
+    )
+    .with_embedding(vec![1.0, 0.0]);
+    let distractor_b = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "Another unrelated note about bicycle maintenance.",
+    )
+    .with_embedding(vec![0.95, 0.05]);
+
+    // Query embedding points along the distractors' axis, so dense alone would
+    // rank the target dead last; the query TEXT contains the rare identifier.
+    let query_text = "how does find_similar_hybrid work";
+    let query_emb = vec![1.0, 0.0];
+
+    let ranked = MemoryManager::hybrid_fuse(
+        vec![target.clone(), distractor_a, distractor_b],
+        query_text,
+        &query_emb,
+        3,
+    );
+
+    assert!(!ranked.is_empty(), "hybrid must return candidates");
+    assert_eq!(
+        ranked[0].0.id, target.id,
+        "BM25 should rescue the exact-identifier memory to the top despite poor dense score"
+    );
+}
+
+#[test]
+fn hybrid_fuse_returns_dense_hits_without_lexical_overlap() {
+    // When the query shares NO tokens with any memory, hybrid must still return
+    // the dense-nearest memory (fusion falls back to the dense ranking).
+    let near = MemoryEntry::new(MemoryCategory::Fact, "alpha bravo charlie")
+        .with_embedding(vec![1.0, 0.0]);
+    let far =
+        MemoryEntry::new(MemoryCategory::Fact, "delta echo foxtrot").with_embedding(vec![0.0, 1.0]);
+
+    let ranked = MemoryManager::hybrid_fuse(
+        vec![near.clone(), far],
+        "zzz_nonmatching_query_token",
+        &[1.0, 0.0],
+        2,
+    );
+
+    assert!(!ranked.is_empty());
+    assert_eq!(
+        ranked[0].0.id, near.id,
+        "dense-nearest memory should rank first"
+    );
+}
+
+#[test]
+fn hybrid_excludes_superseded_memories() {
+    with_temp_home(|_home| {
+        let manager = MemoryManager::new().with_project_dir("/tmp/jcode-hybrid-supersede");
+
+        // Two memories on the same topic with explicit distinct ids (avoid
+        // same-millisecond id collisions).
+        // Distinct embeddings so the write-time dedup does not merge them.
+        let old = MemoryEntry::new(MemoryCategory::Fact, "The build uses cargo profile dev")
+            .with_embedding(vec![1.0, 0.0]);
+        let new = MemoryEntry::new(MemoryCategory::Fact, "The build uses cargo profile selfdev")
+            .with_embedding(vec![0.0, 1.0]);
+
+        let old_id = manager.remember_project(old).expect("remember old");
+        let new_id = manager.remember_project(new).expect("remember new");
+        assert_ne!(old_id, new_id, "ids must differ");
+
+        // Supersede the old memory.
+        let mut graph = manager.load_project_graph().expect("load");
+        graph.supersede(&new_id, &old_id);
+        manager.save_project_graph(&graph).expect("save");
+
+        let results = manager
+            .find_similar_hybrid("cargo build profile selfdev", &[0.0, 1.0], 10)
+            .expect("hybrid");
+        let ids: Vec<&str> = results.iter().map(|(e, _)| e.id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&old_id.as_str()),
+            "superseded memory must not surface from hybrid retrieval; got {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&new_id.as_str()),
+            "the superseding memory should still surface; got {:?}",
+            ids
+        );
+    });
+}
+
+#[test]
+fn focus_query_text_strips_noise_and_leads_with_user_intent() {
+    let raw = "\
+<system-reminder>\n# Session Context\nDate: 2026-06-14\n</system-reminder>\n\
+User:\n\
+how do I fix the scroll bug in navigation.rs\n\
+Assistant:\n\
+Let me look at the handler.\n\
+[Tool: read]\n\
+[Result: fn handle_scroll() { ... }]\n\
+Assistant:\n\
+The bug is in the mouse delta calc.";
+
+    let focused = super::focus_query_text(raw);
+
+    // System-reminder block is gone.
+    assert!(
+        !focused.contains("Session Context"),
+        "reminder not stripped: {focused}"
+    );
+    assert!(!focused.contains("<system-reminder>"));
+    // Tool noise is gone.
+    assert!(
+        !focused.contains("[Tool:"),
+        "tool marker not stripped: {focused}"
+    );
+    assert!(!focused.contains("[Result:"));
+    // Role markers are gone.
+    assert!(!focused.contains("User:"));
+    assert!(!focused.contains("Assistant:"));
+    // Real prose is kept.
+    assert!(focused.contains("scroll bug in navigation.rs"));
+    assert!(focused.contains("mouse delta calc"));
+    // Leads with the latest user intent.
+    assert!(
+        focused.starts_with("how do I fix the scroll bug in navigation.rs"),
+        "should lead with latest user message: {focused}"
+    );
+}
+
+#[test]
+fn focus_query_text_falls_back_when_all_stripped() {
+    let raw = "<system-reminder>\nonly boilerplate\n</system-reminder>\n[Tool: read]";
+    let focused = super::focus_query_text(raw);
+    // Nothing substantive survives -> fall back to raw rather than empty.
+    assert_eq!(focused, raw);
 }

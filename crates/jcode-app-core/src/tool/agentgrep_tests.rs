@@ -45,6 +45,17 @@ fn grep_input(query: &str, max_regions: Option<usize>) -> AgentGrepInput {
 }
 
 #[test]
+fn agentgrep_rejects_missing_session_cwd_instead_of_using_process_cwd() {
+    let mut ctx = test_ctx(Path::new("/unused"));
+    ctx.working_dir = None;
+
+    let error = run_agentgrep_blocking(&grep_input("needle", None), &ctx)
+        .expect_err("workspace search without a session cwd must fail");
+
+    assert!(error.to_string().contains("session working directory"));
+}
+
+#[test]
 fn render_compacts_huge_grep_match_lines() {
     let args = GrepArgs {
         query: "set_status_notice".to_string(),
@@ -63,7 +74,7 @@ fn render_compacts_huge_grep_match_lines() {
         "b".repeat(800)
     );
 
-    let compact = render::compact_rendered_match_line(&line, &args);
+    let compact = ::agentgrep::render::compact_rendered_match_line(&line, &args);
 
     assert!(compact.contains("set_status_notice"));
     assert!(compact.contains("[truncated:"), "{compact}");
@@ -72,6 +83,23 @@ fn render_compacts_huge_grep_match_lines() {
         "compact output should be bounded, got {} chars: {compact}",
         compact.chars().count()
     );
+}
+
+#[test]
+fn render_compacts_huge_trace_region_body_lines() {
+    let line = format!("function handleAuth(){{{}}}", "var x=1;".repeat(2000));
+
+    let compact = ::agentgrep::render::compact_region_body_line(&line);
+
+    assert!(compact.contains("[truncated:"), "{compact}");
+    assert!(
+        compact.chars().count() < 340,
+        "compact region body line should be bounded, got {} chars",
+        compact.chars().count()
+    );
+
+    let short = "fn small() {}";
+    assert_eq!(::agentgrep::render::compact_region_body_line(short), short);
 }
 
 #[test]
@@ -218,6 +246,41 @@ fn build_grep_args_scopes_file_path_to_parent_and_exact_glob() {
         Some(temp.path().join("src").to_string_lossy().as_ref())
     );
     assert_eq!(args.glob.as_deref(), Some("app.rs"));
+}
+
+#[test]
+fn build_grep_and_find_args_scope_file_field_to_exact_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(temp.path().join("src")).expect("mkdir");
+    fs::write(temp.path().join("src/app.rs"), "fn auth_status() {}\n").expect("write file");
+
+    let ctx = test_ctx(temp.path());
+    let params = AgentGrepInput {
+        mode: "grep".to_string(),
+        query: Some("auth_status".to_string()),
+        file: Some("src/app.rs".to_string()),
+        terms: None,
+        regex: Some(false),
+        path: None,
+        glob: Some("**/*.rs".to_string()),
+        file_type: Some("rs".to_string()),
+        hidden: None,
+        no_ignore: None,
+        max_files: None,
+        max_regions: None,
+        full_region: None,
+        debug_plan: None,
+        debug_score: None,
+        paths_only: None,
+    };
+
+    let grep = build_grep_args(&params, &ctx).unwrap();
+    let find = build_find_args(&params, &ctx).unwrap();
+    let expected_parent = temp.path().join("src").to_string_lossy().into_owned();
+    assert_eq!(grep.path.as_deref(), Some(expected_parent.as_str()));
+    assert_eq!(grep.glob.as_deref(), Some("app.rs"));
+    assert_eq!(find.path.as_deref(), Some(expected_parent.as_str()));
+    assert_eq!(find.glob.as_deref(), Some("app.rs"));
 }
 
 #[test]
@@ -467,6 +530,84 @@ fn build_outline_args_accepts_file_field() {
     assert_eq!(args.path.as_deref(), Some("/workspace/repo"));
 }
 
+#[test]
+fn input_accepts_file_path_alias_for_file() {
+    let params: AgentGrepInput = serde_json::from_value(json!({
+        "mode": "outline",
+        "file_path": "src/app.rs"
+    }))
+    .expect("agentgrep input with file_path should deserialize");
+
+    assert_eq!(params.file.as_deref(), Some("src/app.rs"));
+}
+
+#[test]
+fn build_outline_args_treats_file_valued_path_as_outline_target() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::write(temp.path().join("app.rs"), "fn main() {}\n").expect("write file");
+    let ctx = test_ctx(temp.path());
+
+    let params = AgentGrepInput {
+        mode: "outline".to_string(),
+        query: Some("fn".to_string()),
+        file: None,
+        terms: None,
+        regex: None,
+        path: Some("app.rs".to_string()),
+        glob: None,
+        file_type: None,
+        hidden: None,
+        no_ignore: None,
+        max_files: None,
+        max_regions: None,
+        full_region: None,
+        debug_plan: None,
+        debug_score: None,
+        paths_only: None,
+    };
+
+    let args = build_outline_args(&params, &ctx, None).unwrap();
+    assert_eq!(
+        args.file,
+        temp.path().join("app.rs").display().to_string(),
+        "file-valued path should become the outline target instead of joining query onto it"
+    );
+    assert_eq!(args.path, None);
+}
+
+#[test]
+fn build_outline_args_does_not_duplicate_file_valued_path_when_file_is_also_set() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let relative_file = "src/tool/todo.rs";
+    let absolute_file = temp.path().join(relative_file);
+    fs::create_dir_all(absolute_file.parent().expect("file parent")).expect("mkdir");
+    fs::write(&absolute_file, "pub fn save_todos() {}\n").expect("write file");
+    let ctx = test_ctx(temp.path());
+
+    let params = AgentGrepInput {
+        mode: "outline".to_string(),
+        query: None,
+        file: Some(relative_file.to_string()),
+        terms: None,
+        regex: None,
+        path: Some(relative_file.to_string()),
+        glob: None,
+        file_type: None,
+        hidden: None,
+        no_ignore: None,
+        max_files: None,
+        max_regions: None,
+        full_region: None,
+        debug_plan: None,
+        debug_score: None,
+        paths_only: None,
+    };
+
+    let args = build_outline_args(&params, &ctx, None).unwrap();
+    assert_eq!(args.file, absolute_file.display().to_string());
+    assert_eq!(args.path, None);
+}
+
 #[tokio::test]
 async fn execute_runs_linked_grep() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -506,6 +647,30 @@ async fn execute_runs_linked_grep_when_mode_is_omitted() {
 
     assert!(output.output.contains("query: auth_status"));
     assert!(output.output.contains("app.rs"));
+}
+
+#[tokio::test]
+async fn execute_grep_file_field_does_not_scan_sibling_files() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(temp.path().join("src")).expect("mkdir");
+    fs::write(temp.path().join("src/app.rs"), "fn target() {}\n").expect("write target");
+    fs::write(
+        temp.path().join("src/sibling.rs"),
+        "fn target() { panic!(\"sibling marker\") }\n",
+    )
+    .expect("write sibling");
+
+    let output = AgentGrepTool::new()
+        .execute(
+            json!({"mode": "grep", "query": "target", "file": "src/app.rs"}),
+            test_ctx(temp.path()),
+        )
+        .await
+        .expect("file-scoped grep");
+
+    assert!(output.output.contains("app.rs"));
+    assert!(!output.output.contains("sibling.rs"));
+    assert!(!output.output.contains("sibling marker"));
 }
 
 #[tokio::test]
@@ -654,6 +819,7 @@ fn bash_exposure_collects_file_and_line_hits() {
             "command": "cat src/tool/lsp.rs && rg -n auth_status src/tool/lsp.rs"
         }),
         intent: None,
+        thought_signature: None,
     };
     let content = "src/tool/lsp.rs:42:let status = auth_status();\n";
 
@@ -749,4 +915,21 @@ fn tuning_detects_file_changed_since_seen() {
 
     assert!(tuned.current_version_confidence < 0.6);
     assert!(tuned.reasons.contains(&"file_changed_since_seen"));
+}
+
+#[test]
+fn input_accepts_legacy_grep_param_aliases() {
+    // Models sometimes call the removed native `grep` tool, which is now
+    // aliased to agentgrep. Its `pattern`/`include` params must map to
+    // agentgrep's `query`/`glob`.
+    let input: AgentGrepInput = serde_json::from_value(serde_json::json!({
+        "pattern": "fn main",
+        "include": "*.rs",
+        "path": "src"
+    }))
+    .expect("legacy grep params should deserialize");
+    assert_eq!(input.query.as_deref(), Some("fn main"));
+    assert_eq!(input.glob.as_deref(), Some("*.rs"));
+    assert_eq!(input.path.as_deref(), Some("src"));
+    assert_eq!(input.mode, "grep");
 }

@@ -104,6 +104,7 @@ mod transcript_routing_tests {
     use crate::protocol::ServerEvent;
     use crate::server::SwarmMember;
     use std::collections::HashMap;
+    #[cfg(target_os = "linux")]
     use std::ffi::OsString;
     use std::sync::Arc;
     use std::time::Instant;
@@ -128,6 +129,11 @@ mod transcript_routing_tests {
             joined_at: now,
             last_status_change: now,
             is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+            task_label: None,
         }
     }
 
@@ -145,15 +151,18 @@ mod transcript_routing_tests {
             last_seen,
             is_processing: false,
             current_tool_name: None,
+            terminal_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         }
     }
 
+    #[cfg(target_os = "linux")]
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
+    #[cfg(target_os = "linux")]
     impl EnvVarGuard {
         fn set<K: AsRef<std::ffi::OsStr>>(key: &'static str, value: K) -> Self {
             let previous = std::env::var_os(key);
@@ -162,6 +171,7 @@ mod transcript_routing_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {

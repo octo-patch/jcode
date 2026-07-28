@@ -26,6 +26,7 @@ pub fn default_comm_cleanup_target_statuses() -> Vec<String> {
         "completed".to_string(),
         "failed".to_string(),
         "stopped".to_string(),
+        "crashed".to_string(),
     ]
 }
 
@@ -35,6 +36,7 @@ pub fn default_comm_run_await_statuses() -> Vec<String> {
         "completed".to_string(),
         "failed".to_string(),
         "stopped".to_string(),
+        "crashed".to_string(),
     ]
 }
 
@@ -44,6 +46,7 @@ pub fn default_comm_await_target_statuses() -> Vec<String> {
         "completed".to_string(),
         "stopped".to_string(),
         "failed".to_string(),
+        "crashed".to_string(),
     ]
 }
 
@@ -152,6 +155,93 @@ pub fn format_comm_members(current_session_id: &str, members: &[AgentInfo]) -> S
             } else {
                 String::new()
             };
+
+            // Status line: lifecycle + detail, then a contextual age label.
+            // For an idle/ready agent the "age" is how long it has been idle;
+            // for a running agent it is how long the current turn has run.
+            let detail_suffix = member
+                .detail
+                .as_deref()
+                .map(|detail| format!(" — {}", detail))
+                .unwrap_or_default();
+            // Stable task label: what this agent was spawned/assigned for.
+            // Skip when the transient detail already says the same thing.
+            let task_suffix = match member.task_label.as_deref() {
+                Some(task)
+                    if !task.trim().is_empty()
+                        && member.detail.as_deref().is_none_or(|d| !d.contains(task)) =>
+                {
+                    format!("\n    Task: {}", task)
+                }
+                _ => String::new(),
+            };
+            let age_suffix = match member.status_age_secs {
+                Some(age) if status == "ready" || status == "idle" => {
+                    format!(" · idle {}", format_secs(age))
+                }
+                Some(age) if status == "running" => format!(" · {}", format_secs(age)),
+                Some(age) => format!(" · {} ago", format_secs(age)),
+                None => String::new(),
+            };
+            // Last observed activity (tokens/tools/heartbeats). status_age only
+            // tracks lifecycle transitions, so a worker mid-turn for minutes
+            // looks stale without this even while it streams tokens.
+            let activity_age_suffix = match member.last_activity_age_secs {
+                Some(age) if status == "running" || status == "queued" => {
+                    format!(" · active {} ago", format_secs(age))
+                }
+                _ => String::new(),
+            };
+
+            // Live activity: what the agent is doing right now.
+            let activity_suffix = match member.activity.as_ref() {
+                Some(activity) if activity.is_processing => {
+                    match activity.current_tool_name.as_deref() {
+                        Some(tool) => format!("\n    Activity: working ({})", tool),
+                        None => "\n    Activity: thinking".to_string(),
+                    }
+                }
+                _ => String::new(),
+            };
+
+            // Progress: todos completed / total.
+            let progress_suffix = match (member.todos_completed, member.todos_total) {
+                (Some(done), Some(total)) if total > 0 => {
+                    format!("\n    Progress: {}/{} todos", done, total)
+                }
+                _ => String::new(),
+            };
+
+            // Live work signal: recent token churn + cumulative + turns.
+            let mut work_meta = Vec::new();
+            if let (Some(recent), Some(window)) =
+                (member.recent_total_tokens, member.recent_window_secs)
+                && recent > 0
+            {
+                work_meta.push(format!("{} tok/{}s", format_count(recent), window));
+            }
+            if let Some(turns) = member.turn_count.filter(|turns| *turns > 0) {
+                work_meta.push(format!("{} turns", turns));
+            }
+            if let Some(total) = member.cumulative_total_tokens.filter(|total| *total > 0) {
+                work_meta.push(format!("{} tok total", format_count(total)));
+            }
+            let work_suffix = if work_meta.is_empty() {
+                String::new()
+            } else {
+                format!("\n    Work: {}", work_meta.join(" · "))
+            };
+
+            // Model line.
+            let model_suffix = match (
+                member.provider_name.as_deref(),
+                member.provider_model.as_deref(),
+            ) {
+                (Some(provider), Some(model)) => format!("\n    Model: {}/{}", provider, model),
+                (None, Some(model)) => format!("\n    Model: {}", model),
+                _ => String::new(),
+            };
+
             let mut extra_meta = Vec::new();
             if member.is_headless == Some(true) {
                 extra_meta.push("headless".to_string());
@@ -166,34 +256,78 @@ pub fn format_comm_members(current_session_id: &str, members: &[AgentInfo]) -> S
             if let Some(attachments) = member.live_attachments {
                 extra_meta.push(format!("attachments={attachments}"));
             }
-            if let Some(age_secs) = member.status_age_secs {
-                extra_meta.push(format!("status_age={}s", age_secs));
-            }
             let meta_suffix = if extra_meta.is_empty() {
                 String::new()
             } else {
                 format!("\n    Meta: {}", extra_meta.join(" · "))
             };
+
+            // Completion report when the agent has finished.
+            let report_suffix = match member.latest_completion_report.as_deref() {
+                Some(report) if !report.trim().is_empty() => {
+                    format!("\n    Report: {}", truncate_report(report))
+                }
+                _ => String::new(),
+            };
+
             output.push_str(&format!(
-                "  {}{} ({})\n    Status: {}{}{}{}\n",
+                "  {}{} ({})\n    Status: {}{}{}{}{}{}{}{}{}{}{}{}\n",
                 name,
                 role_label,
                 if is_me { "you" } else { session },
                 status,
-                member
-                    .detail
-                    .as_deref()
-                    .map(|detail| format!(" — {}", detail))
-                    .unwrap_or_default(),
+                detail_suffix,
+                age_suffix,
+                activity_age_suffix,
+                task_suffix,
+                activity_suffix,
+                progress_suffix,
+                work_suffix,
+                model_suffix,
                 if files.is_empty() {
                     String::new()
                 } else {
                     format!("\n    Files: {}", files)
                 },
-                meta_suffix
+                meta_suffix,
+                report_suffix,
             ));
         }
         output
+    }
+}
+
+/// Format a duration in seconds into a compact human label (e.g. `45s`, `3m`, `2h`).
+fn format_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+/// Format a token count compactly (e.g. `850`, `12.3k`, `1.2M`).
+fn format_count(count: u64) -> String {
+    if count < 1_000 {
+        count.to_string()
+    } else if count < 1_000_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    }
+}
+
+/// Truncate a completion report to a single compact line for the roster view.
+fn truncate_report(report: &str) -> String {
+    const MAX: usize = 120;
+    let one_line: String = report.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > MAX {
+        let truncated: String = one_line.chars().take(MAX).collect();
+        format!("{}…", truncated)
+    } else {
+        one_line
     }
 }
 
@@ -256,6 +390,9 @@ pub fn format_comm_status_snapshot(snapshot: &AgentStatusSnapshot) -> String {
     if let Some(attachments) = snapshot.live_attachments {
         meta.push(format!("attachments={attachments}"));
     }
+    if let Some(age_secs) = snapshot.last_activity_age_secs {
+        meta.push(format!("active={} ago", format_secs(age_secs)));
+    }
     if let Some(age_secs) = snapshot.status_age_secs {
         meta.push(format!("status_age={}s", age_secs));
     }
@@ -284,9 +421,25 @@ pub fn format_comm_status_snapshot(snapshot: &AgentStatusSnapshot) -> String {
 pub fn format_comm_plan_status(summary: &PlanGraphStatus) -> String {
     let swarm_id = summary.swarm_id.as_deref().unwrap_or("unknown");
     let mut output = format!(
-        "Plan status for swarm {}\n\n  Version: {}\n  Items: {}\n",
-        swarm_id, summary.version, summary.item_count
+        "Plan status for swarm {}\n\n  Version: {}\n  Mode: {}\n  Items: {}\n",
+        swarm_id, summary.version, summary.mode, summary.item_count
     );
+    // Growth accounting: deep mode is meant to outgrow its seed (decomposition,
+    // gate-injected gaps). Surfacing seeded-vs-grown makes a plan that never
+    // grew visibly under-explored.
+    if summary.mode.eq_ignore_ascii_case("deep") && summary.item_count > 0 {
+        output.push_str(&format!(
+            "  Growth: {} seeded -> {} nodes ({} machinery-grown)",
+            summary.seeded_count, summary.item_count, summary.grown_count
+        ));
+        if summary.grown_count == 0 {
+            output.push_str(
+                " — the graph has not grown beyond its seed yet; \
+                 expect expand_node decomposition and gate-injected gaps",
+            );
+        }
+        output.push('\n');
+    }
 
     output.push_str(&format!(
         "  Ready: {}\n",
@@ -322,6 +475,26 @@ pub fn format_comm_plan_status(summary: &PlanGraphStatus) -> String {
             summary.completed_ids.join(", ")
         ));
     }
+    if !summary.failed_ids.is_empty() {
+        output.push_str(&format!(
+            "  Failed (terminal without completing): {}\n",
+            summary.failed_ids.join(", ")
+        ));
+        // Recorded failure reasons (from the durable task progress): a run
+        // that burned nodes on e.g. a 401 credential wave must explain itself
+        // here instead of only listing ids.
+        for id in &summary.failed_ids {
+            if let Some(reason) = summary.failed_reasons.get(id) {
+                output.push_str(&format!("    {}: {}\n", id, reason));
+            }
+        }
+    }
+    if !summary.low_confidence_ids.is_empty() {
+        output.push_str(&format!(
+            "  Low confidence (completed but shaky; widen with follow-up nodes): {}\n",
+            summary.low_confidence_ids.join(", ")
+        ));
+    }
     if !summary.cycle_ids.is_empty() {
         output.push_str(&format!("  Cycles: {}\n", summary.cycle_ids.join(", ")));
     }
@@ -345,14 +518,22 @@ pub fn format_comm_context_history(target: &str, messages: &[HistoryMessage]) ->
             messages.len()
         );
         for msg in messages {
-            let truncated = if msg.content.len() > 500 {
-                format!("{}...", &msg.content[..500])
-            } else {
-                msg.content.clone()
-            };
+            let truncated = truncate_history_content(&msg.content, 500);
             output.push_str(&format!("[{}] {}\n\n", msg.role, truncated));
         }
         output
+    }
+}
+
+/// Truncate on a char boundary. Byte slicing panics when the cut lands inside a
+/// multibyte code point (see #573).
+fn truncate_history_content(content: &str, max_chars: usize) -> String {
+    let mut chars = content.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 
@@ -396,8 +577,13 @@ pub fn format_comm_awaited_members_with_reports(
     members: &[AwaitedMemberStatus],
     reports: &HashMap<String, String>,
 ) -> String {
-    let mut output = if completed {
+    // An any-mode wait can complete while some members are still pending, so
+    // only claim "All members done" when every member actually matched.
+    let all_done = members.iter().all(|member| member.done);
+    let mut output = if completed && all_done {
         format!("All members done. {}\n", summary)
+    } else if completed {
+        format!("Await satisfied. {}\n", summary)
     } else {
         format!("Await incomplete. {}\n", summary)
     };
@@ -464,5 +650,43 @@ pub fn format_comm_channels(channels: &[SwarmChannelInfo]) -> String {
             ));
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    #[test]
+    fn history_truncation_handles_multibyte_boundaries() {
+        // 600 Vietnamese chars: byte index 500 lands inside a code point.
+        let content = "ủ".repeat(600);
+        let out = truncate_history_content(&content, 500);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.trim_end_matches('.').chars().count(), 500);
+    }
+
+    #[test]
+    fn history_truncation_keeps_short_content_verbatim() {
+        assert_eq!(truncate_history_content("hello ủ", 500), "hello ủ");
+    }
+
+    #[test]
+    fn format_comm_context_history_does_not_panic_on_multibyte() {
+        // Craft content whose byte index 500 lands strictly inside a code point:
+        // 499 ASCII bytes then a 3-byte char occupying bytes 499..502.
+        let content = format!("{}{}", "a".repeat(499), "ủ".repeat(50));
+        assert!(
+            !content.is_char_boundary(500),
+            "probe must straddle a code point"
+        );
+        let messages = vec![HistoryMessage {
+            role: "user".to_string(),
+            content,
+            tool_calls: None,
+            tool_data: None,
+        }];
+        let out = format_comm_context_history("worker", &messages);
+        assert!(out.contains("[user]"));
     }
 }

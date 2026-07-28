@@ -10,6 +10,33 @@ use jcode_tui_core::keybind::{
     parse_keybinding, parse_optional, parse_or_default,
 };
 
+// Re-export the per-platform keybinding registry + provenance + validation API
+// so the rest of the TUI can reach it via `crate::tui::keybind::*`.
+#[allow(unused_imports)]
+pub use jcode_config_types::keybindings::{
+    KEYBINDING_DEFAULTS, KeybindingDefault, KeybindingIssue, KeybindingIssueKind,
+    KeybindingPlatform, KeybindingProvenance, PlatformDefault, default_binding,
+    keybinding_defaults_report, validate_keybinding_defaults,
+};
+
+/// Emit a one-time log warning for every keybinding default that is asymmetric
+/// across platforms or relies on an unconfirmed auto-translation. This is the
+/// "check layer": it nudges developers to confirm/fix per-platform defaults
+/// without blocking startup.
+pub fn log_keybinding_default_warnings() {
+    let issues = validate_keybinding_defaults();
+    if issues.is_empty() {
+        return;
+    }
+    crate::logging::warn(&format!(
+        "KEYBINDINGS: {} default(s) need review (platform asymmetry / unconfirmed auto-translation)",
+        issues.len()
+    ));
+    for issue in issues {
+        crate::logging::warn(&format!("KEYBINDINGS: {}", issue.message));
+    }
+}
+
 pub fn load_model_switch_keys() -> ModelSwitchKeys {
     let cfg = config();
 
@@ -30,6 +57,36 @@ pub fn load_model_switch_keys() -> ModelSwitchKeys {
     );
 
     ModelSwitchKeys { next, prev }
+}
+
+/// Binding that accepts the post-error fallback offer (switch to the next best
+/// model/auth-method and resend). Defaults to Ctrl+Y; set "" to disable.
+pub fn load_fallback_switch_key() -> OptionalBinding {
+    let cfg = config();
+    let raw = cfg.keybindings.fallback_switch.trim();
+    if raw.is_empty() || is_disabled(raw) {
+        return OptionalBinding::default();
+    }
+    match parse_keybinding(raw) {
+        Some(binding) => OptionalBinding {
+            label: Some(format_binding(&binding)),
+            binding: Some(binding),
+        },
+        None => OptionalBinding {
+            label: Some("Ctrl+Y".to_string()),
+            binding: Some(KeyBinding {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::CONTROL,
+            }),
+        },
+    }
+}
+
+/// Human-facing label for the fallback-switch key, for use in offer messages.
+pub fn fallback_switch_key_label() -> String {
+    load_fallback_switch_key()
+        .label
+        .unwrap_or_else(|| "Ctrl+Y".to_string())
 }
 
 pub fn load_workspace_navigation_keys() -> WorkspaceNavigationKeys {
@@ -75,14 +132,15 @@ pub fn load_workspace_navigation_keys() -> WorkspaceNavigationKeys {
 pub fn load_scroll_keys() -> ScrollKeys {
     let cfg = config();
 
-    // Default to Ctrl+K/J for scroll (vim-style), Alt+U/D for page scroll
+    // Default to Ctrl+Shift+K/J for incremental scroll; Ctrl+K/J (un-shifted)
+    // move by prompt. Alt+U/D for page scroll.
     let default_up = KeyBinding {
         code: KeyCode::Char('k'),
-        modifiers: KeyModifiers::CONTROL,
+        modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     };
     let default_down = KeyBinding {
         code: KeyCode::Char('j'),
-        modifiers: KeyModifiers::CONTROL,
+        modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     };
     let default_page_up = KeyBinding {
         code: KeyCode::Char('u'),
@@ -93,11 +151,11 @@ pub fn load_scroll_keys() -> ScrollKeys {
         modifiers: KeyModifiers::ALT,
     };
     let default_prompt_up = KeyBinding {
-        code: KeyCode::Char('['),
+        code: KeyCode::Char('k'),
         modifiers: KeyModifiers::CONTROL,
     };
     let default_prompt_down = KeyBinding {
-        code: KeyCode::Char(']'),
+        code: KeyCode::Char('j'),
         modifiers: KeyModifiers::CONTROL,
     };
     let default_bookmark = KeyBinding {
@@ -105,8 +163,8 @@ pub fn load_scroll_keys() -> ScrollKeys {
         modifiers: KeyModifiers::CONTROL,
     };
 
-    let (up, _) = parse_or_default(&cfg.keybindings.scroll_up, default_up, "Ctrl+K");
-    let (down, _) = parse_or_default(&cfg.keybindings.scroll_down, default_down, "Ctrl+J");
+    let (up, _) = parse_or_default(&cfg.keybindings.scroll_up, default_up, "Ctrl+Shift+K");
+    let (down, _) = parse_or_default(&cfg.keybindings.scroll_down, default_down, "Ctrl+Shift+J");
     let default_up_fallback = KeyBinding {
         code: KeyCode::Char('k'),
         modifiers: KeyModifiers::SUPER,
@@ -134,12 +192,12 @@ pub fn load_scroll_keys() -> ScrollKeys {
     let (prompt_up, _) = parse_or_default(
         &cfg.keybindings.scroll_prompt_up,
         default_prompt_up,
-        "Ctrl+[",
+        "Ctrl+K",
     );
     let (prompt_down, _) = parse_or_default(
         &cfg.keybindings.scroll_prompt_down,
         default_prompt_down,
-        "Ctrl+]",
+        "Ctrl+J",
     );
     let (bookmark, _) =
         parse_or_default(&cfg.keybindings.scroll_bookmark, default_bookmark, "Ctrl+G");
@@ -160,27 +218,88 @@ pub fn load_scroll_keys() -> ScrollKeys {
 pub fn load_effort_switch_keys() -> EffortSwitchKeys {
     let cfg = config();
 
-    let default_increase = KeyBinding {
-        code: KeyCode::Right,
-        modifiers: KeyModifiers::ALT,
-    };
-    let default_decrease = KeyBinding {
-        code: KeyCode::Left,
-        modifiers: KeyModifiers::ALT,
-    };
+    // macOS defaults to Cmd+Left/Right so Option+Left/Right stays free for
+    // word navigation; other platforms keep Alt+Left/Right.
+    let (default_increase, default_decrease, increase_label, decrease_label) =
+        if cfg!(target_os = "macos") {
+            (
+                KeyBinding {
+                    code: KeyCode::Right,
+                    modifiers: KeyModifiers::SUPER,
+                },
+                KeyBinding {
+                    code: KeyCode::Left,
+                    modifiers: KeyModifiers::SUPER,
+                },
+                "Cmd+Right",
+                "Cmd+Left",
+            )
+        } else {
+            (
+                KeyBinding {
+                    code: KeyCode::Right,
+                    modifiers: KeyModifiers::ALT,
+                },
+                KeyBinding {
+                    code: KeyCode::Left,
+                    modifiers: KeyModifiers::ALT,
+                },
+                "Alt+Right",
+                "Alt+Left",
+            )
+        };
 
     let (increase, _) = parse_or_default(
         &cfg.keybindings.effort_increase,
         default_increase,
-        "Alt+Right",
+        increase_label,
     );
     let (decrease, _) = parse_or_default(
         &cfg.keybindings.effort_decrease,
         default_decrease,
-        "Alt+Left",
+        decrease_label,
     );
 
     EffortSwitchKeys { increase, decrease }
+}
+
+/// User-facing label for the effort cycle keys, e.g. "Cmd+Left / Cmd+Right".
+pub fn effort_switch_keys_label() -> String {
+    let keys = load_effort_switch_keys();
+    format!(
+        "{} / {}",
+        format_binding(&keys.decrease),
+        format_binding(&keys.increase)
+    )
+}
+
+/// Display label for the "next model" switch chord, or `None` when the binding
+/// is disabled. Used by the learned-keybinding hint registry.
+pub(crate) fn model_switch_next_label() -> Option<String> {
+    let cfg = config();
+    let raw = cfg.keybindings.model_switch_next.trim();
+    if raw.is_empty() || is_disabled(raw) {
+        return None;
+    }
+    Some(format_binding(&load_model_switch_keys().next))
+}
+
+/// Display label for the effort-increase chord, or `None` when disabled.
+pub(crate) fn effort_increase_label() -> Option<String> {
+    let cfg = config();
+    let raw = cfg.keybindings.effort_increase.trim();
+    if raw.is_empty() || is_disabled(raw) {
+        return None;
+    }
+    Some(format_binding(&load_effort_switch_keys().increase))
+}
+
+/// Display label for the alignment (centered-mode) toggle, or `None` when unbound.
+pub(crate) fn centered_toggle_label() -> Option<String> {
+    load_centered_toggle_key()
+        .toggle
+        .as_ref()
+        .map(format_binding)
 }
 
 pub fn load_centered_toggle_key() -> CenteredToggleKeys {
@@ -191,7 +310,7 @@ pub fn load_centered_toggle_key() -> CenteredToggleKeys {
         modifiers: KeyModifiers::ALT,
     };
 
-    let (toggle, _) = parse_or_default(&cfg.keybindings.centered_toggle, default_toggle, "Alt+C");
+    let (toggle, _) = parse_optional(&cfg.keybindings.centered_toggle, default_toggle, "Alt+C");
 
     CenteredToggleKeys { toggle }
 }
@@ -207,17 +326,24 @@ pub struct ToggleBinding {
 
 impl ToggleBinding {
     fn load(raw: &str, default_letter: char) -> Self {
-        let default = KeyBinding {
-            code: KeyCode::Char(default_letter),
-            modifiers: KeyModifiers::ALT,
-        };
+        Self::load_with_default(
+            raw,
+            KeyBinding {
+                code: KeyCode::Char(default_letter),
+                modifiers: KeyModifiers::ALT,
+            },
+        )
+    }
+
+    /// Load a toggle binding from an explicit default chord.
+    fn load_with_default(raw: &str, default: KeyBinding) -> Self {
         let default_label = format_binding(&default);
         let (binding, _) = parse_optional(raw, default, &default_label);
         let macos_option_letter = binding.as_ref().and_then(|b| {
-            if b.modifiers == KeyModifiers::ALT {
-                if let KeyCode::Char(c) = b.code {
-                    return Some(c.to_ascii_lowercase());
-                }
+            if b.modifiers == KeyModifiers::ALT
+                && let KeyCode::Char(c) = b.code
+            {
+                return Some(c.to_ascii_lowercase());
             }
             None
         });
@@ -240,6 +366,11 @@ impl ToggleBinding {
         }
         false
     }
+
+    /// The configured chord, or `None` when the toggle is disabled.
+    pub fn binding(&self) -> Option<&KeyBinding> {
+        self.binding.as_ref()
+    }
 }
 
 /// All configurable pane / mode toggle keybindings.
@@ -251,6 +382,8 @@ pub struct ToggleKeys {
     pub typing_scroll_lock: ToggleBinding,
     pub diff_mode_cycle: ToggleBinding,
     pub info_widget: ToggleBinding,
+    pub todo_card: ToggleBinding,
+    pub swarm_panel_focus: ToggleBinding,
 }
 
 pub fn load_toggle_keys() -> ToggleKeys {
@@ -262,17 +395,80 @@ pub fn load_toggle_keys() -> ToggleKeys {
         typing_scroll_lock: ToggleBinding::load(&cfg.keybindings.typing_scroll_lock_toggle, 's'),
         diff_mode_cycle: ToggleBinding::load(&cfg.keybindings.diff_mode_cycle, 'g'),
         info_widget: ToggleBinding::load(&cfg.keybindings.info_widget_toggle, 'i'),
+        todo_card: ToggleBinding::load(&cfg.keybindings.todo_card_toggle, 'x'),
+        swarm_panel_focus: ToggleBinding::load_with_default(
+            &cfg.keybindings.swarm_panel_focus,
+            swarm_panel_focus_default(),
+        ),
     }
 }
 
-pub(crate) fn side_panel_toggle_key_label() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "⌥+M"
+/// `/effort` hint text. Mac keyboards label the Alt modifier ⌥, not "Alt".
+#[cfg(target_os = "macos")]
+pub(crate) const EFFORT_HELP: &str = "Show/change reasoning effort (⌥+left/right)";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const EFFORT_HELP: &str = "Show/change reasoning effort (Alt+left/right)";
+
+/// The default swarm-panel focus chord: Alt+N.
+fn swarm_panel_focus_default() -> KeyBinding {
+    KeyBinding {
+        code: KeyCode::Char('n'),
+        modifiers: KeyModifiers::ALT,
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "Alt+M"
+}
+
+pub(crate) fn side_panel_toggle_key_label() -> String {
+    jcode_tui_core::keybind::alt_chord("M")
+}
+
+/// Status-line hint shown when the inline swarm controls open.
+pub(crate) fn swarm_view_hint(next: &str) -> String {
+    use jcode_tui_core::keybind::alt_chord_lower;
+    format!(
+        "Swarm: {} {next} · {} select · {} open · esc",
+        alt_chord_lower("n"),
+        alt_chord_lower("↑/↓"),
+        alt_chord_lower("o"),
+    )
+}
+
+/// Status-line hint shown when the full swarm page opens.
+pub(crate) fn swarm_page_hint() -> String {
+    use jcode_tui_core::keybind::alt_chord_lower;
+    format!(
+        "Swarm page: {} chat · {} select · {} open · esc",
+        alt_chord_lower("n"),
+        alt_chord_lower("↑/↓"),
+        alt_chord_lower("o"),
+    )
+}
+
+/// Human-friendly label for the configured swarm-panel focus chord (e.g.
+/// "Alt+N"), used in the inline swarm strip's enter-controls hint.
+pub(crate) fn swarm_panel_focus_key_label() -> String {
+    let cfg = config();
+    let default = swarm_panel_focus_default();
+    let default_label = format_binding(&default);
+    let (binding, _) = parse_optional(&cfg.keybindings.swarm_panel_focus, default, &default_label);
+    match binding {
+        Some(b) => format_binding(&b),
+        None => default_label,
+    }
+}
+
+/// Human-friendly label for the configured todo-card toggle chord (e.g.
+/// "Alt+X"), used in /todos help text.
+pub(crate) fn todo_card_key_label() -> String {
+    let cfg = config();
+    let default = KeyBinding {
+        code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::ALT,
+    };
+    let default_label = format_binding(&default);
+    let (binding, _) = parse_optional(&cfg.keybindings.todo_card_toggle, default, &default_label);
+    match binding {
+        Some(b) => format_binding(&b),
+        None => default_label,
     }
 }
 
@@ -381,9 +577,52 @@ pub fn load_dictation_key() -> OptionalBinding {
     }
 }
 
+/// Optional binding that spawns a fresh jcode session in a new terminal window.
+/// Unbound by default; users opt in with e.g. `new_terminal = "alt+enter"`.
+pub fn load_new_terminal_key() -> OptionalBinding {
+    let cfg = config();
+    let raw = cfg.keybindings.new_terminal.trim();
+    if raw.is_empty() || is_disabled(raw) {
+        return OptionalBinding::default();
+    }
+    match parse_keybinding(raw) {
+        Some(binding) => OptionalBinding {
+            label: Some(format_binding(&binding)),
+            binding: Some(binding),
+        },
+        None => OptionalBinding::default(),
+    }
+}
+
+/// Optional binding that opens the `/resume` session picker.
+/// Default: Cmd+B on macOS, Alt+R elsewhere. Set "" to disable.
+pub fn load_open_resume_key() -> OptionalBinding {
+    let cfg = config();
+    let raw = cfg.keybindings.open_resume.trim();
+    if raw.is_empty() || is_disabled(raw) {
+        return OptionalBinding::default();
+    }
+    match parse_keybinding(raw) {
+        Some(binding) => OptionalBinding {
+            label: Some(format_binding(&binding)),
+            binding: Some(binding),
+        },
+        None => OptionalBinding::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_terminal_alt_enter_binding_parses_and_matches() {
+        let binding = parse_keybinding("alt+enter").expect("alt+enter should parse");
+        assert!(binding.matches(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(!binding.matches(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(!binding.matches(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(format_binding(&binding), "Alt+Enter");
+    }
 
     #[test]
     fn side_panel_toggle_matches_alt_m_on_all_platforms() {

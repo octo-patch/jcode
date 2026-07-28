@@ -16,10 +16,10 @@ pub(super) use super::commands_review::{
     autoreview_status_message, build_autojudge_startup_message, build_autoreview_startup_message,
     build_judge_startup_message, build_review_startup_message, current_feedback_target_session_id,
     handle_autojudge_command_local, handle_autoreview_command_local, handle_judge_command_local,
-    handle_observe_command, handle_review_command_local, launch_prompt_in_new_session_local,
-    maybe_trigger_autojudge_local, maybe_trigger_autoreview_local,
-    preferred_one_shot_review_override, prepare_review_spawned_session, queue_review_spawn_remote,
-    reset_current_session,
+    handle_observe_command, handle_review_command_local, launch_forked_session_local,
+    launch_prompt_in_new_session_local, maybe_trigger_autojudge_local,
+    maybe_trigger_autoreview_local, preferred_one_shot_review_override,
+    prepare_review_spawned_session, queue_review_spawn_remote, reset_current_session,
 };
 pub(super) use super::todos_view::handle_todos_view_command;
 use super::{App, DisplayMessage, LocalRewindUndoSnapshot, ProcessingStatus};
@@ -30,15 +30,19 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-const BTW_PAGE_ID: &str = "btw";
 pub(super) const REVIEW_PREFERRED_MODEL: &str = "gpt-5.5";
 const POKE_OFF_UI_HINT: &str = "/poke off to stop.";
-const TODO_CONFIDENCE_THRESHOLD: u8 = 90;
-const TODO_CONFIDENCE_SUMMARY_PREFIX: &str = "All todos are done. Todo confidence summary:";
+const TODO_CONFIDENCE_THRESHOLD: u8 = crate::todo::QUALITY_GATE_THRESHOLD;
+const TODO_COMPLETION_CONTINUATION_MESSAGE: &str =
+    crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE;
+const TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE: &str =
+    crate::todo::TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TodoConfidenceSummary {
     pub completion_average: Option<u8>,
+    pub completion_confidence_needs_validation: bool,
+    pub confidence_spike_detected: bool,
     pub needs_more_work: bool,
 }
 
@@ -71,14 +75,13 @@ pub(super) fn parse_poke_command(trimmed: &str) -> Option<Result<PokeCommand, St
 }
 
 pub(super) fn is_poke_message(message: &str) -> bool {
-    (message.starts_with("You have ")
-        && message.contains(" incomplete todo")
-        && message.ends_with("update the todo tool."))
-        || message.starts_with(TODO_CONFIDENCE_SUMMARY_PREFIX)
+    crate::todo::is_auto_poke_message(message)
 }
 
 pub(super) fn is_todo_confidence_summary_message(message: &str) -> bool {
-    message.starts_with(TODO_CONFIDENCE_SUMMARY_PREFIX)
+    message.starts_with(TODO_COMPLETION_CONTINUATION_MESSAGE)
+        || message.starts_with(TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE)
+        || message.starts_with("All todos are done. Todo confidence summary:")
 }
 
 pub(super) fn queued_messages_are_only_pokes(messages: &[String]) -> bool {
@@ -103,83 +106,69 @@ pub(super) fn clear_queued_poke_messages(app: &mut App) -> usize {
 pub(super) fn disable_auto_poke(app: &mut App) -> usize {
     let cleared = clear_queued_poke_messages(app);
     app.auto_poke_incomplete_todos = false;
+    app.todo_confidence_spike_challenged = false;
+    app.todo_completion_gate_attempts = 0;
+    app.todo_gate_digest_delivered = false;
     cleared
 }
 
-pub(super) fn is_non_retryable_auto_poke_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
+#[path = "commands_auto_poke_errors.rs"]
+mod auto_poke_errors;
+pub(super) use auto_poke_errors::is_non_retryable_auto_poke_error;
 
-    // These failures are deterministic for the current request/session shape. Retrying the same
-    // auto-poke cannot help and can create an infinite spam loop.
-    let deterministic_markers = [
-        "400 bad request",
-        "invalid_request_error",
-        "string_above_max_length",
-        "string_too_long",
-        "maximum length",
-        "request too large",
-        "payload too large",
-        "body too large",
-        "input too large",
-        "context length exceeded",
-        "context_length_exceeded",
-        "maximum context length",
-        "token limit exceeded",
-        "invalid model",
-        "model_not_found",
-        "model_not_supported",
-        "unsupported parameter",
-        "unsupported_value",
-        "invalid parameter",
-        "invalid schema",
-        "invalid tool",
-        "invalid image",
-        "image too large",
-        "unsupported image",
-        "unsupported file",
-        "file too large",
-        "content_policy_violation",
-        "safety_violation",
-        "permission_denied",
-        "unauthorized",
-        "401 unauthorized",
-        "403 forbidden",
-        "insufficient_quota",
-        "402 payment required",
-        "payment required",
-        "requires more credits",
-        "add more credits",
-        "more credits",
-        "billing",
-        "credit balance",
-        "out of credits",
-    ];
-
-    deterministic_markers
-        .iter()
-        .any(|marker| lower.contains(marker))
-        || is_auto_poke_connectivity_error(error)
-}
-
+/// Whether `error` is a transient connectivity failure (DNS, name resolution,
+/// routing, unreachable host) that the agent itself cannot repair by resending
+/// immediately. These are NOT non-retryable: they resolve once the network
+/// environment recovers, so callers route them to a network-wait/resume path
+/// rather than stopping auto-poke. Kept separate from
+/// [`is_non_retryable_auto_poke_error`] precisely so a transient disconnect is
+/// never treated as a permanent failure.
 pub(super) fn is_auto_poke_connectivity_error(error: &str) -> bool {
+    // Delegate to the shared connectivity classifier (jcode-app-core's
+    // network_retry) so this list can never drift out of sync with the wait-
+    // for-network path, then add wrappers specific to this call site.
+    if crate::network_retry::classify_message(error).is_some() {
+        return true;
+    }
+
     let lower = error.to_ascii_lowercase();
 
-    // Auto-poke cannot repair local/network/provider DNS or routing failures. Re-sending the same
-    // poke just creates noise until the user or network environment changes.
     let connectivity_markers = [
         "failed to send openai-compatible chat request",
-        "dns error",
-        "failed to lookup address information",
-        "name or service not known",
-        "temporary failure in name resolution",
-        "no route to host",
-        "network is unreachable",
-        "host is unreachable",
         "could not resolve host",
         "couldn't resolve host",
     ];
 
     connectivity_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Whether `error` is a deterministic model/endpoint-capability failure that can
+/// never succeed by resending the identical request: the configured model is not
+/// valid for the configured endpoint (e.g. Volcengine Ark's coding-plan endpoint
+/// returning `404 UnsupportedModel` for a model that lacks the coding plan
+/// feature, or a plain model-not-found). Unlike the broader
+/// [`is_non_retryable_auto_poke_error`] set (which also covers billing, payload
+/// size, auth, etc.), this is narrow enough that we can fail fast *regardless of
+/// auto-poke* during reconnect/recovery continuation instead of burning the
+/// retry budget on a request that is structurally guaranteed to 4xx. See #387.
+pub(super) fn is_fatal_model_endpoint_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+
+    let model_endpoint_markers = [
+        "unsupportedmodel",
+        "unsupported model",
+        "does not support the coding plan",
+        "coding plan feature",
+        "model_not_found",
+        "model_not_supported",
+        "invalid model",
+        "the model does not exist",
+        "model does not exist",
+    ];
+
+    model_endpoint_markers
         .iter()
         .any(|marker| lower.contains(marker))
 }
@@ -193,7 +182,7 @@ pub(super) fn stop_auto_poke_for_non_retryable_error(app: &mut App, error: &str)
     app.rate_limit_pending_message = None;
     app.rate_limit_reset = None;
     app.push_display_message(DisplayMessage::system(format!(
-        "🛑 Auto-poke stopped because the last request failed with a non-retryable error.{} Fix the request/session, then run /poke again if you want to resume.",
+        "🛑 The last request failed in a way that retrying won't fix, so we stopped poking.{} Fix the request or session, then /poke to resume.",
         if cleared == 0 {
             String::new()
         } else {
@@ -204,7 +193,7 @@ pub(super) fn stop_auto_poke_for_non_retryable_error(app: &mut App, error: &str)
             )
         }
     )));
-    app.set_status_notice("Poke stopped: non-retryable error");
+    app.set_status_notice("Poke stopped: this error won't fix itself");
     true
 }
 
@@ -224,19 +213,19 @@ pub(super) fn poke_disabled_message(cleared: usize) -> String {
 }
 
 pub(super) fn poke_enabled_without_incomplete_message() -> String {
-    "Auto-poke enabled. No incomplete todos found right now.".to_string()
+    "Auto-poke enabled. Nothing unfinished right now; we'll poke the agent if it stops with todos left.".to_string()
 }
 
 pub(super) fn poke_queued_display_message() -> String {
     format!(
-        "👉 /poke queued. Re-checking incomplete todos after this turn. {}",
+        "👉 Poke queued. We'll re-check for unfinished todos after this turn. {}",
         POKE_OFF_UI_HINT
     )
 }
 
 pub(super) fn poke_triggered_display_message(incomplete_count: usize) -> String {
     format!(
-        "👉 Poking model: {} incomplete todo{}. {}",
+        "👉 {} incomplete todo{}. We poked the agent. {}",
         incomplete_count,
         if incomplete_count == 1 { "" } else { "s" },
         POKE_OFF_UI_HINT,
@@ -246,6 +235,15 @@ pub(super) fn poke_triggered_display_message(incomplete_count: usize) -> String 
 pub(super) fn activate_auto_poke(app: &mut App) -> PokeActivation {
     let incomplete = incomplete_poke_todos(app);
     app.auto_poke_incomplete_todos = true;
+    app.todo_confidence_spike_challenged = false;
+    app.todo_completion_gate_attempts = 0;
+    // Re-arming starts a fresh review cycle, so the deferred quality digest is
+    // eligible to be delivered again for the upcoming work.
+    app.todo_gate_digest_delivered = false;
+    // Re-arming is an explicit user action: give the guardrail circuit
+    // breaker its full budget again (the user likely rephrased the task).
+    app.consecutive_guardrail_stops = 0;
+    app.turn_guardrail_stopped = false;
     app.set_status_notice("Poke: ON");
 
     if incomplete.is_empty() {
@@ -302,19 +300,19 @@ pub(super) fn activate_auto_poke_local(app: &mut App) {
             app.thinking_buffer.clear();
             app.streaming_tool_calls.clear();
             app.batch_progress = None;
-            app.streaming_input_tokens = 0;
-            app.streaming_output_tokens = 0;
-            app.streaming_cache_read_tokens = None;
-            app.streaming_cache_creation_tokens = None;
-            app.current_api_usage_recorded = false;
+            app.streaming.streaming_input_tokens = 0;
+            app.streaming.streaming_output_tokens = 0;
+            app.streaming.streaming_cache_read_tokens = None;
+            app.streaming.streaming_cache_creation_tokens = None;
+            app.kv_cache.current_api_usage_recorded = false;
             app.upstream_provider = None;
             app.status_detail = None;
-            app.streaming_tps_start = None;
-            app.streaming_tps_elapsed = std::time::Duration::ZERO;
-            app.streaming_tps_collect_output = false;
-            app.streaming_total_output_tokens = 0;
-            app.streaming_tps_observed_output_tokens = 0;
-            app.streaming_tps_observed_elapsed = std::time::Duration::ZERO;
+            app.streaming.streaming_tps_start = None;
+            app.streaming.streaming_tps_elapsed = std::time::Duration::ZERO;
+            app.streaming.streaming_tps_collect_output = false;
+            app.streaming.streaming_total_output_tokens = 0;
+            app.streaming.streaming_tps_observed_output_tokens = 0;
+            app.streaming.streaming_tps_observed_elapsed = std::time::Duration::ZERO;
             app.processing_started = Some(Instant::now());
             app.visible_turn_started = Some(Instant::now());
             app.pending_turn = true;
@@ -524,6 +522,7 @@ pub(super) fn handle_transfer_command_local(app: &mut App) {
     app.pending_transfer_request = true;
     if app.is_processing {
         app.interleave_message = Some(transfer_pause_message());
+        app.interleave_images.clear();
         app.push_display_message(DisplayMessage::system(
             "Queued /transfer. The current session will be asked to pause, then the compacted handoff will open in a new window."
                 .to_string(),
@@ -644,6 +643,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             "command": "/subagent",
         }),
         intent: None,
+        thought_signature: None,
     };
 
     app.push_display_message(DisplayMessage {
@@ -659,6 +659,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         id: tool_call.id.clone(),
         name: tool_call.name.clone(),
         input: tool_call.input.clone(),
+        thought_signature: None,
     }];
     app.add_provider_message(Message {
         role: Role::Assistant,
@@ -682,6 +683,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             tool_call_id: tool_call_for_task.id.clone(),
             tool_name: tool_call_for_task.name.clone(),
             status: ToolStatus::Running,
+            intent: tool_call_for_task.intent.clone(),
             title: None,
         }));
 
@@ -722,6 +724,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             tool_call_id: tool_call_for_task.id.clone(),
             tool_name: tool_call_for_task.name.clone(),
             status,
+            intent: tool_call_for_task.intent.clone(),
             title: title.clone(),
         }));
 
@@ -815,6 +818,35 @@ fn handle_subagent_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+/// `/cancel` (and `/stop`) interrupt the in-flight turn, mirroring Ctrl+C
+/// while processing. The command has long been registered and advertised by
+/// interactive prompts, but had no top-level dispatch, so typing it outside a
+/// pending prompt fell through to skill parsing and produced
+/// "Unknown skill: /cancel" (issue #496).
+pub(super) fn handle_cancel_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/cancel" && trimmed != "/stop" {
+        return false;
+    }
+
+    if app.is_processing {
+        app.cancel_requested = true;
+        app.interleave_message = None;
+        app.interleave_images.clear();
+        app.pending_soft_interrupts.clear();
+        app.pending_soft_interrupt_requests.clear();
+        if app.cancel_overnight_for_interrupt() {
+            app.set_status_notice("Interrupting... Overnight cancelled");
+        } else {
+            app.set_status_notice("Interrupting...");
+        }
+    } else {
+        app.push_display_message(DisplayMessage::system(
+            "Nothing to cancel: no prompt or operation is in progress.".to_string(),
+        ));
+    }
+    true
+}
+
 pub(super) fn handle_help_command(app: &mut App, trimmed: &str) -> bool {
     if let Some(topic) = trimmed
         .strip_prefix("/help ")
@@ -837,6 +869,38 @@ pub(super) fn handle_help_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     false
+}
+
+/// `/keys` shows the keymap diagnostics: detected terminal, discovered terminal
+/// and macOS shortcuts, and any conflicts with jcode's own keybindings.
+/// `/keys refresh` forces a fresh scan of the machine (otherwise a cached
+/// snapshot up to a day old is reused).
+pub(super) fn handle_keys_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = slash_command_rest(trimmed, "/keys")
+        .or_else(|| slash_command_rest(trimmed, "/keybindings"))
+    else {
+        return false;
+    };
+
+    let force_refresh = matches!(rest.trim(), "refresh" | "rescan" | "reload");
+    let snapshot = if force_refresh {
+        crate::setup_hints::keymap::refresh_and_save()
+    } else {
+        crate::setup_hints::keymap::snapshot_cached_or_refresh()
+    };
+
+    let cfg = crate::config::config();
+    let report = crate::setup_hints::keymap::render_report(&cfg.keybindings, &snapshot);
+    app.push_display_message(DisplayMessage::system(report));
+
+    if let Some(status) =
+        crate::setup_hints::keymap::render_status_line(&cfg.keybindings, &snapshot)
+    {
+        app.set_status_notice(status);
+    } else {
+        app.set_status_notice("No keybinding conflicts detected");
+    }
+    true
 }
 
 pub(super) fn handle_model_status_command(app: &mut App, trimmed: &str) -> bool {
@@ -890,7 +954,7 @@ fn apply_diff_mode(app: &mut App, mode: crate::config::DiffDisplayMode) {
     if !app.diff_pane_visible() {
         app.diff_pane_focus = false;
     }
-    app.set_status_notice(&format!("Diffs: {}", app.diff_mode.label()));
+    app.set_status_notice(format!("Diffs: {}", app.diff_mode.label()));
 }
 
 pub(super) fn handle_diff_command(app: &mut App, trimmed: &str) -> bool {
@@ -978,7 +1042,8 @@ fn build_provider_test_coverage_summary() -> String {
                 &coverage,
                 path.display().to_string(),
             );
-            crate::live_tests::format_strict_live_provider_model_coverage_summary(&summary, 50)
+            // 0 = no per-pair cap: the overlay scrolls, so show every pair.
+            crate::live_tests::format_strict_live_provider_model_coverage_summary(&summary, 0)
         }
         Err(err) => {
             let mut out = String::new();
@@ -1237,37 +1302,8 @@ fn disconnect_ssh_remote(app: &mut App, name: &str) {
     }
 }
 
-fn build_btw_loading_markdown(question: &str) -> String {
-    format!(
-        "# `/btw`\n\n## Question\n{}\n\n## Status\nThinking…\n",
-        question.trim()
-    )
-}
-
-fn build_btw_system_reminder(question: &str) -> String {
-    format!(
-        "The user invoked `/btw`, which is a side question about the current session. \
-Answer ONLY from the existing conversation/context already in memory for this session. \
-Do not read files, run commands, search the web, or call any tool except `side_panel`.\n\n\
-Use the `side_panel` tool exactly once with:\n\
-- `action`: `write`\n\
-- `page_id`: `{}`\n\
-- `title`: ``/btw``\n\
-- `focus`: `true`\n\n\
-Write markdown with this shape:\n\
-# `/btw`\n\
-## Question\n<repeat the question>\n\
-## Answer\n<your concise answer>\n\n\
-If the answer is not already knowable from the current session context, say so clearly in the Answer section and explain that a normal prompt is needed.\n\n\
-After writing the side panel content, do not add any normal chat response text.\n\n\
-Question: {}",
-        BTW_PAGE_ID,
-        question.trim()
-    )
-}
-
 fn handle_btw_command(app: &mut App, trimmed: &str) -> bool {
-    if !trimmed.starts_with("/btw") {
+    if trimmed != "/btw" && !trimmed.starts_with("/btw ") {
         return false;
     }
 
@@ -1277,39 +1313,38 @@ fn handle_btw_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    match crate::side_panel::write_markdown_page(
-        active_session_id(app).as_str(),
-        BTW_PAGE_ID,
-        Some("/btw"),
-        &build_btw_loading_markdown(question),
-        true,
-    ) {
-        Ok(snapshot) => app.set_side_panel_snapshot(snapshot),
-        Err(error) => {
-            app.push_display_message(DisplayMessage::error(format!(
-                "Failed to prepare /btw side panel: {}",
-                error
-            )));
-            return true;
-        }
-    }
-
-    app.hidden_queued_system_messages
-        .push(build_btw_system_reminder(question));
-    if app.is_processing {
-        app.push_display_message(DisplayMessage::system(
-            "/btw noted - answer will appear in the side panel.".to_string(),
-        ));
-        app.set_status_notice("/btw noted");
-    } else {
-        app.push_display_message(DisplayMessage::system(
-            "Running /btw - answer will appear in the side panel.".to_string(),
-        ));
-        app.pending_queued_dispatch = true;
-        app.set_status_notice("Running /btw");
-    }
-
+    fork_session_with_prompt_local(app, Some(question));
     true
+}
+
+/// `/fork [prompt]` and `/split`: fork the current session into a new window.
+/// With a prompt, the forked session starts by answering it.
+fn handle_fork_command(app: &mut App, trimmed: &str) -> bool {
+    let rest = if trimmed == "/fork" || trimmed == "/split" {
+        ""
+    } else if let Some(rest) = trimmed.strip_prefix("/fork ") {
+        rest
+    } else {
+        return false;
+    };
+
+    let prompt = rest.trim();
+    fork_session_with_prompt_local(app, (!prompt.is_empty()).then_some(prompt));
+    true
+}
+
+/// Fork the current session (like `/split`) and, when given, deliver `prompt`
+/// as the first message of the forked session. Shared by `/btw <question>`,
+/// `/fork [prompt]`, and `/split`.
+pub(super) fn fork_session_with_prompt_local(app: &mut App, prompt: Option<&str>) {
+    let staged = prompt.map(|prompt| (prompt.to_string(), Vec::new()));
+    if let Err(error) = launch_forked_session_local(app, staged) {
+        app.push_display_message(DisplayMessage::error(format!(
+            "Failed to fork session: {}",
+            error
+        )));
+        app.set_status_notice("Fork failed");
+    }
 }
 
 fn load_catchup_candidates(app: &App) -> Vec<crate::tui::session_picker::SessionInfo> {
@@ -1568,7 +1603,7 @@ fn handle_transcript_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    match open::that_detached(&path) {
+    match super::helpers::open_path_or_url_detached(&path) {
         Ok(()) => {
             app.push_display_message(DisplayMessage::system(transcript_opened_message(&path)));
             app.set_status_notice("Transcript opened");
@@ -1599,12 +1634,14 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
 
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     if handle_subagent_model_command(app, trimmed)
+        || app.handle_hotkeys_command(trimmed)
         || handle_subagent_command(app, trimmed)
         || handle_observe_command(app, trimmed)
         || handle_todos_view_command(app, trimmed)
         || super::commands_overnight::handle_overnight_command(app, trimmed)
         || super::split_view::handle_split_view_command(app, trimmed)
         || handle_btw_command(app, trimmed)
+        || handle_fork_command(app, trimmed)
         || handle_transcript_command(app, trimmed)
         || handle_git_command(app, trimmed)
         || handle_catchup_command(app, trimmed)
@@ -1623,8 +1660,43 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if trimmed == "/commit-push" || trimmed == "/commit-and-push" {
+        handle_commit_push_command_local(app);
+        return true;
+    }
+
+    if matches!(
+        trimmed,
+        "/fast-release" | "/cut-release" | "/commit-push-release"
+    ) {
+        handle_fast_release_command_local(app);
+        return true;
+    }
+
+    if trimmed == "/remote-release" {
+        handle_remote_release_command_local(app);
+        return true;
+    }
+
+    // After `/remote-release`: the parser claims only `/remote` + whitespace/end.
+    if super::commands_remote::handle_remote_command(app, trimmed) {
+        return true;
+    }
+
+    if trimmed == "/triage" || trimmed.starts_with("/triage ") {
+        let rest = trimmed.strip_prefix("/triage").unwrap_or_default();
+        handle_triage_command_local(app, rest);
+        return true;
+    }
+
     if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
         app.open_session_picker();
+        app.record_keybinding_slow(super::shortcut_hints::LearnableAction::Resume);
+        return true;
+    }
+
+    if trimmed == "/active" {
+        app.open_active_sessions_picker();
         return true;
     }
 
@@ -1870,7 +1942,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             return true;
         };
 
-        let current_count = app.session.visible_conversation_message_count();
+        let current_count = app.session.rewind_target_count();
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
         app.session.replace_messages(snapshot.messages);
         app.provider_session_id = snapshot.provider_session_id;
@@ -1880,6 +1952,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         app.replace_provider_messages(provider_messages);
 
         app.clear_display_messages();
+        // Drop any streaming mermaid preview tied to the transcript being
+        // replaced (defensive: submit_input's commit already clears it on the
+        // slash-command path, but direct callers must not leak the slot).
+        // ACTIVE_DIAGRAMS deliberately survives: undo RESTORES messages whose
+        // diagrams are already registered, and the body-cache prefix reuse in
+        // ui_prepare.rs means re-rendered-identical messages do not re-run the
+        // mermaid path (and so would never re-register if we cleared here).
+        app.clear_streaming_render_state();
         for rendered in crate::session::render_messages(&app.session) {
             app.push_display_message(DisplayMessage {
                 role: rendered.role,
@@ -1901,8 +1981,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/rewind" {
-        let visible_messages = app.session.visible_conversation_messages();
-        if visible_messages.is_empty() {
+        // Number the same rendered transcript entries `/rewind N` targets so
+        // the printed numbers always match what a rewind actually does
+        // (issue #432).
+        let rendered_targets: Vec<_> = crate::session::render_messages(&app.session)
+            .into_iter()
+            .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+            .collect();
+        if rendered_targets.is_empty() {
             app.push_display_message(DisplayMessage::system(
                 "No messages in conversation.".to_string(),
             ));
@@ -1910,13 +1996,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         }
 
         let mut history = String::from("Conversation history:\n\n");
-        for (i, msg) in visible_messages.iter().enumerate() {
-            let role_str = match msg.role {
-                Role::User => "👤 User",
-                Role::Assistant => "🤖 Assistant",
+        for (i, msg) in rendered_targets.iter().enumerate() {
+            let role_str = match msg.role.as_str() {
+                "user" => "👤 User",
+                "assistant" => "🤖 Assistant",
+                _ => "💬 Message",
             };
-            let content = msg.content_preview();
-            let preview = crate::util::truncate_str(&content, 80);
+            let content = msg.content.replace('\n', " ");
+            let preview = crate::util::truncate_str(content.trim(), 80);
             history.push_str(&format!("  {} {} - {}\n", i + 1, role_str, preview));
         }
         history.push_str("\nUse /rewind N to rewind to message N (removes all messages after). After rewinding, use /rewind undo to restore the removed messages.");
@@ -1927,7 +2014,8 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
 
     if let Some(num_str) = trimmed.strip_prefix("/rewind ") {
         let num_str = num_str.trim();
-        let visible_count = app.session.visible_conversation_message_count();
+        let targets = app.session.rewind_target_stored_indices();
+        let visible_count = targets.len();
         match num_str.parse::<usize>() {
             Ok(n) if n > 0 && n <= visible_count => {
                 let removed = visible_count - n;
@@ -1937,15 +2025,22 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
                     session_provider_session_id: app.session.provider_session_id.clone(),
                     visible_message_count: visible_count,
                 });
-                if let Some(stored_len) = app.session.stored_len_for_visible_conversation_message(n)
-                {
-                    app.session.truncate_messages(stored_len);
-                }
+                app.session.truncate_messages(targets[n - 1] + 1);
                 let provider_messages = app.session.messages_for_provider_uncached();
                 app.replace_provider_messages(provider_messages);
                 app.session.updated_at = chrono::Utc::now();
 
                 app.clear_display_messages();
+                // Same defensive preview clear as /rewind undo above.
+                // ACTIVE_DIAGRAMS survives here too: messages BEFORE the
+                // rewind point are retained, and body-cache prefix reuse
+                // (ui_prepare.rs build_body_from_base) skips re-rendering
+                // them, so clearing the registry would orphan the pinned
+                // pane / margin widget for diagrams that are still in the
+                // transcript. Diagrams from rewound-away messages leak until
+                // eviction (ACTIVE_DIAGRAMS_MAX) - a pinned, known tradeoff
+                // (tests/swarm_plan_graph_inline.rs).
+                app.clear_streaming_render_state();
                 for rendered in crate::session::render_messages(&app.session) {
                     app.push_display_message(DisplayMessage {
                         role: rendered.role,
@@ -2026,11 +2121,113 @@ pub(super) fn build_commit_prompt() -> String {
     "Make interactive, logical commits for the current uncommitted work. Inspect the git state first, including unstaged and staged changes. Group related changes into small coherent commits, staging only the files or hunks that belong together. Preserve unrelated user or agent work, do not discard changes, and do not amend existing commits unless clearly necessary. For each commit, use a concise conventional-style message when possible. Validate as appropriate for the changed files before committing, and report the commits created plus any remaining uncommitted changes.".to_string()
 }
 
+pub(super) fn build_commit_push_prompt() -> String {
+    let mut prompt = build_commit_prompt();
+    prompt.push(' ');
+    prompt.push_str(
+        "After creating the commits, push them to the remote tracking branch with git push (set the upstream with git push -u if the branch has no upstream yet). If the push fails, report the error instead of force-pushing, and never force-push or rewrite already-pushed history. Finally, report the commits created and the push result.",
+    );
+    prompt
+}
+
+fn build_release_prompt(before_bump_instruction: &str, release_instruction: &str) -> String {
+    let mut prompt = build_commit_push_prompt();
+    prompt.push(' ');
+    prompt.push_str("Then cut a release. Find the last release tag (git describe --tags --abbrev=0 or gh release list) and review everything that changed since it to pick the semver bump: patch for fixes and small internal changes, minor for new features, major only for breaking changes. ");
+    if !before_bump_instruction.is_empty() {
+        prompt.push_str(before_bump_instruction);
+        prompt.push(' ');
+    }
+    prompt.push_str("Bump the version in the root Cargo.toml, refresh Cargo.lock (for example with cargo check), and, if the repo has a changelog/ directory, write a user-facing changelog entry changelog/v<version>.json following changelog/README.md (translate commits into user-visible effects, skip internal-only changes, update changelog/index.json). Commit the version bump together with the changelog entry as one release-metadata commit, and push. ");
+    prompt.push_str(release_instruction);
+    prompt.push_str(" Do not force-push or move existing tags. Finally, report the new version, the commits created, the tag push, and the release status.");
+    prompt
+}
+
+pub(super) fn build_fast_release_prompt() -> String {
+    build_release_prompt(
+        "Before editing Cargo.toml or the changelog for the version bump, run scripts/quick-release.sh --prepare-fast v<version>. It must refresh the warm target/selfdev cache for the Linux x86_64 binary while the existing Cargo version is unchanged and record the prepared commit.",
+        "Then run scripts/quick-release.sh --fast-local v<version>. It must wrap the prepared selfdev binary with the release identity, publish that Linux asset and the GitHub release immediately, and let CI replace it with the portable Linux artifact while adding macOS, Windows, FreeBSD, signatures, and final checksums. Do not run the separate local macOS cross-build or wait for release optimization. If preparation is stale or the release-metadata commit contains code changes, stop instead of publishing a binary that differs from the tag.",
+    )
+}
+
+pub(super) fn build_remote_release_prompt() -> String {
+    build_release_prompt(
+        "",
+        "Then run scripts/quick-release.sh --remote v<version> to push the tag immediately without any local build. Let the release workflow build, sign, checksum, and publish every platform, and leave publication gated on those remote checks.",
+    )
+}
+
+pub(super) fn build_triage_prompt(focus: &str) -> String {
+    let mut prompt = String::from(
+        "Triage the open GitHub issues for the repository in the current working directory, then autonomously fix the ones that are safe to fix. \
+        Hard rules: every public comment, issue reply, or PR description you post MUST end with a clear agent attribution line like '--- *— Jcode agent (automated triage), on behalf of @<repo-owner>*' so it can never be mistaken for the human. \
+        Never close an issue as wontfix/invalid without user confirmation (closing as completed is fine only after a verified fix). Be brief, friendly, and factual toward reporters. Prefer a branch + PR unless the repo's established norm is committing directly to the default branch. \
+        Workflow: (1) Collect: verify gh auth status, identify the repo with gh repo view, list open issues newest-first (gh issue list --state open --limit 50 --json number,title,labels,createdAt,author,comments,body), focus on untriaged ones (no labels or no maintainer/agent comment), and read each candidate fully with gh issue view <n> --comments. \
+        (2) Classify each into exactly one bucket and track them in a todo list: auto-fix (clear, reproducible, low-risk, verifiable), needs-info (comment asking for the specific missing details), needs-human (design decisions, breaking changes, security-sensitive, large refactors), duplicate (link the original, do not close without confirmation unless unambiguous), or question/support (answer directly if verifiable against the code or docs). Apply existing labels only (check gh label list first, never invent labels). \
+        (3) Fix the auto-fix bucket: locate the root cause first (demote to needs-human if you cannot pin it confidently), implement the smallest correct fix with a test when practical, verify with builds/tests before claiming anything, commit referencing the issue (fix: <summary> (fixes #<n>)), and comment on the issue describing what was done, signed. If there are more than about 3 auto-fix issues, consider spawning swarm workers, one per issue, and synthesize their reports. \
+        (4) Report back with a compact table of issue number, title, bucket, and action taken, plus links to commits/PRs and one-line recommendations for the needs-human issues.",
+    );
+    let focus = focus.trim();
+    if !focus.is_empty() {
+        prompt.push_str(" Additional focus from the user: ");
+        prompt.push_str(focus);
+    }
+    prompt
+}
+
+pub(super) fn triage_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting GitHub issue triage...".to_string()
+    } else {
+        "🚀 Starting GitHub issue triage...".to_string()
+    }
+}
+
+fn handle_triage_command_local(app: &mut App, rest: &str) {
+    let prompt = build_triage_prompt(rest);
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /triage...",
+            triage_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(triage_launch_notice(false)));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
 pub(super) fn commit_launch_notice(interrupted: bool) -> String {
     if interrupted {
         "👉 Interrupting and starting logical commits...".to_string()
     } else {
         "🚀 Starting logical commits...".to_string()
+    }
+}
+
+pub(super) fn commit_push_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting logical commits + push...".to_string()
+    } else {
+        "🚀 Starting logical commits + push...".to_string()
+    }
+}
+
+pub(super) fn fast_release_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting logical commits + push + fast local release...".to_string()
+    } else {
+        "🚀 Starting logical commits + push + fast local release...".to_string()
+    }
+}
+
+pub(super) fn remote_release_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting logical commits + push + remote release...".to_string()
+    } else {
+        "🚀 Starting logical commits + push + remote release...".to_string()
     }
 }
 
@@ -2045,6 +2242,51 @@ fn handle_commit_command_local(app: &mut App) {
         );
     } else {
         app.push_display_message(DisplayMessage::system(commit_launch_notice(false)));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
+fn handle_commit_push_command_local(app: &mut App) {
+    let prompt = build_commit_push_prompt();
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /commit-push...",
+            commit_push_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(commit_push_launch_notice(false)));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
+fn handle_fast_release_command_local(app: &mut App) {
+    let prompt = build_fast_release_prompt();
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /fast-release...",
+            fast_release_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(fast_release_launch_notice(false)));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
+fn handle_remote_release_command_local(app: &mut App) {
+    let prompt = build_remote_release_prompt();
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /remote-release...",
+            remote_release_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(remote_release_launch_notice(false)));
         super::commands_improve::start_synthetic_user_turn(app, prompt);
     }
 }
@@ -2357,11 +2599,7 @@ pub(super) fn incomplete_poke_todos(app: &App) -> Vec<crate::todo::TodoItem> {
 }
 
 pub(super) fn build_poke_message(incomplete: &[crate::todo::TodoItem]) -> String {
-    format!(
-        "You have {} incomplete todo{}. Continue working, or update the todo tool.",
-        incomplete.len(),
-        if incomplete.len() == 1 { "" } else { "s" },
-    )
+    crate::todo::build_auto_poke_message(incomplete.len())
 }
 
 fn todo_confidence_weight(priority: &str) -> u32 {
@@ -2388,116 +2626,13 @@ fn weighted_confidence_average(scores: impl IntoIterator<Item = (u8, u32)>) -> O
 
 pub(super) fn build_todo_confidence_summary_message(todos: &[crate::todo::TodoItem]) -> String {
     let summary = todo_confidence_summary(todos);
-    let completed: Vec<&crate::todo::TodoItem> = todos
-        .iter()
-        .filter(|todo| todo.status == "completed")
-        .collect();
-    let cancelled_count = todos
-        .iter()
-        .filter(|todo| todo.status == "cancelled")
-        .count();
-
-    let planning_average = weighted_confidence_average(todos.iter().filter_map(|todo| {
-        todo.confidence
-            .map(|score| (score, todo_confidence_weight(&todo.priority)))
-    }));
-    let completion_scores: Vec<(&crate::todo::TodoItem, u8, u32)> = completed
-        .iter()
-        .filter_map(|todo| {
-            todo.completion_confidence
-                .map(|score| (*todo, score, todo_confidence_weight(&todo.priority)))
-        })
-        .collect();
-    let completion_average = summary.completion_average;
-    let missing_completion_confidence = completed
-        .iter()
-        .filter(|todo| todo.completion_confidence.is_none())
-        .count();
-    let below_threshold_count = completion_scores
-        .iter()
-        .filter(|(_, score, _)| *score < TODO_CONFIDENCE_THRESHOLD)
-        .count();
-    let lowest_completed = completion_scores
-        .iter()
-        .min_by_key(|(_, score, _)| *score)
-        .map(|(_, score, _)| *score);
-
-    let mut lines = vec![TODO_CONFIDENCE_SUMMARY_PREFIX.to_string()];
-    lines.push(format!(
-        "- Completed todos: {}{}.",
-        completed.len(),
-        if cancelled_count == 0 {
-            String::new()
-        } else {
-            format!(
-                " ({} cancelled todo{} skipped)",
-                cancelled_count,
-                if cancelled_count == 1 { "" } else { "s" }
-            )
-        }
-    ));
-
-    match completion_average {
-        Some(avg) => lines.push(format!("- Weighted completion confidence: {}%.", avg)),
-        None if !completed.is_empty() => lines.push(
-            "- Weighted completion confidence: unknown because no completed todo has completion_confidence."
-                .to_string(),
-        ),
-        None => lines.push("- No completed todos recorded completion confidence.".to_string()),
-    }
-    lines.push(format!(
-        "- Confidence threshold: {}%.",
-        TODO_CONFIDENCE_THRESHOLD
-    ));
-
-    match planning_average {
-        Some(avg) => lines.push(format!("- Weighted planning confidence: {}%.", avg)),
-        None => lines.push("- Weighted planning confidence: unknown.".to_string()),
-    }
-
-    match lowest_completed {
-        Some(score) => lines.push(format!("- Lowest completed todo confidence: {}%.", score)),
-        None => lines.push("- Lowest completed todo confidence: unknown.".to_string()),
-    }
-
-    if missing_completion_confidence > 0 {
-        lines.push(format!(
-            "- Missing completion_confidence on {} completed todo{}.",
-            missing_completion_confidence,
-            if missing_completion_confidence == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ));
-    }
-
-    if below_threshold_count > 0 {
-        lines.push(format!(
-            "- {} completed todo{} below the {}% confidence threshold.",
-            below_threshold_count,
-            if below_threshold_count == 1 {
-                " is"
-            } else {
-                "s are"
-            },
-            TODO_CONFIDENCE_THRESHOLD
-        ));
-    }
-
-    if summary.needs_more_work {
-        lines.push(
-            "- Auto-poke instruction: confidence is below the threshold or incomplete. Keep working: validate, test, fix gaps, and update completion_confidence when the evidence changes."
-                .to_string(),
-        );
+    if summary.completion_confidence_needs_validation {
+        TODO_COMPLETION_CONTINUATION_MESSAGE.to_string()
+    } else if summary.confidence_spike_detected {
+        TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE.to_string()
     } else {
-        lines.push(
-            "- Suggested action: use this confidence summary when deciding whether any further validation would materially improve certainty before finalizing."
-                .to_string(),
-        );
+        TODO_COMPLETION_CONTINUATION_MESSAGE.to_string()
     }
-
-    lines.join("\n")
 }
 
 pub(super) fn todo_confidence_summary(todos: &[crate::todo::TodoItem]) -> TodoConfidenceSummary {
@@ -2525,14 +2660,18 @@ pub(super) fn todo_confidence_summary(todos: &[crate::todo::TodoItem]) -> TodoCo
         .iter()
         .filter(|(_, score, _)| *score < TODO_CONFIDENCE_THRESHOLD)
         .count();
-    let needs_more_work = completion_average
+    let completion_confidence_needs_validation = completion_average
         .map(|avg| avg < TODO_CONFIDENCE_THRESHOLD)
         .unwrap_or(true)
         || missing_completion_confidence > 0
         || below_threshold_count > 0;
+    let confidence_spike_detected = !crate::todo::spike_completed_todos(todos).is_empty();
+    let needs_more_work = completion_confidence_needs_validation || confidence_spike_detected;
 
     TodoConfidenceSummary {
         completion_average,
+        completion_confidence_needs_validation,
+        confidence_spike_detected,
         needs_more_work,
     }
 }
@@ -2588,6 +2727,150 @@ fn parse_alignment_value(raw: &str) -> Option<bool> {
     }
 }
 
+fn parse_on_off_value(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "compact" | "true" | "1" | "yes" | "enable" | "enabled" => Some(true),
+        "off" | "full" | "false" | "0" | "no" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn handle_compact_notifications_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/compact-notifications" && !trimmed.starts_with("/compact-notifications ") {
+        return false;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/compact-notifications")
+        .unwrap_or_default()
+        .trim();
+
+    if rest.is_empty() || matches!(rest, "show" | "status") {
+        let current = crate::config::config().display.compact_notifications;
+        app.push_display_message(DisplayMessage::system(format!(
+            "Compact notifications are currently {}.\n\nWhen on, swarm/file-activity notifications collapse to a single line (path · summary) instead of the full multi-line card with diff preview.\n\nUse /compact-notifications on or /compact-notifications off to change it.",
+            if current { "on" } else { "off" }
+        )));
+        return true;
+    }
+
+    let Some(enabled) = parse_on_off_value(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /compact-notifications (show), /compact-notifications on, or /compact-notifications off".to_string(),
+        ));
+        return true;
+    };
+
+    app.set_status_notice(format!(
+        "Compact notifications: {}",
+        if enabled { "on" } else { "off" }
+    ));
+    match crate::config::Config::set_compact_notifications(enabled) {
+        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
+            "Saved compact notifications: {}. Applied to this session immediately.",
+            if enabled { "on" } else { "off" }
+        ))),
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Applied compact notifications {} for this session, but failed to save it as the default: {}",
+            if enabled { "on" } else { "off" },
+            error
+        ))),
+    }
+
+    true
+}
+
+fn handle_tool_call_details_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/tool-call-details" && !trimmed.starts_with("/tool-call-details ") {
+        return false;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/tool-call-details")
+        .unwrap_or_default()
+        .trim();
+
+    if rest.is_empty() || matches!(rest, "show" | "status") {
+        let current = crate::config::config().display.tool_call_details;
+        app.push_display_message(DisplayMessage::system(format!(
+            "Tool call details are currently {}.\n\nWhen on, tool rows show the dimmed technical detail (command, path, args) next to the model-provided intent. When off, rows with an intent show only the intent; rows without an intent still show the technical detail.\n\nUse /tool-call-details on or /tool-call-details off to change it.",
+            if current { "on" } else { "off" }
+        )));
+        return true;
+    }
+
+    let Some(enabled) = parse_on_off_value(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /tool-call-details (show), /tool-call-details on, or /tool-call-details off"
+                .to_string(),
+        ));
+        return true;
+    };
+
+    app.set_status_notice(format!(
+        "Tool call details: {}",
+        if enabled { "on" } else { "off" }
+    ));
+    match crate::config::Config::set_tool_call_details(enabled) {
+        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
+            "Saved tool call details: {}. Applied to this session immediately.",
+            if enabled { "on" } else { "off" }
+        ))),
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Applied tool call details {} for this session, but failed to save it as the default: {}",
+            if enabled { "on" } else { "off" },
+            error
+        ))),
+    }
+
+    true
+}
+
+fn handle_show_agentgrep_output_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/show-agentgrep-output" && !trimmed.starts_with("/show-agentgrep-output ") {
+        return false;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/show-agentgrep-output")
+        .unwrap_or_default()
+        .trim();
+
+    if rest.is_empty() || matches!(rest, "show" | "status") {
+        let current = crate::config::config().display.show_agentgrep_output;
+        app.push_display_message(DisplayMessage::system(format!(
+            "Show agentgrep output is currently {}.\n\nWhen on, the full agentgrep search results render inline in the transcript instead of just the one-line summary.\n\nUse /show-agentgrep-output on or /show-agentgrep-output off to change it.",
+            if current { "on" } else { "off" }
+        )));
+        return true;
+    }
+
+    let Some(enabled) = parse_on_off_value(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /show-agentgrep-output (show), /show-agentgrep-output on, or /show-agentgrep-output off".to_string(),
+        ));
+        return true;
+    };
+
+    app.set_status_notice(format!(
+        "Show agentgrep output: {}",
+        if enabled { "on" } else { "off" }
+    ));
+    match crate::config::Config::set_show_agentgrep_output(enabled) {
+        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
+            "Saved show agentgrep output: {}. Applied to this session immediately.",
+            if enabled { "on" } else { "off" }
+        ))),
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Applied show agentgrep output {} for this session, but failed to save it as the default: {}",
+            if enabled { "on" } else { "off" },
+            error
+        ))),
+    }
+
+    true
+}
+
 fn parse_agents_target(raw: &str) -> Option<crate::tui::AgentModelTarget> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "swarm" | "agent" | "agents" | "subagent" | "subagents" => {
@@ -2603,6 +2886,103 @@ fn parse_agents_target(raw: &str) -> Option<crate::tui::AgentModelTarget> {
         "ambient" => Some(crate::tui::AgentModelTarget::Ambient),
         _ => None,
     }
+}
+
+fn file_has_nonblank_content(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| !content.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn ensure_swarm_prompt_edit_path(
+    working_dir: Option<&str>,
+    jcode_dir: &std::path::Path,
+) -> std::io::Result<PathBuf> {
+    let project_dir = match working_dir {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_dir()?,
+    };
+    let project_path = project_dir.join(".jcode").join("swarm-prompt.md");
+    if file_has_nonblank_content(&project_path) {
+        return Ok(project_path);
+    }
+
+    let global_path = jcode_dir.join("swarm-prompt.md");
+    if file_has_nonblank_content(&global_path) {
+        return Ok(global_path);
+    }
+
+    std::fs::create_dir_all(jcode_dir)?;
+    let contents = format!("{}\n", crate::prompt::DEFAULT_SWARM_PROMPT.trim());
+    std::fs::write(&global_path, contents)?;
+    Ok(global_path)
+}
+
+pub(super) fn handle_swarm_prompt_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/swarm-prompt"
+        && trimmed != "/swarm-prompt edit"
+        && trimmed != "/swarm-prompt open"
+    {
+        if trimmed.starts_with("/swarm-prompt ") {
+            app.push_display_message(DisplayMessage::error("Usage: /swarm-prompt".to_string()));
+            return true;
+        }
+        return false;
+    }
+
+    let jcode_dir = match crate::storage::jcode_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to locate the Jcode config directory: {}",
+                error
+            )));
+            return true;
+        }
+    };
+    let path = match ensure_swarm_prompt_edit_path(app.session.working_dir.as_deref(), &jcode_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to prepare the swarm prompt file: {}",
+                error
+            )));
+            return true;
+        }
+    };
+
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "nano".to_string());
+    let mut parts = editor.split_whitespace();
+    let Some(bin) = parts.next() else {
+        app.push_display_message(DisplayMessage::error(
+            "$VISUAL/$EDITOR is empty; cannot open the swarm prompt.".to_string(),
+        ));
+        return true;
+    };
+    let extra: Vec<&str> = parts.collect();
+    match std::process::Command::new(bin)
+        .args(&extra)
+        .arg(&path)
+        .spawn()
+    {
+        Ok(_) => {
+            app.push_display_message(DisplayMessage::system(format!(
+                "Opening the active swarm routing prompt in {}:\n{}\n\nChanges apply after restarting or reloading Jcode because running agent tool registries cache the prompt.",
+                editor,
+                path.display()
+            )));
+            app.set_status_notice("Opened swarm prompt");
+        }
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Failed to launch editor '{}' for {}: {}",
+            editor,
+            path.display(),
+            error
+        ))),
+    }
+    true
 }
 
 pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
@@ -2640,9 +3020,9 @@ fn handle_alignment_command(app: &mut App, trimmed: &str) -> bool {
     if rest.is_empty() || matches!(rest, "show" | "status") {
         let saved = crate::config::Config::load().display.centered;
         app.push_display_message(DisplayMessage::system(format!(
-            "Alignment is currently {}.\nSaved default: {}.\n\nUse /alignment centered or /alignment left to change it permanently, or press Alt+C to toggle it for the current session.",
+            "Alignment is currently {}.\nSaved default: {}.\n\nUse /alignment centered or /alignment left to change it permanently, or press {} to toggle it for the current session.",
             alignment_label(app.centered),
-            alignment_label(saved)
+            alignment_label(saved), jcode_tui_core::keybind::alt_chord("C")
         )));
         return true;
     }
@@ -2656,6 +3036,7 @@ fn handle_alignment_command(app: &mut App, trimmed: &str) -> bool {
 
     app.set_centered(centered);
     app.set_status_notice(alignment_status_notice(centered));
+    app.record_keybinding_slow(super::shortcut_hints::LearnableAction::Alignment);
 
     match crate::config::Config::set_display_centered(centered) {
         Ok(()) => app.push_display_message(DisplayMessage::system(format!(
@@ -2672,8 +3053,83 @@ fn handle_alignment_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+fn handle_reasoning_display_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/reasoning"
+        && !trimmed.starts_with("/reasoning ")
+        && trimmed != "/thinking"
+        && !trimmed.starts_with("/thinking ")
+        && trimmed != "/thinking-display"
+        && !trimmed.starts_with("/thinking-display ")
+    {
+        return false;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/thinking-display")
+        .or_else(|| trimmed.strip_prefix("/reasoning"))
+        .or_else(|| trimmed.strip_prefix("/thinking"))
+        .unwrap_or_default()
+        .trim();
+
+    if rest.is_empty() || matches!(rest, "show" | "status") {
+        let current = crate::config::config().display.reasoning_display();
+        app.push_display_message(DisplayMessage::system(format!(
+            "Thinking display is currently {}.\n\n\
+             Modes:\n\
+             • off - never show thinking text\n\
+             • full - keep every thinking trace in the transcript\n\
+             • current - show only the live thinking, then collapse it once a tool runs or the answer commits\n\n\
+             Use /thinking-display <off|full|current> to change it. To change how hard the model thinks, use /effort.",
+            current.label()
+        )));
+        return true;
+    }
+
+    let Some(mode) = crate::config::ReasoningDisplayMode::parse(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /thinking-display (show), then off, full, or current".to_string(),
+        ));
+        return true;
+    };
+
+    app.set_status_notice(format!("Thinking display: {}", mode.label()));
+    match crate::config::Config::set_reasoning_display(mode) {
+        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
+            "Saved thinking display: {}. Applied to this session immediately.",
+            mode.label()
+        ))),
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Applied thinking display {} for this session, but failed to save it as the default: {}",
+            mode.label(),
+            error
+        ))),
+    }
+
+    true
+}
+
 pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
     if handle_alignment_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_reasoning_display_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_compact_notifications_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_show_agentgrep_output_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_tool_call_details_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_swarm_prompt_command(app, trimmed) {
         return true;
     }
 
@@ -2893,7 +3349,31 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
                 tool_data: None,
             });
 
-            let _ = std::process::Command::new(&editor).arg(&path).spawn();
+            // $EDITOR may contain arguments (e.g. "zed --wait" or "code -w"), so
+            // split on whitespace and use the first token as the binary, passing
+            // the rest as leading args before the file path. Report spawn errors
+            // instead of swallowing them so the user is not left confused.
+            let mut parts = editor.split_whitespace();
+            match parts.next() {
+                Some(bin) => {
+                    let extra: Vec<&str> = parts.collect();
+                    if let Err(e) = std::process::Command::new(bin)
+                        .args(&extra)
+                        .arg(&path)
+                        .spawn()
+                    {
+                        app.push_display_message(DisplayMessage::error(format!(
+                            "Failed to launch editor '{}': {}",
+                            editor, e
+                        )));
+                    }
+                }
+                None => {
+                    app.push_display_message(DisplayMessage::error(
+                        "$EDITOR is set to an empty value; cannot open config.".to_string(),
+                    ));
+                }
+            }
         }
         return true;
     }
@@ -2907,14 +3387,6 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     false
-}
-
-pub(super) fn handle_debug_command(app: &mut App, trimmed: &str) -> bool {
-    super::debug::handle_debug_command(app, trimmed)
-}
-
-pub(super) fn handle_model_command(app: &mut App, trimmed: &str) -> bool {
-    super::model_context::handle_model_command(app, trimmed)
 }
 
 pub(super) fn handle_usage_command(app: &mut App, trimmed: &str) -> bool {
@@ -2958,8 +3430,57 @@ pub(super) fn handle_feedback_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
-pub(super) fn handle_dev_command(app: &mut App, trimmed: &str) -> bool {
-    super::tui_lifecycle_runtime::handle_dev_command(app, trimmed)
+/// `/telemetry [everything|no-prompts|nothing]` - show or change the same
+/// three-way telemetry level offered by the onboarding "Telemetry settings"
+/// page, so the promise made there ("change this later with /telemetry") holds.
+pub(super) fn handle_telemetry_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("/telemetry") else {
+        return false;
+    };
+    if !rest.is_empty()
+        && !rest
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(false)
+    {
+        return false;
+    }
+
+    use crate::tui::app::onboarding_flow::TelemetryLevel;
+    let arg = rest.trim().to_ascii_lowercase();
+    let level = match arg.as_str() {
+        "" => {
+            let current = TelemetryLevel::current();
+            let detail = match current {
+                TelemetryLevel::Everything => {
+                    "Sending everything, including prompts and transcripts. Thank you."
+                }
+                TelemetryLevel::NoContent => {
+                    "Sending usage stats and crash reports only. No prompts or transcripts."
+                }
+                TelemetryLevel::Nothing => "Sending nothing.",
+            };
+            app.push_display_message(DisplayMessage::system(format!(
+                "{detail}\nChange it with /telemetry everything | no-prompts | nothing."
+            )));
+            app.set_status_notice(current.status_label());
+            return true;
+        }
+        "everything" | "all" => TelemetryLevel::Everything,
+        "no-prompts" | "no-content" | "usage" => TelemetryLevel::NoContent,
+        "nothing" | "off" | "none" => TelemetryLevel::Nothing,
+        other => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Unknown telemetry level \"{other}\". Use everything, no-prompts, or nothing."
+            )));
+            return true;
+        }
+    };
+    level.persist();
+    app.push_display_message(DisplayMessage::system(level.status_label().to_string()));
+    app.set_status_notice(level.status_label());
+    true
 }
 
 #[cfg(test)]

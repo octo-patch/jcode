@@ -1,241 +1,209 @@
 import Foundation
 
-public actor JCodeConnection {
-    public enum State: Sendable {
-        case disconnected
-        case connecting
-        case connected(sessionId: String)
-        case error(String)
-    }
-
-    public enum Event: Sendable {
-        case stateChanged(State)
-        case serverEvent(ServerEvent)
-    }
-
-    private var webSocket: URLSessionWebSocketTask?
-    private var urlSession: URLSession?
-    private var state: State = .disconnected
-    private var nextId: UInt64 = 1
-    private var eventContinuation: AsyncStream<Event>.Continuation?
-    private var expectingReloadDisconnect = false
-    private var keepaliveTask: Task<Void, Never>?
-    private let authToken: String
-    private let serverURL: URL
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
-    private static let keepaliveIntervalNanos: UInt64 = 20_000_000_000
-
-    public init(host: String, port: UInt16 = 7643, authToken: String) {
-        var components = URLComponents()
-        components.scheme = "ws"
-        components.host = host
-        components.port = Int(port)
-        components.path = "/ws"
-        self.serverURL = components.url!
-        self.authToken = authToken
-    }
-
-    public func events() -> AsyncStream<Event> {
-        AsyncStream { continuation in
-            self.eventContinuation = continuation
-        }
-    }
-
-    public func connect(workingDir: String? = nil) async throws {
-        expectingReloadDisconnect = false
-        setState(.connecting)
-
-        let session = URLSession(configuration: .default)
-        self.urlSession = session
-
-        var request = URLRequest(url: serverURL)
-        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-        let task = session.webSocketTask(with: request)
-        self.webSocket = task
-        task.resume()
-
-        startReceiving()
-        startKeepaliveLoop()
-
-        let id = nextId
-        nextId += 1
-        try await send(.subscribe(id: id, workingDir: workingDir))
-
-        setState(.connected(sessionId: ""))
-    }
-
-    public func disconnect() {
-        expectingReloadDisconnect = false
-        keepaliveTask?.cancel()
-        keepaliveTask = nil
-        webSocket?.cancel(with: .normalClosure, reason: nil)
-        webSocket = nil
-        urlSession = nil
-        setState(.disconnected)
-        eventContinuation?.finish()
-        eventContinuation = nil
-    }
-
-    public func sendMessage(_ content: String, images: [(String, String)] = []) async throws -> UInt64 {
-        let id = nextId
-        nextId += 1
-        try await send(.message(id: id, content: content, images: images))
-        return id
-    }
-
-    public func cancelGeneration() async throws {
-        let id = nextId
-        nextId += 1
-        try await send(.cancel(id: id))
-    }
-
-    public func requestHistory() async throws -> UInt64 {
-        let id = nextId
-        nextId += 1
-        try await send(.getHistory(id: id))
-        return id
-    }
-
-    public func ping() async throws {
-        let id = nextId
-        nextId += 1
-        try await send(.ping(id: id))
-    }
-
-    public func resumeSession(_ sessionId: String) async throws {
-        let id = nextId
-        nextId += 1
-        try await send(.resumeSession(id: id, sessionId: sessionId))
-    }
-
-    public func setModel(_ model: String) async throws {
-        let id = nextId
-        nextId += 1
-        try await send(.setModel(id: id, model: model))
-    }
-
-    public func interrupt(_ content: String, urgent: Bool = false) async throws {
-        let id = nextId
-        nextId += 1
-        try await send(.softInterrupt(id: id, content: content, urgent: urgent))
-    }
-
-    // MARK: - Private
-
-    private func send(_ request: Request) async throws {
-        guard let webSocket else {
-            throw ConnectionError.notConnected
-        }
-        let data = try encoder.encode(request)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw ConnectionError.encodingFailed
-        }
-        try await webSocket.send(.string(text))
-    }
-
-    private func startReceiving() {
-        webSocket?.receive { [weak self] result in
-            Task { [weak self] in
-                guard let self else { return }
-                await self.handleReceive(result)
-            }
-        }
-    }
-
-    private func startKeepaliveLoop() {
-        keepaliveTask?.cancel()
-        keepaliveTask = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: Self.keepaliveIntervalNanos)
-                if Task.isCancelled {
-                    break
-                }
-                do {
-                    try await self.sendWebSocketPing()
-                } catch {
-                    await self.handleKeepaliveFailure(error)
-                    break
-                }
-            }
-        }
-    }
-
-    private func sendWebSocketPing() async throws {
-        guard let webSocket else {
-            throw ConnectionError.notConnected
-        }
-
-        try await withCheckedThrowingContinuation { continuation in
-            webSocket.sendPing { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
-        }
-    }
-
-    private func handleKeepaliveFailure(_ error: Error) {
-        keepaliveTask?.cancel()
-        keepaliveTask = nil
-        if expectingReloadDisconnect {
-            expectingReloadDisconnect = false
-            setState(.disconnected)
-            eventContinuation?.yield(.stateChanged(.disconnected))
-            return
-        }
-
-        let message = error.localizedDescription
-        setState(.error(message))
-        eventContinuation?.yield(.stateChanged(.error(message)))
-    }
-
-    private func handleReceive(_ result: Result<URLSessionWebSocketTask.Message, Error>) {
-        switch result {
-        case .success(let message):
-            switch message {
-            case .string(let text):
-                if let data = text.data(using: .utf8),
-                   let event = try? self.decoder.decode(ServerEvent.self, from: data) {
-                    if case .reloading = event {
-                        expectingReloadDisconnect = true
-                    }
-                    if case .sessionId(let sid) = event {
-                        setState(.connected(sessionId: sid))
-                    }
-                    eventContinuation?.yield(.serverEvent(event))
-                }
-            case .data:
-                break
-            @unknown default:
-                break
-            }
-            startReceiving()
-
-        case .failure(let error):
-            keepaliveTask?.cancel()
-            keepaliveTask = nil
-            if expectingReloadDisconnect {
-                expectingReloadDisconnect = false
-                setState(.disconnected)
-            } else {
-                setState(.error(error.localizedDescription))
-                eventContinuation?.yield(.stateChanged(.error(error.localizedDescription)))
-            }
-        }
-    }
-
-    private func setState(_ newState: State) {
-        state = newState
-        eventContinuation?.yield(.stateChanged(newState))
-    }
+/// Connection lifecycle reported to the UI.
+public enum ConnectionPhase: Equatable, Sendable {
+    case disconnected
+    case connecting
+    case connected
+    /// Waiting before the next reconnect attempt.
+    case reconnecting(attempt: Int)
+    /// Gave up or was told to stop; `reason` is user-displayable.
+    case failed(reason: String)
 }
 
-public enum ConnectionError: Error, Sendable {
-    case encodingFailed
-    case notConnected
-    case invalidResponse
+/// Everything the UI observes from a connection: lifecycle changes plus
+/// decoded server events.
+public enum ConnectionOutput: Equatable, Sendable {
+    case phase(ConnectionPhase)
+    case event(ServerEvent)
+}
+
+/// Actor owning one WebSocket connection to a jcode server.
+///
+/// Responsibilities:
+/// - connect, authenticate, subscribe
+/// - decode incoming NDJSON frames into `ServerEvent`s
+/// - automatic reconnect with capped exponential backoff
+/// - request-ID assignment
+///
+/// It deliberately knows nothing about app state; consumers feed the output
+/// stream into `SessionReducer`.
+public actor Connection {
+    public struct Configuration: Sendable {
+        public var gateway: Gateway
+        public var authToken: String
+        /// Maximum reconnect attempts before reporting `.failed`. Nil retries forever.
+        public var maxReconnectAttempts: Int?
+        /// Base backoff delay in seconds, doubled per attempt and capped at 30s.
+        public var baseBackoffSeconds: Double
+
+        public init(
+            gateway: Gateway,
+            authToken: String,
+            maxReconnectAttempts: Int? = nil,
+            baseBackoffSeconds: Double = 1.0
+        ) {
+            self.gateway = gateway
+            self.authToken = authToken
+            self.maxReconnectAttempts = maxReconnectAttempts
+            self.baseBackoffSeconds = baseBackoffSeconds
+        }
+    }
+
+    private let configuration: Configuration
+    private let makeTransport: @Sendable () -> any WebSocketTransport
+    private var transport: (any WebSocketTransport)?
+    private var nextRequestID: UInt64 = 1
+    private var runTask: Task<Void, Never>?
+    private var continuation: AsyncStream<ConnectionOutput>.Continuation?
+    private var targetSessionID: String?
+    private var stopped = false
+    /// Set when the server announced a reload; the next reconnect attempt
+    /// skips backoff because the drop is expected and the server returns fast.
+    private var expectServerReload = false
+    /// Set when the server asked this client to close; reconnecting would
+    /// fight the server, so the loop ends with a failed phase instead.
+    private var closeRequestedReason: String?
+
+    public init(
+        configuration: Configuration,
+        makeTransport: @escaping @Sendable () -> any WebSocketTransport = {
+            URLSessionWebSocketTransport()
+        }
+    ) {
+        self.configuration = configuration
+        self.makeTransport = makeTransport
+    }
+
+    /// Starts the connection loop. The returned stream yields phase changes
+    /// and decoded events until `stop()` is called or the stream is cancelled.
+    public func start(resumeSessionID: String? = nil) -> AsyncStream<ConnectionOutput> {
+        targetSessionID = resumeSessionID
+        stopped = false
+        expectServerReload = false
+        closeRequestedReason = nil
+        let (stream, continuation) = AsyncStream.makeStream(of: ConnectionOutput.self)
+        self.continuation = continuation
+        runTask = Task { await runLoop() }
+        continuation.onTermination = { _ in
+            Task { [weak self] in await self?.stop() }
+        }
+        return stream
+    }
+
+    public func stop() async {
+        guard !stopped else { return }
+        stopped = true
+        runTask?.cancel()
+        runTask = nil
+        if let transport {
+            await transport.close()
+        }
+        transport = nil
+        continuation?.yield(.phase(.disconnected))
+        continuation?.finish()
+        continuation = nil
+    }
+
+    /// Sends a request, assigning it a fresh ID. Returns the assigned ID.
+    @discardableResult
+    public func send(_ build: @Sendable (UInt64) -> Request) async throws -> UInt64 {
+        guard let transport else { throw TransportError.notConnected }
+        let id = nextRequestID
+        nextRequestID += 1
+        let request = build(id)
+        try await transport.send(text: request.encodedLine())
+        return id
+    }
+
+    // MARK: - Internals
+
+    private func runLoop() async {
+        var attempt = 0
+        while !Task.isCancelled && !stopped {
+            yield(.phase(attempt == 0 ? .connecting : .reconnecting(attempt: attempt)))
+            let transport = makeTransport()
+            do {
+                try await transport.connect(
+                    url: configuration.gateway.webSocketURL,
+                    authToken: configuration.authToken
+                )
+                self.transport = transport
+                yield(.phase(.connected))
+                attempt = 0
+                try await subscribeAndSync()
+                try await receiveLoop(transport: transport)
+                // Clean close: fall through to reconnect.
+            } catch {
+                if Task.isCancelled || stopped { break }
+                if case TransportError.unauthorized = error {
+                    // Retrying with the same token can never succeed.
+                    self.transport = nil
+                    yield(
+                        .phase(
+                            .failed(
+                                reason:
+                                    "This device is no longer paired with the server. Re-pair to reconnect."
+                            )))
+                    return
+                }
+            }
+            self.transport = nil
+            if Task.isCancelled || stopped { break }
+            if let reason = closeRequestedReason {
+                await transport.close()
+                yield(.phase(.failed(reason: reason)))
+                return
+            }
+            attempt += 1
+            if let max = configuration.maxReconnectAttempts, attempt > max {
+                yield(.phase(.failed(reason: "Could not reach server after \(max) attempts")))
+                return
+            }
+            if expectServerReload {
+                // The server told us it is restarting: reconnect eagerly with a
+                // short fixed delay instead of exponential backoff.
+                expectServerReload = false
+                try? await Task.sleep(nanoseconds: UInt64(configuration.baseBackoffSeconds * 500_000_000))
+                continue
+            }
+            let delay = min(
+                configuration.baseBackoffSeconds * pow(2.0, Double(attempt - 1)), 30.0)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+    }
+
+    private func subscribeAndSync() async throws {
+        let sessionID = targetSessionID
+        try await send { .subscribe(id: $0, targetSessionID: sessionID) }
+        try await send { .getHistory(id: $0) }
+    }
+
+    private func receiveLoop(transport: any WebSocketTransport) async throws {
+        while !Task.isCancelled && !stopped {
+            guard let text = try await transport.receiveText() else { return }
+            // A frame may contain multiple newline-delimited events.
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                if let event = try? ServerEvent.decode(line: String(line)) {
+                    switch event {
+                    case .sessionID(let sessionID):
+                        targetSessionID = sessionID
+                    case .reloading:
+                        expectServerReload = true
+                    case .sessionCloseRequested(let reason):
+                        closeRequestedReason =
+                            reason.isEmpty ? "Server closed this session" : reason
+                    default:
+                        break
+                    }
+                    yield(.event(event))
+                    if closeRequestedReason != nil { return }
+                }
+            }
+        }
+    }
+
+    private func yield(_ output: ConnectionOutput) {
+        continuation?.yield(output)
+    }
 }

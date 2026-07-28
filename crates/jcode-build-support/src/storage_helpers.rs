@@ -5,10 +5,34 @@ use std::path::PathBuf;
 
 /// Get path to builds directory
 pub fn builds_dir() -> Result<PathBuf> {
-    let base = storage::jcode_dir()?;
-    let dir = base.join("builds");
+    let dir = resolve_builds_dir(
+        std::env::var_os("JCODE_HOME").map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        storage::jcode_dir()?,
+        cfg!(windows),
+    );
     storage::ensure_dir(&dir)?;
     Ok(dir)
+}
+
+fn resolve_builds_dir(
+    jcode_home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    default_jcode_dir: PathBuf,
+    is_windows: bool,
+) -> PathBuf {
+    if let Some(jcode_home) = jcode_home {
+        return jcode_home.join("builds");
+    }
+
+    if is_windows && let Some(local_app_data) = local_app_data {
+        // Keep runtime channel discovery aligned with scripts/install.ps1 and
+        // the supported Windows layout under %LOCALAPPDATA%\jcode\builds.
+        // Durable user state and logs still live under ~/.jcode.
+        return local_app_data.join("jcode").join("builds");
+    }
+
+    default_jcode_dir.join("builds")
 }
 
 /// Get path to build manifest
@@ -37,6 +61,48 @@ pub fn current_binary_path() -> Result<PathBuf> {
 /// Get path to the shared server symlink (approved daemon channel).
 pub fn shared_server_binary_path() -> Result<PathBuf> {
     Ok(builds_dir()?.join("shared-server").join(binary_name()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_builds_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn windows_builds_use_local_app_data() {
+        let resolved = resolve_builds_dir(
+            None,
+            Some(PathBuf::from("/local-app-data")),
+            PathBuf::from("/home/test/.jcode"),
+            true,
+        );
+
+        assert_eq!(resolved, PathBuf::from("/local-app-data/jcode/builds"));
+    }
+
+    #[test]
+    fn jcode_home_override_wins_on_windows() {
+        let resolved = resolve_builds_dir(
+            Some(PathBuf::from("/isolated-jcode")),
+            Some(PathBuf::from("/local-app-data")),
+            PathBuf::from("/home/test/.jcode"),
+            true,
+        );
+
+        assert_eq!(resolved, PathBuf::from("/isolated-jcode/builds"));
+    }
+
+    #[test]
+    fn non_windows_builds_stay_under_jcode_home() {
+        let resolved = resolve_builds_dir(
+            None,
+            Some(PathBuf::from("/ignored/local-app-data")),
+            PathBuf::from("/home/test/.jcode"),
+            false,
+        );
+
+        assert_eq!(resolved, PathBuf::from("/home/test/.jcode/builds"));
+    }
 }
 
 /// Get path to canary binary
@@ -153,11 +219,52 @@ pub fn build_progress_path() -> Result<PathBuf> {
 pub fn write_build_progress(status: &str) -> Result<()> {
     let path = build_progress_path()?;
     std::fs::write(&path, status)?;
+    invalidate_build_progress_cache();
     Ok(())
 }
 
-/// Read current build progress
+/// Process-local cache for `read_build_progress`. Stores the last-read value
+/// alongside the time it was read so per-frame TUI calls can be served without
+/// a disk hit.
+static BUILD_PROGRESS_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<String>)>> =
+    std::sync::Mutex::new(None);
+
+const BUILD_PROGRESS_TTL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn invalidate_build_progress_cache() {
+    if let Ok(mut guard) = BUILD_PROGRESS_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+/// Read current build progress.
+///
+/// The TUI calls this from its per-frame redraw scheduler (several times per
+/// frame, across every connected client), so a naive implementation performs a
+/// synchronous disk read on every render tick even when no build is running.
+/// Build progress is a purely cosmetic status string, so we cache the result
+/// for a short window. The cache is invalidated immediately on
+/// `write_build_progress`/`clear_build_progress` so progress still updates
+/// promptly when a build is driven from the same process; cross-process updates
+/// become visible within the TTL.
 pub fn read_build_progress() -> Option<String> {
+    if let Ok(guard) = BUILD_PROGRESS_CACHE.lock()
+        && let Some((at, ref value)) = *guard
+        && at.elapsed() < BUILD_PROGRESS_TTL
+    {
+        return value.clone();
+    }
+
+    let value = read_build_progress_uncached();
+
+    if let Ok(mut guard) = BUILD_PROGRESS_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), value.clone()));
+    }
+
+    value
+}
+
+fn read_build_progress_uncached() -> Option<String> {
     build_progress_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -171,5 +278,6 @@ pub fn clear_build_progress() -> Result<()> {
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
+    invalidate_build_progress_cache();
     Ok(())
 }

@@ -2,6 +2,27 @@ use super::*;
 use crate::cli::provider_init::ProviderChoice;
 
 #[test]
+fn server_start_and_internal_keepalive_parse() {
+    let args = Args::try_parse_from(["jcode", "server", "start", "--json"])
+        .expect("server start should parse");
+    assert!(matches!(
+        args.command,
+        Some(Command::Server {
+            action: ServerCommand::Start { json: true }
+        })
+    ));
+
+    let keepalive = Args::try_parse_from(["jcode", "server", "keepalive"])
+        .expect("internal server keepalive should parse");
+    assert!(matches!(
+        keepalive.command,
+        Some(Command::Server {
+            action: ServerCommand::Keepalive
+        })
+    ));
+}
+
+#[test]
 fn test_provider_choice_aliases_parse() {
     let args = Args::try_parse_from(["jcode", "--provider", "z.ai", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Zai);
@@ -28,6 +49,35 @@ fn test_provider_choice_aliases_parse() {
 
     let args = Args::try_parse_from(["jcode", "--provider", "cgc", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Comtegra);
+}
+
+#[test]
+fn serve_server_name_option_parses() {
+    let args =
+        Args::try_parse_from(["jcode", "serve", "--server-name", "mount-cloud/fabian"]).unwrap();
+    match args.command {
+        Some(Command::Serve { server_name, .. }) => {
+            assert_eq!(server_name.as_deref(), Some("mount-cloud/fabian"));
+        }
+        other => panic!("unexpected command: {:?}", other),
+    }
+}
+
+#[test]
+fn remote_working_dir_option_parses() {
+    let args = Args::try_parse_from([
+        "jcode",
+        "--socket",
+        "/tmp/jcode.sock",
+        "--remote-working-dir",
+        "/home/agent/project",
+    ])
+    .unwrap();
+
+    assert_eq!(
+        args.remote_working_dir.as_deref(),
+        Some("/home/agent/project")
+    );
 }
 
 #[test]
@@ -457,6 +507,43 @@ fn login_scriptable_flags_parse() {
 }
 
 #[test]
+fn account_subcommands_parse() {
+    let login =
+        Args::try_parse_from(["jcode", "account", "login", "--no-browser"]).expect("account login");
+    assert!(matches!(
+        login.command,
+        Some(Command::Account {
+            action: AccountCommand::Login { no_browser: true }
+        })
+    ));
+
+    let status =
+        Args::try_parse_from(["jcode", "account", "status", "--json"]).expect("account status");
+    assert!(matches!(
+        status.command,
+        Some(Command::Account {
+            action: AccountCommand::Status { json: true }
+        })
+    ));
+
+    let manage = Args::try_parse_from(["jcode", "account", "manage"]).expect("account manage");
+    assert!(matches!(
+        manage.command,
+        Some(Command::Account {
+            action: AccountCommand::Manage
+        })
+    ));
+
+    let logout = Args::try_parse_from(["jcode", "account", "logout"]).expect("account logout");
+    assert!(matches!(
+        logout.command,
+        Some(Command::Account {
+            action: AccountCommand::Logout
+        })
+    ));
+}
+
+#[test]
 fn quiet_global_flag_parses() {
     let args = Args::try_parse_from(["jcode", "--quiet", "model", "list"]).unwrap();
     assert!(args.quiet);
@@ -636,4 +723,39 @@ fn restart_save_auto_restore_flag_parses() {
         }) => {}
         other => panic!("unexpected command: {:?}", other),
     }
+}
+
+/// Contract test for the onboarding agent-repair brief (see
+/// `jcode-tui::tui::app::onboarding_repair::build_repair_brief`). The brief
+/// tells a coding agent to run these exact commands to diagnose and fix a
+/// failed login. If any flag here stops parsing, the brief would hand the agent
+/// a broken command, so this guards the agent-facing CLI contract.
+#[test]
+fn onboarding_repair_brief_commands_are_valid_cli() {
+    // Diagnose.
+    Args::try_parse_from(["jcode", "auth-test", "--provider", "openai", "--json"])
+        .expect("auth-test --provider --json must parse");
+    Args::try_parse_from(["jcode", "auth-test", "--all-configured", "--json"])
+        .expect("auth-test --all-configured --json must parse");
+    Args::try_parse_from(["jcode", "auth", "doctor"]).expect("auth doctor must parse");
+
+    // Fix: OAuth and API-key logins.
+    Args::try_parse_from(["jcode", "login", "--provider", "openai"])
+        .expect("login --provider must parse");
+    Args::try_parse_from(["jcode", "login", "--provider", "openai", "--api-key", "k"])
+        .expect("login --provider --api-key must parse");
+
+    // Fix: custom OpenAI-compatible endpoint via provider add + key on stdin.
+    Args::try_parse_from([
+        "jcode",
+        "provider",
+        "add",
+        "my-endpoint",
+        "--base-url",
+        "https://api.example.com/v1",
+        "--model",
+        "some-model",
+        "--api-key-stdin",
+    ])
+    .expect("provider add --base-url --model --api-key-stdin must parse");
 }

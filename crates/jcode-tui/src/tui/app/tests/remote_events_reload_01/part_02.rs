@@ -82,6 +82,7 @@ fn test_remote_auto_poke_followup_preserves_visible_timer_and_stays_hidden() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Continue working".to_string(),
                 status: "pending".to_string(),
@@ -90,6 +91,7 @@ fn test_remote_auto_poke_followup_preserves_visible_timer_and_stays_hidden() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -124,7 +126,7 @@ fn test_remote_auto_poke_followup_preserves_visible_timer_and_stays_hidden() {
 }
 
 #[test]
-fn test_remote_auto_poke_completion_above_threshold_only_updates_ui() {
+fn test_remote_auto_poke_challenges_abrupt_confidence_increase() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -133,14 +135,16 @@ fn test_remote_auto_poke_completion_above_threshold_only_updates_ui() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Finished work".to_string(),
                 status: "completed".to_string(),
                 priority: "high".to_string(),
                 blocked_by: Vec::new(),
                 assigned_to: None,
-                confidence: Some(95),
-                completion_confidence: Some(95),
+                confidence: Some(0),
+                completion_confidence: Some(100),
+                confidence_history: vec![0, 100],
             }],
         )
         .expect("save todos");
@@ -150,12 +154,16 @@ fn test_remote_auto_poke_completion_above_threshold_only_updates_ui() {
         app.status = ProcessingStatus::Streaming;
         app.current_message_id = Some(42);
         app.handle_server_event(crate::protocol::ServerEvent::Done { id: 42 }, &mut remote);
-        assert!(!app.auto_poke_incomplete_todos);
-        assert!(!app.pending_queued_dispatch);
-        assert!(app.hidden_queued_system_messages.is_empty());
+        assert!(app.auto_poke_incomplete_todos);
+        assert!(app.todo_confidence_spike_challenged);
+        assert!(app.pending_queued_dispatch);
+        assert_eq!(
+            app.queued_messages,
+            vec![crate::todo::TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE]
+        );
         assert!(app.display_messages().iter().any(|msg| {
             msg.content
-                .contains("Todos complete. Auto-poke finished. Cumulative confidence: 95%.")
+                .contains("confidence jumped suddenly")
         }));
     });
 }
@@ -170,6 +178,7 @@ fn test_remote_auto_poke_completion_below_threshold_tells_model_to_keep_working(
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Needs validation".to_string(),
                 status: "completed".to_string(),
@@ -178,6 +187,7 @@ fn test_remote_auto_poke_completion_below_threshold_tells_model_to_keep_working(
                 assigned_to: None,
                 confidence: Some(80),
                 completion_confidence: Some(80),
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -187,13 +197,16 @@ fn test_remote_auto_poke_completion_below_threshold_tells_model_to_keep_working(
         app.status = ProcessingStatus::Streaming;
         app.current_message_id = Some(42);
         app.handle_server_event(crate::protocol::ServerEvent::Done { id: 42 }, &mut remote);
-        assert!(!app.auto_poke_incomplete_todos);
+        assert!(app.auto_poke_incomplete_todos);
         assert!(app.pending_queued_dispatch);
-        assert_eq!(app.hidden_queued_system_messages.len(), 1);
-        assert!(app.hidden_queued_system_messages[0].contains("Keep working"));
+        assert_eq!(app.queued_messages.len(), 1);
+        assert_eq!(
+            app.queued_messages[0],
+            crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE
+        );
         assert!(app.display_messages().iter().any(|msg| {
             msg.content
-                .contains("Todos complete. Auto-poke finished. Cumulative confidence: 80%.")
+                .contains("marked its work done without strong enough validation")
         }));
     });
 }
@@ -209,6 +222,7 @@ fn test_remote_poke_status_and_off_update_state() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Continue working".to_string(),
                 status: "pending".to_string(),
@@ -217,6 +231,7 @@ fn test_remote_poke_status_and_off_update_state() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -333,6 +348,7 @@ fn test_remote_rewind_completion_shows_undo_hint_after_history_refresh() {
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
             compaction_mode: crate::config::CompactionMode::Reactive,

@@ -4,6 +4,7 @@ use std::collections::BinaryHeap;
 use std::io::Write;
 use std::path::Path;
 use tokenizers::Tokenizer;
+use tract_hir::infer::Factoid as _;
 use tract_hir::prelude::*;
 
 pub const MODEL_NAME: &str = "all-MiniLM-L6-v2";
@@ -93,6 +94,29 @@ pub type EmbeddingVec = Vec<f32>;
 pub struct Embedder {
     model: RunnableEmbeddingModel,
     tokenizer: Tokenizer,
+    /// Per-input binding plan: (role, dtype) in the model's DECLARED input order.
+    /// Exporters differ in both input ORDER (MiniLM puts input_ids first; e5/bge
+    /// put attention_mask first) and DTYPE (f32 vs i64), so we bind by name and
+    /// feed each input its model-declared dtype instead of assuming a position.
+    input_plan: Vec<(InputRole, DatumType)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InputRole {
+    InputIds,
+    AttentionMask,
+    TokenTypeIds,
+}
+
+fn classify_input(name: &str) -> InputRole {
+    let n = name.to_ascii_lowercase();
+    if n.contains("attention") || n.contains("mask") {
+        InputRole::AttentionMask
+    } else if n.contains("token_type") || n.contains("segment") {
+        InputRole::TokenTypeIds
+    } else {
+        InputRole::InputIds
+    }
 }
 
 impl Embedder {
@@ -107,18 +131,41 @@ impl Embedder {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
-        let model = tract_onnx::onnx()
+        let raw = tract_onnx::onnx()
             .model_for_path(&model_path)
-            .context("Failed to load ONNX model")?
-            .with_input_fact(0, f32::fact([1, MAX_SEQ_LENGTH]).into())?
-            .with_input_fact(1, i64::fact([1, MAX_SEQ_LENGTH]).into())?
-            .with_input_fact(2, i64::fact([1, MAX_SEQ_LENGTH]).into())?
+            .context("Failed to load ONNX model")?;
+
+        // Determine each input's role (by name) and dtype (declared, else i64).
+        let input_outlets = raw
+            .input_outlets()
+            .context("Failed to read model input outlets")?
+            .to_vec();
+        let mut input_plan: Vec<(InputRole, DatumType)> = Vec::with_capacity(input_outlets.len());
+        for (ix, outlet) in input_outlets.iter().enumerate() {
+            let role = classify_input(&raw.node(outlet.node).name);
+            let dt = raw
+                .input_fact(ix)
+                .ok()
+                .and_then(|f| f.datum_type.concretize())
+                .unwrap_or(DatumType::I64);
+            input_plan.push((role, dt));
+        }
+
+        let mut model = raw;
+        for (ix, (_, dt)) in input_plan.iter().enumerate() {
+            model = model.with_input_fact(ix, InferenceFact::dt_shape(*dt, [1, MAX_SEQ_LENGTH]))?;
+        }
+        let model = model
             .into_optimized()
             .context("Failed to optimize model")?
             .into_runnable()
             .context("Failed to make model runnable")?;
 
-        Ok(Self { model, tokenizer })
+        Ok(Self {
+            model,
+            tokenizer,
+            input_plan,
+        })
     }
 
     pub fn embed(&self, text: &str) -> Result<EmbeddingVec> {
@@ -139,23 +186,24 @@ impl Embedder {
             attention_mask[i] = 1;
         }
 
-        let input_ids_tensor: Tensor =
-            tract_ndarray::Array2::from_shape_vec((1, MAX_SEQ_LENGTH), input_ids)?
-                .into_tensor()
-                .cast_to::<f32>()?
-                .into_owned();
+        // Build each input tensor by role, cast to the model's declared dtype.
+        let make = |data: &[i64], dt: DatumType| -> Result<Tensor> {
+            let t: Tensor =
+                tract_ndarray::Array2::from_shape_vec((1, MAX_SEQ_LENGTH), data.to_vec())?.into();
+            Ok(t.cast_to_dt(dt)?.into_owned())
+        };
 
-        let attention_mask_tensor: Tensor =
-            tract_ndarray::Array2::from_shape_vec((1, MAX_SEQ_LENGTH), attention_mask)?.into();
+        let mut inputs: TVec<TValue> = tvec![];
+        for (role, dt) in &self.input_plan {
+            let data: &[i64] = match role {
+                InputRole::InputIds => &input_ids,
+                InputRole::AttentionMask => &attention_mask,
+                InputRole::TokenTypeIds => &token_type_ids,
+            };
+            inputs.push(make(data, *dt)?.into());
+        }
 
-        let token_type_ids_tensor: Tensor =
-            tract_ndarray::Array2::from_shape_vec((1, MAX_SEQ_LENGTH), token_type_ids)?.into();
-
-        let outputs = self.model.run(tvec![
-            input_ids_tensor.into(),
-            attention_mask_tensor.into(),
-            token_type_ids_tensor.into(),
-        ])?;
+        let outputs = self.model.run(inputs)?;
 
         let output = outputs[0].to_array_view::<f32>()?.to_owned();
 
@@ -192,6 +240,124 @@ impl Embedder {
 
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<EmbeddingVec>> {
         texts.iter().map(|t| self.embed(t)).collect()
+    }
+}
+
+/// Build the run() inputs for a BERT-style model from token ids, honoring the
+/// model's declared input order/role/dtype. Shared by Embedder and CrossEncoder.
+fn build_bert_inputs(
+    input_plan: &[(InputRole, DatumType)],
+    ids: &[u32],
+    type_ids: &[u32],
+) -> Result<TVec<TValue>> {
+    let mut input_ids = vec![0i64; MAX_SEQ_LENGTH];
+    let mut attention_mask = vec![0i64; MAX_SEQ_LENGTH];
+    let mut token_type_ids = vec![0i64; MAX_SEQ_LENGTH];
+    let len = ids.len().min(MAX_SEQ_LENGTH);
+    for i in 0..len {
+        input_ids[i] = ids[i] as i64;
+        attention_mask[i] = 1;
+        if i < type_ids.len() {
+            token_type_ids[i] = type_ids[i] as i64;
+        }
+    }
+    let make = |data: &[i64], dt: DatumType| -> Result<Tensor> {
+        let t: Tensor =
+            tract_ndarray::Array2::from_shape_vec((1, MAX_SEQ_LENGTH), data.to_vec())?.into();
+        Ok(t.cast_to_dt(dt)?.into_owned())
+    };
+    let mut inputs: TVec<TValue> = tvec![];
+    for (role, dt) in input_plan {
+        let data: &[i64] = match role {
+            InputRole::InputIds => &input_ids,
+            InputRole::AttentionMask => &attention_mask,
+            InputRole::TokenTypeIds => &token_type_ids,
+        };
+        inputs.push(make(data, *dt)?.into());
+    }
+    Ok(inputs)
+}
+
+/// A cross-encoder reranker: scores a (query, passage) pair jointly and returns
+/// a single relevance logit. Used to reorder a candidate set after first-stage
+/// retrieval (recall-5). Higher score = more relevant.
+pub struct CrossEncoder {
+    model: RunnableEmbeddingModel,
+    tokenizer: Tokenizer,
+    input_plan: Vec<(InputRole, DatumType)>,
+}
+
+impl CrossEncoder {
+    pub fn load_from_dir(model_dir: &Path) -> Result<Self> {
+        let model_path = model_dir.join("model.onnx");
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+
+        let raw = tract_onnx::onnx()
+            .model_for_path(&model_path)
+            .context("Failed to load cross-encoder ONNX model")?;
+        let input_outlets = raw.input_outlets().context("read input outlets")?.to_vec();
+        let mut input_plan: Vec<(InputRole, DatumType)> = Vec::with_capacity(input_outlets.len());
+        for (ix, outlet) in input_outlets.iter().enumerate() {
+            let role = classify_input(&raw.node(outlet.node).name);
+            let dt = raw
+                .input_fact(ix)
+                .ok()
+                .and_then(|f| f.datum_type.concretize())
+                .unwrap_or(DatumType::I64);
+            input_plan.push((role, dt));
+        }
+        let mut model = raw;
+        for (ix, (_, dt)) in input_plan.iter().enumerate() {
+            model = model.with_input_fact(ix, InferenceFact::dt_shape(*dt, [1, MAX_SEQ_LENGTH]))?;
+        }
+        let model = model
+            .into_optimized()
+            .context("optimize cross-encoder")?
+            .into_runnable()
+            .context("make cross-encoder runnable")?;
+        Ok(Self {
+            model,
+            tokenizer,
+            input_plan,
+        })
+    }
+
+    /// Relevance score for a (query, passage) pair. Higher = more relevant.
+    pub fn score(&self, query: &str, passage: &str) -> Result<f32> {
+        let encoding = self
+            .tokenizer
+            .encode((query, passage), true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+        let inputs = build_bert_inputs(
+            &self.input_plan,
+            encoding.get_ids(),
+            encoding.get_type_ids(),
+        )?;
+        let outputs = self.model.run(inputs)?;
+        let view = outputs[0].to_array_view::<f32>()?;
+        // logits shape is [1, 1] (relevance) or [1, N]; take the first/primary.
+        view.iter()
+            .next()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("empty cross-encoder output"))
+    }
+
+    /// Rerank `(id, text)` candidates by cross-encoder score against `query`.
+    /// Returns ids sorted by descending relevance.
+    pub fn rerank(
+        &self,
+        query: &str,
+        candidates: &[(String, String)],
+    ) -> Result<Vec<(String, f32)>> {
+        let mut scored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
+        for (id, text) in candidates {
+            let s = self.score(query, text)?;
+            scored.push((id.clone(), s));
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Ok(scored)
     }
 }
 
@@ -334,5 +500,83 @@ mod tests {
         let hits = find_similar(&query, &candidates, 0.1, 2);
 
         assert_eq!(hits, vec![(1, 0.9), (3, 0.8)]);
+    }
+
+    fn related_beats_unrelated(model_dir: &Path) {
+        let e = Embedder::load_from_dir(model_dir).expect("load model");
+        let q = e.embed("how do I set the cargo build profile").unwrap();
+        let related = e.embed("The build uses the selfdev cargo profile").unwrap();
+        let unrelated = e.embed("Bees pollinate flowers in spring").unwrap();
+        let sim_rel = cosine_similarity(&q, &related);
+        let sim_unrel = cosine_similarity(&q, &unrelated);
+        assert!(
+            sim_rel > sim_unrel + 0.05,
+            "expected related ({sim_rel:.3}) >> unrelated ({sim_unrel:.3}) for {}",
+            model_dir.display()
+        );
+    }
+
+    /// Regression test for the input-binding fix: the real MiniLM model must
+    /// produce meaningfully higher similarity for related vs unrelated text.
+    /// Skipped automatically if the model isn't present locally.
+    #[test]
+    fn minilm_related_beats_unrelated_if_present() {
+        let dir = std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".jcode/models/all-MiniLM-L6-v2"))
+            .filter(|d| is_model_available(d));
+        match dir {
+            Some(d) => related_beats_unrelated(&d),
+            None => eprintln!("skip: MiniLM model not present locally"),
+        }
+    }
+
+    /// Exploratory check for an alternate model with a DIFFERENT input
+    /// order/dtype (e5-small-v2: attention_mask declared first). Reports the
+    /// related vs unrelated gap but does NOT hard-fail: some models need
+    /// model-specific pooling/normalization (e.g. CLS pooling) that the shared
+    /// mean-pool path does not yet provide. Skipped if not present locally.
+    #[test]
+    fn alt_model_related_beats_unrelated_if_present() {
+        let dir = std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("jcode-memory-bench/models/e5-small-v2"))
+            .filter(|d| is_model_available(d));
+        let Some(d) = dir else {
+            eprintln!("skip: e5-small-v2 model not present locally");
+            return;
+        };
+        let e = Embedder::load_from_dir(&d).expect("load model");
+        let q = e.embed("how do I set the cargo build profile").unwrap();
+        let related = e.embed("The build uses the selfdev cargo profile").unwrap();
+        let unrelated = e.embed("Bees pollinate flowers in spring").unwrap();
+        let sim_rel = cosine_similarity(&q, &related);
+        let sim_unrel = cosine_similarity(&q, &unrelated);
+        eprintln!(
+            "e5-small-v2: related={sim_rel:.4} unrelated={sim_unrel:.4} gap={:.4} (informational; mean-pool may need CLS for this family)",
+            sim_rel - sim_unrel
+        );
+    }
+
+    /// Cross-encoder reranker must score a relevant (query, passage) pair higher
+    /// than an irrelevant one. Skipped if the model isn't present locally.
+    #[test]
+    fn cross_encoder_scores_relevant_higher_if_present() {
+        let dir = std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("jcode-memory-bench/models/ce-minilm-l6"))
+            .filter(|d| d.join("model.onnx").exists() && d.join("tokenizer.json").exists());
+        let Some(d) = dir else {
+            eprintln!("skip: cross-encoder model not present locally");
+            return;
+        };
+        let ce = CrossEncoder::load_from_dir(&d).expect("load cross-encoder");
+        let q = "how do I set the cargo build profile";
+        let rel = ce
+            .score(q, "The build uses the selfdev cargo profile")
+            .unwrap();
+        let unrel = ce.score(q, "Bees pollinate flowers in spring").unwrap();
+        eprintln!("cross-encoder: relevant={rel:.3} irrelevant={unrel:.3}");
+        assert!(
+            rel > unrel,
+            "cross-encoder must score relevant ({rel:.3}) > irrelevant ({unrel:.3})"
+        );
     }
 }

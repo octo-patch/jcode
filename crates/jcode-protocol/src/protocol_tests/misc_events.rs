@@ -196,6 +196,82 @@ fn test_set_feature_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn test_set_route_deserializes_as_set_model_compat_alias() -> Result<()> {
+    // Legacy/desktop compatibility shape: a bare model string under the
+    // `set_route` tag. `decode_request` (not raw serde) normalizes it.
+    let decoded = decode_request(r#"{"type":"set_route","id":42,"model":"claude-opus-4-5"}"#)?;
+    let Request::SetModel { id, model } = decoded else {
+        return Err(anyhow!(
+            "expected set_route compatibility alias to decode as SetModel"
+        ));
+    };
+    assert_eq!(id, 42);
+    assert_eq!(model, "claude-opus-4-5");
+    Ok(())
+}
+
+#[test]
+fn test_structured_set_route_decodes_as_set_route_not_set_model() -> Result<()> {
+    // Regression for the "Invalid request: missing field `model`" bug seen when
+    // switching models via the picker: a structured `set_route` request (with a
+    // `selection` object, no `model` field) must decode as `Request::SetRoute`,
+    // not be shadowed by the legacy `set_model` compatibility path.
+    let request = Request::SetRoute {
+        id: 7,
+        selection: jcode_provider_core::RouteSelection {
+            model: "gpt-5.5".to_string(),
+            runtime_key: jcode_provider_core::RuntimeKey::OpenAIApiKey,
+            api_method: "openai-api".to_string(),
+            provider_label: "OpenAI".to_string(),
+            detail: String::new(),
+        },
+    };
+    let line = serde_json::to_string(&request)?;
+    assert!(line.contains("\"type\":\"set_route\""));
+
+    let decoded = decode_request(&line)?;
+    let Request::SetRoute { id, selection } = decoded else {
+        return Err(anyhow!(
+            "expected structured set_route to decode as SetRoute, got {decoded:?}"
+        ));
+    };
+    assert_eq!(id, 7);
+    assert_eq!(selection.model, "gpt-5.5");
+    Ok(())
+}
+
+#[test]
+fn test_jcode_subscription_set_route_is_wire_safe() -> Result<()> {
+    let request = Request::SetRoute {
+        id: 8,
+        selection: jcode_provider_core::RouteSelection {
+            model: "gpt-5.5".to_string(),
+            runtime_key: jcode_provider_core::RuntimeKey::JcodeSubscription,
+            api_method: "jcode-subscription".to_string(),
+            provider_label: "Jcode Subscription".to_string(),
+            detail: "jcode subscription routing · managed server-side".to_string(),
+        },
+    };
+
+    let line = serde_json::to_string(&request)?;
+    assert!(line.contains("\"type\":\"set_route\""));
+    assert!(line.contains("\"kind\":\"jcode-subscription\""));
+
+    let decoded = decode_request(&line)?;
+    let Request::SetRoute { id, selection } = decoded else {
+        return Err(anyhow!("expected Jcode SetRoute, got {decoded:?}"));
+    };
+    assert_eq!(id, 8);
+    assert_eq!(selection.model, "gpt-5.5");
+    assert_eq!(
+        selection.runtime_key,
+        jcode_provider_core::RuntimeKey::JcodeSubscription
+    );
+    assert_eq!(selection.routed_model_spec(), "gpt-5.5");
+    Ok(())
+}
+
+#[test]
 fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result<()> {
     let req = Request::Subscribe {
         id: 89,
@@ -205,6 +281,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         client_instance_id: Some("client-123".to_string()),
         client_has_local_history: true,
         allow_session_takeover: true,
+        terminal_env: vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())],
     };
     let json = serde_json::to_string(&req)?;
     assert!(json.contains("\"type\":\"subscribe\""));
@@ -217,6 +294,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         client_instance_id,
         client_has_local_history,
         allow_session_takeover,
+        terminal_env,
     } = decoded
     else {
         return Err(anyhow!("expected Subscribe"));
@@ -228,6 +306,10 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
     assert_eq!(client_instance_id.as_deref(), Some("client-123"));
     assert!(client_has_local_history);
     assert!(allow_session_takeover);
+    assert_eq!(
+        terminal_env,
+        vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())]
+    );
     Ok(())
 }
 
@@ -243,6 +325,7 @@ fn test_subscribe_request_defaults_optional_flags() -> Result<()> {
         client_instance_id,
         client_has_local_history,
         allow_session_takeover,
+        terminal_env,
     } = decoded
     else {
         return Err(anyhow!("expected Subscribe"));
@@ -254,6 +337,7 @@ fn test_subscribe_request_defaults_optional_flags() -> Result<()> {
     assert_eq!(client_instance_id, None);
     assert!(!client_has_local_history);
     assert!(!allow_session_takeover);
+    assert!(terminal_env.is_empty());
     Ok(())
 }
 
@@ -276,6 +360,49 @@ fn test_resume_session_defaults_sync_flags() -> Result<()> {
     assert_eq!(client_instance_id, None);
     assert!(!client_has_local_history);
     assert!(!allow_session_takeover);
+    Ok(())
+}
+
+#[test]
+fn test_resume_all_sessions_request_roundtrip() -> Result<()> {
+    let req = Request::ResumeAllSessions { id: 451 };
+    let json = serde_json::to_string(&req)?;
+    assert!(json.contains("\"type\":\"resume_all_sessions\""));
+    let decoded = parse_request_json(&json)?;
+    let Request::ResumeAllSessions { id } = decoded else {
+        return Err(anyhow!("expected ResumeAllSessions"));
+    };
+    assert_eq!(id, 451);
+    Ok(())
+}
+
+#[test]
+fn test_resume_all_result_event_roundtrip() -> Result<()> {
+    let event = ServerEvent::ResumeAllResult {
+        id: 451,
+        resumed: 2,
+        skipped: 1,
+        resumed_sessions: vec!["fox".to_string(), "owl".to_string()],
+        message: "Resuming 2 interrupted sessions: fox, owl.".to_string(),
+    };
+    let json = serde_json::to_string(&event)?;
+    assert!(json.contains("\"type\":\"resume_all_result\""));
+    let decoded = parse_event_json(&json)?;
+    let ServerEvent::ResumeAllResult {
+        id,
+        resumed,
+        skipped,
+        resumed_sessions,
+        message,
+    } = decoded
+    else {
+        return Err(anyhow!("expected ResumeAllResult"));
+    };
+    assert_eq!(id, 451);
+    assert_eq!(resumed, 2);
+    assert_eq!(skipped, 1);
+    assert_eq!(resumed_sessions, vec!["fox".to_string(), "owl".to_string()]);
+    assert_eq!(message, "Resuming 2 interrupted sessions: fox, owl.");
     Ok(())
 }
 
@@ -307,5 +434,66 @@ fn test_message_request_roundtrip_preserves_images_and_system_reminder() -> Resu
     assert_eq!(images[0].0, "image/png");
     assert_eq!(images[1].0, "image/jpeg");
     assert_eq!(system_reminder.as_deref(), Some("be concise"));
+    Ok(())
+}
+
+#[test]
+fn test_provider_guardrail_event_roundtrip() -> Result<()> {
+    let event = ServerEvent::ProviderGuardrail {
+        stop_reason: Some("refusal".to_string()),
+        message: "Provider guardrail stopped the response".to_string(),
+    };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"provider_guardrail\""));
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::ProviderGuardrail {
+        stop_reason,
+        message,
+    } = decoded
+    else {
+        return Err(anyhow!("expected ProviderGuardrail event"));
+    };
+    assert_eq!(stop_reason.as_deref(), Some("refusal"));
+    assert_eq!(message, "Provider guardrail stopped the response");
+
+    // stop_reason is optional on the wire.
+    let decoded = parse_event_json(
+        r#"{"type":"provider_guardrail","message":"blocked"}"#,
+    )?;
+    let ServerEvent::ProviderGuardrail { stop_reason, .. } = decoded else {
+        return Err(anyhow!("expected ProviderGuardrail event"));
+    };
+    assert!(stop_reason.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_message_end_carries_provider_stop_reason() -> Result<()> {
+    // `max_tokens` is the only signal that the output budget truncated a turn.
+    // Dropping it made a truncated benchmark run look like a clean one, so the
+    // reason must survive the wire round trip.
+    let event = ServerEvent::MessageEnd {
+        stop_reason: Some("max_tokens".to_string()),
+    };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"message_end\""));
+    assert!(json.contains("\"stop_reason\":\"max_tokens\""));
+
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::MessageEnd { stop_reason } = decoded else {
+        return Err(anyhow!("expected MessageEnd event"));
+    };
+    assert_eq!(stop_reason.as_deref(), Some("max_tokens"));
+
+    // Older producers omit the field entirely, which must still decode.
+    let decoded = parse_event_json(r#"{"type":"message_end"}"#)?;
+    let ServerEvent::MessageEnd { stop_reason } = decoded else {
+        return Err(anyhow!("expected MessageEnd event"));
+    };
+    assert!(stop_reason.is_none());
+
+    // A reasonless end-of-turn must not add noise to the wire.
+    let json = encode_event(&ServerEvent::MessageEnd { stop_reason: None });
+    assert!(!json.contains("stop_reason"), "unexpected field: {json}");
     Ok(())
 }

@@ -322,6 +322,7 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
                     swarm_enabled: false,
                     status: "ready".to_string(),
                     detail: None,
+                    task_label: None,
                     friendly_name: Some("trigger".to_string()),
                     report_back_to_session_id: None,
                     latest_completion_report: None,
@@ -329,6 +330,10 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
                     joined_at: now,
                     last_status_change: now,
                     is_headless: false,
+                    output_tail: None,
+                    todo_progress: None,
+                    todo_items: Vec::new(),
+                    runtime: crate::protocol::SwarmMemberRuntime::default(),
                 },
             ),
             (
@@ -342,6 +347,7 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
                     swarm_enabled: false,
                     status: "ready".to_string(),
                     detail: None,
+                    task_label: None,
                     friendly_name: Some("peer".to_string()),
                     report_back_to_session_id: None,
                     latest_completion_report: None,
@@ -349,6 +355,10 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
                     joined_at: now,
                     last_status_change: now,
                     is_headless: false,
+                    output_tail: None,
+                    todo_progress: None,
+                    todo_items: Vec::new(),
+                    runtime: crate::protocol::SwarmMemberRuntime::default(),
                 },
             ),
         ])));
@@ -381,7 +391,7 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
             Some("session_test_reload")
         );
         assert!(signal.prefer_selfdev_binary);
-        assert_eq!(signal.hash, jcode_build_meta::GIT_HASH);
+        assert_eq!(signal.hash, jcode_build_meta::git_hash());
 
         let state = crate::server::recent_reload_state(std::time::Duration::from_secs(5))
             .ok_or_else(|| anyhow!("reload state should exist"))?;

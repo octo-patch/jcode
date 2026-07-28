@@ -213,6 +213,15 @@ pub enum RemoteRead {
     Disconnected(RemoteDisconnectReason),
 }
 
+/// Classification of a single decoded protocol line read from the server
+/// stream. Used by [`RemoteConnection::next_event`] to keep the cancellation-
+/// safe read loop readable. The event is boxed because [`ServerEvent`] is large.
+enum LineOutcome {
+    Event(Box<ServerEvent>),
+    Skip,
+    Disconnect(RemoteDisconnectReason),
+}
+
 /// Information about the backend's provider
 #[derive(Debug, Clone)]
 pub struct BackendInfo {
@@ -231,13 +240,45 @@ pub struct RemoteConnection {
     client_instance_id: Option<String>,
     next_request_id: u64,
     tool_diff: RemoteDiffTracker,
-    line_buffer: String,
+    /// Bytes pulled from the socket that have not yet been split into complete
+    /// newline-delimited protocol lines. This buffer is persistent across
+    /// `next_event` calls so a future cancelled by a `tokio::select!` peer
+    /// branch never loses partially-read bytes.
+    read_buffer: Vec<u8>,
+    /// First byte in `read_buffer` that has not yet been checked for a newline.
+    ///
+    /// Large History events can be tens of megabytes and arrive over thousands
+    /// of socket reads. Searching from byte zero after every read makes framing
+    /// quadratic and eventually backpressures the server writer. Keeping this
+    /// cursor makes each received byte participate in at most one newline scan.
+    read_buffer_scan_start: usize,
+    #[cfg(test)]
+    protocol_bytes_scanned: usize,
     has_loaded_history: bool,
     call_output_tokens_seen: u64,
 }
 
 const DETACHED_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_STRAY_REMOTE_PROTOCOL_LINES: usize = 32;
+/// Hard cap for one newline-delimited server event. History events can be large
+/// because they may contain images, but an authenticated or compromised peer
+/// must not be able to grow the client process without bound.
+const MAX_REMOTE_PROTOCOL_FRAME_BYTES: usize = 256 * 1024 * 1024;
+/// Capacity above which the persistent `read_buffer` is considered oversized
+/// once its backlog drains. A single multi-megabyte protocol line (e.g. a
+/// `History` event with embedded images) would otherwise pin that capacity
+/// for the lifetime of the connection.
+const READ_BUFFER_SHRINK_THRESHOLD: usize = 256 * 1024;
+/// Capacity retained after shrinking an oversized `read_buffer`. Comfortably
+/// above typical streaming line sizes so steady-state traffic never causes
+/// grow/shrink thrash.
+const READ_BUFFER_RETAIN_CAPACITY: usize = 64 * 1024;
+
+fn remote_protocol_frame_exceeds_limit(buffered: usize, incoming: usize) -> bool {
+    buffered
+        .checked_add(incoming)
+        .is_none_or(|total| total > MAX_REMOTE_PROTOCOL_FRAME_BYTES)
+}
 
 pub(crate) trait RemoteEventState {
     fn handle_tool_start(&mut self, id: &str, name: &str);
@@ -262,7 +303,7 @@ pub(crate) struct ReplayRemoteState {
 impl RemoteConnection {
     /// Connect to the server
     pub async fn connect() -> Result<Self> {
-        Self::connect_with_session(None, None, false, false).await
+        Self::connect_with_session(None, None, false, false, None).await
     }
 
     /// Connect to the server and optionally resume a specific session.
@@ -274,6 +315,7 @@ impl RemoteConnection {
         client_instance_id: Option<&str>,
         client_has_local_history: bool,
         allow_session_takeover: bool,
+        remote_working_dir: Option<&str>,
     ) -> Result<Self> {
         let connect_start = Instant::now();
         let socket_connect_start = Instant::now();
@@ -289,14 +331,17 @@ impl RemoteConnection {
             client_instance_id: client_instance_id.map(str::to_string),
             next_request_id: 1,
             tool_diff: RemoteDiffTracker::default(),
-            line_buffer: String::new(),
+            read_buffer: Vec::new(),
+            read_buffer_scan_start: 0,
+            #[cfg(test)]
+            protocol_bytes_scanned: 0,
             has_loaded_history: false,
             call_output_tokens_seen: 0,
         };
 
         // Subscribe to events
         let subscribe_start = Instant::now();
-        let (working_dir, selfdev) = super::subscribe_metadata();
+        let (working_dir, selfdev) = super::subscribe_metadata(remote_working_dir);
         let resume_target = resume_session
             .filter(|session_id| crate::session::session_exists(session_id))
             .map(|session_id| session_id.to_string());
@@ -308,6 +353,7 @@ impl RemoteConnection {
             client_instance_id: conn.client_instance_id.clone(),
             client_has_local_history,
             allow_session_takeover,
+            terminal_env: crate::terminal_launch::snapshot_client_terminal_env(),
         })
         .await?;
         let subscribe_ms = subscribe_start.elapsed().as_millis();
@@ -375,6 +421,7 @@ impl RemoteConnection {
                 id,
                 content,
                 urgent,
+                ..
             } => Some(format!(
                 "{} urgent={} content_bytes={} content_chars={}",
                 base("soft_interrupt", *id),
@@ -529,6 +576,45 @@ impl RemoteConnection {
         };
         self.next_request_id += 1;
         self.send_request(request).await
+    }
+
+    /// Ask the server to continue every live session that was interrupted and
+    /// would auto-resume on a reload. Returns the request id so the client can
+    /// correlate the `ResumeAllResult` event.
+    pub async fn resume_all_sessions(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::ResumeAllSessions { id }).await?;
+        Ok(id)
+    }
+
+    /// Re-request the session history payload from the server.
+    ///
+    /// Used by the client-side history-recovery watchdog: if the bootstrap
+    /// `History` event never arrives after a (re)connect (e.g. it was dropped
+    /// during a reload handoff, or the server was momentarily busy), the client
+    /// would otherwise be stuck forever on "loading session…" with every prompt
+    /// gated behind `has_loaded_history()`. Sending a fresh `GetHistory` lets the
+    /// server resend the payload so the session can recover without a `/restart`.
+    pub async fn request_history(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::GetHistory { id }).await?;
+        Ok(id)
+    }
+
+    /// Ask the server for the fully route-expanded model catalog.
+    ///
+    /// The bootstrap `History` payload deliberately ships model *names* only
+    /// (route expansion is expensive), and live bus catalog pushes are
+    /// downgraded to names-only above a size cap. Without this request a client
+    /// whose persisted catalog cache is missing or stale has nothing but
+    /// placeholder "remote-catalog" rows in `/model`.
+    pub async fn request_model_catalog(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::GetModelCatalog { id }).await?;
+        Ok(id)
     }
 
     /// Resume a specific session by ID
@@ -788,11 +874,17 @@ impl RemoteConnection {
 
     /// Queue a soft interrupt message to be injected at the next safe point
     /// This doesn't cancel anything - the message is naturally incorporated
-    pub async fn soft_interrupt(&mut self, content: String, urgent: bool) -> Result<u64> {
+    pub async fn soft_interrupt(
+        &mut self,
+        content: String,
+        images: Vec<(String, String)>,
+        urgent: bool,
+    ) -> Result<u64> {
         let id = self.next_request_id;
         let request = Request::SoftInterrupt {
             id,
             content,
+            images,
             urgent,
         };
         self.next_request_id += 1;
@@ -853,6 +945,26 @@ impl RemoteConnection {
             id,
             provider: None,
             auth: None,
+            prefer_strongest: false,
+        })
+        .await
+    }
+
+    /// Notify the server about a typed auth lifecycle change and report
+    /// transport failure to the caller.
+    pub async fn notify_auth_changed_event(
+        &mut self,
+        provider: Option<&str>,
+        auth: Option<AuthChanged>,
+        prefer_strongest: bool,
+    ) -> Result<()> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::NotifyAuthChanged {
+            id,
+            provider: provider.map(str::to_string),
+            auth,
+            prefer_strongest,
         })
         .await
     }
@@ -864,7 +976,7 @@ impl RemoteConnection {
 
     /// Notify the server about a provider-specific auth change without blocking the caller.
     pub fn notify_auth_changed_for_provider_detached(&mut self, provider: Option<&str>) {
-        self.notify_auth_changed_detached_event(provider, None);
+        self.notify_auth_changed_detached_event(provider, None, false);
     }
 
     /// Notify the server about a typed auth lifecycle change without blocking the caller.
@@ -872,6 +984,7 @@ impl RemoteConnection {
         &mut self,
         provider: Option<&str>,
         auth: Option<AuthChanged>,
+        prefer_strongest: bool,
     ) {
         let id = self.next_request_id;
         self.next_request_id += 1;
@@ -880,6 +993,7 @@ impl RemoteConnection {
                 id,
                 provider: provider.map(str::to_string),
                 auth,
+                prefer_strongest,
             },
             "notify_auth_changed",
         );
@@ -914,58 +1028,39 @@ impl RemoteConnection {
     }
 
     /// Read the next event from the server.
+    ///
+    /// This is **cancellation safe** and may be used directly as a branch in a
+    /// `tokio::select!`. Every byte pulled from the socket is moved into the
+    /// persistent [`Self::read_buffer`] immediately, and the only `.await`
+    /// point is [`AsyncBufReadExt::fill_buf`], which tokio guarantees reads
+    /// nothing when its future is dropped. A previous implementation used
+    /// `BufReader::read_line`, which tokio documents as **not** cancellation
+    /// safe: when a large payload (e.g. a multi-megabyte `History` event for a
+    /// session with images) was mid-read and a sibling `select!` branch (a
+    /// redraw tick, terminal event, or bus event) completed first, the
+    /// `read_line` future was dropped and the bytes it had already consumed
+    /// from the socket were lost. That desynced the newline-framed protocol
+    /// stream: the next read began mid-payload, surfaced as "stray non-JSON
+    /// protocol line" warnings, the real `History` was discarded, and the
+    /// session stayed stuck on "loading session…" until a manual `/restart`.
     pub async fn next_event(&mut self) -> RemoteRead {
         let mut stray_lines = 0usize;
         loop {
-            self.line_buffer.clear();
-            match self.reader.read_line(&mut self.line_buffer).await {
-                Ok(0) => {
-                    crate::logging::warn(&format!(
-                        "RemoteConnection::next_event: peer closed (session_id={:?}, client_instance_id={:?})",
-                        self.session_id, self.client_instance_id
-                    ));
-                    return RemoteRead::Disconnected(RemoteDisconnectReason::PeerClosed);
+            // Serve any complete line already buffered before touching the
+            // socket. This drains backlog left by a previous (possibly
+            // cancelled) call before issuing a new read.
+            if let Some(line) = self.take_buffered_line() {
+                match self.classify_protocol_line(line, &mut stray_lines) {
+                    LineOutcome::Event(event) => return RemoteRead::Event(*event),
+                    LineOutcome::Skip => continue,
+                    LineOutcome::Disconnect(reason) => return RemoteRead::Disconnected(reason),
                 }
-                Ok(_) => {
-                    let trimmed = self.line_buffer.trim_start();
-                    if trimmed.trim().is_empty() {
-                        crate::logging::warn(&format!(
-                            "RemoteConnection::next_event: skipping blank line (session_id={:?}, client_instance_id={:?})",
-                            self.session_id, self.client_instance_id
-                        ));
-                        continue;
-                    }
-                    if !trimmed.starts_with('{') {
-                        stray_lines += 1;
-                        let preview: String = self.line_buffer.chars().take(240).collect();
-                        crate::logging::warn(&format!(
-                            "RemoteConnection::next_event: skipping stray non-JSON protocol line {}/{} preview={:?} (session_id={:?}, client_instance_id={:?})",
-                            stray_lines,
-                            MAX_STRAY_REMOTE_PROTOCOL_LINES,
-                            preview,
-                            self.session_id,
-                            self.client_instance_id
-                        ));
-                        if stray_lines >= MAX_STRAY_REMOTE_PROTOCOL_LINES {
-                            return RemoteRead::Disconnected(RemoteDisconnectReason::Protocol(
-                                "too many stray non-JSON protocol lines".to_string(),
-                            ));
-                        }
-                        continue;
-                    }
-                    match serde_json::from_str(&self.line_buffer) {
-                        Ok(event) => return RemoteRead::Event(event),
-                        Err(error) => {
-                            crate::logging::warn(&format!(
-                                "RemoteConnection::next_event: protocol error={} line={:?} (session_id={:?}, client_instance_id={:?})",
-                                error, self.line_buffer, self.session_id, self.client_instance_id
-                            ));
-                            return RemoteRead::Disconnected(RemoteDisconnectReason::Protocol(
-                                error.to_string(),
-                            ));
-                        }
-                    }
-                }
+            }
+
+            // No complete line yet: pull more bytes. `fill_buf` is cancel safe,
+            // so if a `select!` peer wins the race here nothing is read or lost.
+            let chunk = match self.reader.fill_buf().await {
+                Ok(buf) => buf,
                 Err(error) => {
                     crate::logging::warn(&format!(
                         "RemoteConnection::next_event: io error={} (session_id={:?}, client_instance_id={:?})",
@@ -973,6 +1068,166 @@ impl RemoteConnection {
                     ));
                     return RemoteRead::Disconnected(RemoteDisconnectReason::Io(error.to_string()));
                 }
+            };
+            if chunk.is_empty() {
+                // EOF. Surface any trailing partial line for diagnostics, then
+                // report a clean peer-closed disconnect.
+                if self.read_buffer.is_empty() {
+                    crate::logging::warn(&format!(
+                        "RemoteConnection::next_event: peer closed (session_id={:?}, client_instance_id={:?})",
+                        self.session_id, self.client_instance_id
+                    ));
+                } else {
+                    let preview: String = String::from_utf8_lossy(&self.read_buffer)
+                        .chars()
+                        .take(240)
+                        .collect();
+                    crate::logging::warn(&format!(
+                        "RemoteConnection::next_event: peer closed mid-line, discarding {} buffered bytes preview={:?} (session_id={:?}, client_instance_id={:?})",
+                        self.read_buffer.len(),
+                        preview,
+                        self.session_id,
+                        self.client_instance_id
+                    ));
+                    self.read_buffer.clear();
+                    self.read_buffer_scan_start = 0;
+                }
+                return RemoteRead::Disconnected(RemoteDisconnectReason::PeerClosed);
+            }
+            let len = chunk.len();
+            if remote_protocol_frame_exceeds_limit(self.read_buffer.len(), len) {
+                self.reader.consume(len);
+                self.read_buffer.clear();
+                self.read_buffer_scan_start = 0;
+                return RemoteRead::Disconnected(RemoteDisconnectReason::Protocol(format!(
+                    "remote protocol frame exceeded {} bytes",
+                    MAX_REMOTE_PROTOCOL_FRAME_BYTES
+                )));
+            }
+            self.read_buffer.extend_from_slice(chunk);
+            self.reader.consume(len);
+        }
+    }
+
+    /// Split off the next complete newline-delimited line (without the trailing
+    /// `\n`) from the persistent read buffer, leaving any partial remainder in
+    /// place for the next read.
+    fn take_buffered_line(&mut self) -> Option<Vec<u8>> {
+        // Only inspect bytes appended since the previous unsuccessful scan.
+        // Without this cursor, a 27 MB History line delivered in 8 KB chunks
+        // causes roughly 45 GB of redundant memory scanning.
+        let scan_start = self.read_buffer_scan_start.min(self.read_buffer.len());
+        let unscanned = &self.read_buffer[scan_start..];
+        let relative_newline = unscanned.iter().position(|&b| b == b'\n');
+        #[cfg(test)]
+        {
+            self.protocol_bytes_scanned += relative_newline.map_or(unscanned.len(), |i| i + 1);
+        }
+        let Some(relative_newline) = relative_newline else {
+            self.read_buffer_scan_start = self.read_buffer.len();
+            return None;
+        };
+        let newline = scan_start + relative_newline;
+        let mut line: Vec<u8> = self.read_buffer.drain(..=newline).collect();
+        line.pop(); // drop trailing '\n'
+        // `position` stopped at the first newline, so none of the remaining
+        // bytes have been inspected yet.
+        self.read_buffer_scan_start = 0;
+        // A single oversized line (e.g. a multi-megabyte `History` event)
+        // permanently grows this persistent buffer. Once the line has been
+        // split off, release the excess so each connection returns to a small
+        // steady-state footprint. The mostly-unused check (len < cap/4) plus
+        // the retain floor keep normal streaming from ever reallocating.
+        if self.read_buffer.capacity() > READ_BUFFER_SHRINK_THRESHOLD
+            && self.read_buffer.len() < self.read_buffer.capacity() / 4
+        {
+            self.read_buffer
+                .shrink_to(self.read_buffer.len().max(READ_BUFFER_RETAIN_CAPACITY));
+        }
+        Some(line)
+    }
+
+    /// Decide what a single decoded protocol line means: a real event, a line
+    /// to skip (blank/stray), or a fatal protocol/transport error.
+    fn classify_protocol_line(&self, line: Vec<u8>, stray_lines: &mut usize) -> LineOutcome {
+        let text = match String::from_utf8(line) {
+            Ok(text) => text,
+            Err(error) => {
+                *stray_lines += 1;
+                let preview: String = String::from_utf8_lossy(error.as_bytes())
+                    .chars()
+                    .take(240)
+                    .collect();
+                crate::logging::warn(&format!(
+                    "RemoteConnection::next_event: skipping stray non-UTF-8 protocol line {}/{} preview={:?} (session_id={:?}, client_instance_id={:?})",
+                    *stray_lines,
+                    MAX_STRAY_REMOTE_PROTOCOL_LINES,
+                    preview,
+                    self.session_id,
+                    self.client_instance_id
+                ));
+                if *stray_lines >= MAX_STRAY_REMOTE_PROTOCOL_LINES {
+                    return LineOutcome::Disconnect(RemoteDisconnectReason::Protocol(
+                        "too many stray non-JSON protocol lines".to_string(),
+                    ));
+                }
+                return LineOutcome::Skip;
+            }
+        };
+        let trimmed = text.trim_start();
+        if trimmed.trim().is_empty() {
+            crate::logging::warn(&format!(
+                "RemoteConnection::next_event: skipping blank line (session_id={:?}, client_instance_id={:?})",
+                self.session_id, self.client_instance_id
+            ));
+            return LineOutcome::Skip;
+        }
+        if !trimmed.starts_with('{') {
+            *stray_lines += 1;
+            let preview: String = text.chars().take(240).collect();
+            crate::logging::warn(&format!(
+                "RemoteConnection::next_event: skipping stray non-JSON protocol line {}/{} preview={:?} (session_id={:?}, client_instance_id={:?})",
+                *stray_lines,
+                MAX_STRAY_REMOTE_PROTOCOL_LINES,
+                preview,
+                self.session_id,
+                self.client_instance_id
+            ));
+            if *stray_lines >= MAX_STRAY_REMOTE_PROTOCOL_LINES {
+                return LineOutcome::Disconnect(RemoteDisconnectReason::Protocol(
+                    "too many stray non-JSON protocol lines".to_string(),
+                ));
+            }
+            return LineOutcome::Skip;
+        }
+        match serde_json::from_str(&text) {
+            Ok(event) => LineOutcome::Event(Box::new(event)),
+            Err(error) => {
+                // A single unparseable JSON line (e.g. the tail half of a frame
+                // split by a lost write, or an event variant this client build
+                // doesn't know) must not kill the whole session. Count it
+                // against the stray-line budget and resync on the next line;
+                // only give up if the stream keeps failing to parse (which
+                // indicates a real protocol/version mismatch). See issue #422:
+                // huge sessions used to die permanently on one corrupt frame.
+                *stray_lines += 1;
+                let preview: String = text.chars().take(240).collect();
+                crate::logging::warn(&format!(
+                    "RemoteConnection::next_event: skipping unparseable protocol line {}/{} error={} preview={:?} (session_id={:?}, client_instance_id={:?})",
+                    *stray_lines,
+                    MAX_STRAY_REMOTE_PROTOCOL_LINES,
+                    error,
+                    preview,
+                    self.session_id,
+                    self.client_instance_id
+                ));
+                if *stray_lines >= MAX_STRAY_REMOTE_PROTOCOL_LINES {
+                    return LineOutcome::Disconnect(RemoteDisconnectReason::Protocol(format!(
+                        "too many unparseable protocol lines; last error: {}",
+                        error
+                    )));
+                }
+                LineOutcome::Skip
             }
         }
     }
@@ -1001,7 +1256,10 @@ impl RemoteConnection {
             client_instance_id: None,
             next_request_id: 1,
             tool_diff: RemoteDiffTracker::default(),
-            line_buffer: String::new(),
+            read_buffer: Vec::new(),
+            read_buffer_scan_start: 0,
+            #[cfg(test)]
+            protocol_bytes_scanned: 0,
             has_loaded_history: false,
             call_output_tokens_seen: 0,
         }
@@ -1020,6 +1278,14 @@ impl RemoteConnection {
     /// Check if history has been loaded
     pub fn has_loaded_history(&self) -> bool {
         self.has_loaded_history
+    }
+
+    /// Whether the socket reader already holds part of an inbound protocol
+    /// frame. A history recovery request must not be sent in this state: the
+    /// original response is in flight, and another request only queues another
+    /// full copy behind it.
+    pub fn has_buffered_inbound_frame(&self) -> bool {
+        !self.read_buffer.is_empty()
     }
 
     /// Mark history as loaded
@@ -1204,6 +1470,7 @@ mod tests {
                 id: 1,
                 provider: Some(provider),
                 auth: None,
+                prefer_strongest: false,
             } if provider == "azure-openai"
         ));
     }
@@ -1232,6 +1499,71 @@ mod tests {
         }
     }
 
+    /// Regression for issue #422: a single corrupt frame (e.g. the tail half of
+    /// a split multi-megabyte event, or an event variant this client build does
+    /// not know) must not permanently kill the session. The client should skip
+    /// the bad line, resync on the next newline, and deliver the next valid
+    /// event.
+    #[tokio::test]
+    async fn next_event_skips_corrupt_json_frame_and_recovers() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (_reader, mut writer) = peer.into_split();
+
+        // Corrupt JSON that passes the '{' prefix check but fails to parse.
+        writer
+            .write_all(b"{\"type\":\"done\",\"id\":\n")
+            .await
+            .expect("corrupt frame should write");
+        // Valid JSON that is not a ServerEvent (unknown variant / wrong shape).
+        writer
+            .write_all(b"{\"type\":\"event_from_a_newer_server_version\"}\n")
+            .await
+            .expect("unknown-variant frame should write");
+        writer
+            .write_all(crate::protocol::encode_event(&ServerEvent::Done { id: 9 }).as_bytes())
+            .await
+            .expect("valid event should write");
+
+        match remote.next_event().await {
+            RemoteRead::Event(ServerEvent::Done { id }) => assert_eq!(id, 9),
+            other => panic!("expected Done event after corrupt frames, got {other:?}"),
+        }
+    }
+
+    /// A stream that keeps failing to parse (real protocol/version mismatch)
+    /// must still disconnect once the stray-line budget is exhausted, instead
+    /// of spinning forever.
+    #[tokio::test]
+    async fn next_event_disconnects_after_too_many_corrupt_json_frames() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (_reader, mut writer) = peer.into_split();
+
+        for _ in 0..MAX_STRAY_REMOTE_PROTOCOL_LINES {
+            writer
+                .write_all(b"{\"not\":\"a server event\"}\n")
+                .await
+                .expect("corrupt frame should write");
+        }
+
+        match remote.next_event().await {
+            RemoteRead::Disconnected(RemoteDisconnectReason::Protocol(message)) => {
+                assert!(
+                    message.contains("too many unparseable protocol lines"),
+                    "unexpected protocol disconnect message: {message}"
+                );
+            }
+            other => panic!("expected protocol disconnect after budget exhaustion, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn clear_sends_clear_request_to_remote_server() {
         let mut remote = RemoteConnection::dummy();
@@ -1255,5 +1587,234 @@ mod tests {
             serde_json::from_str::<Request>(&line).expect("clear request should deserialize"),
             Request::Clear { id: 1 }
         ));
+    }
+
+    /// Regression test for the "stuck on loading session…" bug.
+    ///
+    /// `next_event` runs as a branch in the client `tokio::select!`. If it were
+    /// not cancellation safe, a large `History` payload that is mid-read when a
+    /// peer branch (redraw tick, terminal event) wins the race would lose the
+    /// bytes already consumed from the socket and desync the protocol stream.
+    /// Here we cancel `next_event` repeatedly while a large event is still
+    /// streaming in, then confirm the event is delivered intact.
+    #[tokio::test]
+    async fn next_event_is_cancellation_safe_for_large_payloads() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (_reader, mut writer) = peer.into_split();
+
+        // A History-sized payload: a single string field large enough to span
+        // many socket reads, mimicking the multi-megabyte base64 image data
+        // carried by a real `History` event for an image-bearing session.
+        let big_text = "x".repeat(2 * 1024 * 1024);
+        let event = ServerEvent::StatusDetail {
+            detail: big_text.clone(),
+        };
+        let encoded = crate::protocol::encode_event(&event);
+        let encoded_len = encoded.len();
+
+        // Feed the encoded event in small chunks from a background task, so the
+        // reader sees a partially-available line for most of the test.
+        let writer_task = tokio::spawn(async move {
+            for chunk in encoded.as_bytes().chunks(4096) {
+                writer
+                    .write_all(chunk)
+                    .await
+                    .expect("chunk should write to peer");
+                // Yield so the reader gets a chance to observe a partial line.
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Repeatedly start and immediately cancel `next_event` (the `select!`
+        // peer "wins" via a zero-delay timeout) until the full line arrives.
+        let event = loop {
+            tokio::select! {
+                biased;
+                read = remote.next_event() => break read,
+                _ = tokio::time::sleep(Duration::from_micros(50)) => {
+                    // Cancellation point: the in-flight `next_event` future is
+                    // dropped here. A cancellation-unsafe reader would lose
+                    // buffered bytes and never reassemble the event.
+                }
+            }
+        };
+
+        writer_task.await.expect("writer task should finish");
+
+        match event {
+            RemoteRead::Event(ServerEvent::StatusDetail { detail }) => {
+                assert_eq!(
+                    detail.len(),
+                    big_text.len(),
+                    "large payload must survive repeated cancellations intact"
+                );
+                assert!(detail.bytes().all(|b| b == b'x'));
+            }
+            other => panic!("expected intact event after cancellations, got {other:?}"),
+        }
+        assert_eq!(
+            remote.protocol_bytes_scanned, encoded_len,
+            "fragmented frame assembly must inspect each protocol byte exactly once"
+        );
+    }
+
+    /// A single logical event split across multiple socket writes (no trailing
+    /// newline until the end) must be reassembled into one event.
+    #[tokio::test]
+    async fn next_event_reassembles_event_split_across_reads() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (_reader, mut writer) = peer.into_split();
+
+        let encoded = crate::protocol::encode_event(&ServerEvent::Done { id: 9 });
+        let bytes = encoded.as_bytes();
+        let mid = bytes.len() / 2;
+        writer
+            .write_all(&bytes[..mid])
+            .await
+            .expect("first half should write");
+        // Give the reader a chance to observe the partial line.
+        tokio::task::yield_now().await;
+        writer
+            .write_all(&bytes[mid..])
+            .await
+            .expect("second half should write");
+
+        match remote.next_event().await {
+            RemoteRead::Event(ServerEvent::Done { id }) => assert_eq!(id, 9),
+            other => panic!("expected reassembled Done event, got {other:?}"),
+        }
+    }
+
+    /// Two events delivered back-to-back in a single socket write must both be
+    /// returned, with the second served from the buffer without another read.
+    #[tokio::test]
+    async fn next_event_serves_multiple_buffered_events() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (_reader, mut writer) = peer.into_split();
+
+        let mut payload = crate::protocol::encode_event(&ServerEvent::Done { id: 1 });
+        payload.push_str(&crate::protocol::encode_event(&ServerEvent::Done { id: 2 }));
+        writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("both events should write in one chunk");
+        drop(writer);
+
+        match remote.next_event().await {
+            RemoteRead::Event(ServerEvent::Done { id }) => assert_eq!(id, 1),
+            other => panic!("expected first Done event, got {other:?}"),
+        }
+        match remote.next_event().await {
+            RemoteRead::Event(ServerEvent::Done { id }) => assert_eq!(id, 2),
+            other => panic!("expected second Done event, got {other:?}"),
+        }
+    }
+
+    /// A single multi-megabyte protocol line (e.g. a `History` event with
+    /// embedded images) must not pin its full capacity inside the persistent
+    /// `read_buffer` for the rest of the connection. Once the line drains, the
+    /// buffer shrinks back to a bounded size, preserving any partial remainder.
+    #[tokio::test]
+    async fn take_buffered_line_shrinks_oversized_read_buffer() {
+        let mut remote = RemoteConnection::dummy();
+        let large_len = 4 * 1024 * 1024;
+        remote.read_buffer.resize(large_len, b'x');
+        remote.read_buffer.push(b'\n');
+        // Trailing partial fragment of the next line must survive the shrink.
+        remote.read_buffer.extend_from_slice(b"{\"partial");
+        assert!(remote.read_buffer.capacity() > READ_BUFFER_SHRINK_THRESHOLD);
+
+        let line = remote
+            .take_buffered_line()
+            .expect("large buffered line should be returned");
+        assert_eq!(line.len(), large_len);
+        assert_eq!(remote.read_buffer, b"{\"partial");
+        assert!(
+            remote.read_buffer.capacity() <= READ_BUFFER_RETAIN_CAPACITY,
+            "read_buffer should shrink after a large line drains, capacity={}",
+            remote.read_buffer.capacity()
+        );
+    }
+
+    /// Steady-state streaming buffers (small capacity) must never shrink, so
+    /// normal traffic does not thrash between grow and shrink reallocations.
+    #[tokio::test]
+    async fn take_buffered_line_keeps_capacity_for_small_buffers() {
+        let mut remote = RemoteConnection::dummy();
+        remote.read_buffer.reserve(32 * 1024);
+        let capacity = remote.read_buffer.capacity();
+        remote.read_buffer.extend_from_slice(b"hello\n");
+
+        let line = remote
+            .take_buffered_line()
+            .expect("buffered line should be returned");
+        assert_eq!(line, b"hello");
+        assert_eq!(
+            remote.read_buffer.capacity(),
+            capacity,
+            "small read_buffer must retain its capacity"
+        );
+    }
+
+    /// While a large backlog is still buffered (buffer mostly full), capacity
+    /// is retained so draining the remaining lines does not reallocate. Only
+    /// once the backlog empties out does the buffer shrink.
+    #[tokio::test]
+    async fn take_buffered_line_keeps_capacity_while_backlog_remains() {
+        let mut remote = RemoteConnection::dummy();
+        let line_len = 1024 * 1024;
+        for _ in 0..3 {
+            let start = remote.read_buffer.len();
+            remote.read_buffer.resize(start + line_len, b'y');
+            remote.read_buffer.push(b'\n');
+        }
+        let capacity = remote.read_buffer.capacity();
+
+        let first = remote
+            .take_buffered_line()
+            .expect("first buffered line should be returned");
+        assert_eq!(first.len(), line_len);
+        assert_eq!(
+            remote.read_buffer.capacity(),
+            capacity,
+            "capacity must be retained while a large backlog remains buffered"
+        );
+
+        remote
+            .take_buffered_line()
+            .expect("second buffered line should be returned");
+        remote
+            .take_buffered_line()
+            .expect("third buffered line should be returned");
+        assert!(
+            remote.read_buffer.capacity() <= READ_BUFFER_RETAIN_CAPACITY,
+            "read_buffer should shrink once the backlog drains, capacity={}",
+            remote.read_buffer.capacity()
+        );
+    }
+
+    #[test]
+    fn remote_protocol_frame_limit_rejects_oversize_and_overflow() {
+        assert!(!remote_protocol_frame_exceeds_limit(
+            MAX_REMOTE_PROTOCOL_FRAME_BYTES - 1,
+            1,
+        ));
+        assert!(remote_protocol_frame_exceeds_limit(
+            MAX_REMOTE_PROTOCOL_FRAME_BYTES,
+            1,
+        ));
+        assert!(remote_protocol_frame_exceeds_limit(usize::MAX, 1));
     }
 }

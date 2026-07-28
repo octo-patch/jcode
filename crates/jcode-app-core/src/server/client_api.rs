@@ -73,15 +73,20 @@ impl Client {
     ) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
+        let working_dir = match working_dir {
+            Some(working_dir) => working_dir,
+            None => std::env::current_dir()?.to_string_lossy().into_owned(),
+        };
 
         let request = Request::Subscribe {
             id,
-            working_dir,
+            working_dir: Some(working_dir),
             selfdev,
             target_session_id,
             client_instance_id: None,
             client_has_local_history,
             allow_session_takeover,
+            terminal_env: crate::terminal_launch::snapshot_client_terminal_env(),
         };
         let json = serde_json::to_string(&request)? + "\n";
         self.writer.write_all(json.as_bytes()).await?;
@@ -226,6 +231,19 @@ impl Client {
         Ok(id)
     }
 
+    /// Ask the server to continue every live session that was interrupted and
+    /// would auto-resume on a reload. Returns the request id so callers can
+    /// correlate the `ResumeAllResult` event.
+    pub async fn resume_all_sessions(&mut self) -> Result<u64> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let request = Request::ResumeAllSessions { id };
+        let json = serde_json::to_string(&request)? + "\n";
+        self.writer.write_all(json.as_bytes()).await?;
+        Ok(id)
+    }
+
     pub async fn send_transcript(
         &mut self,
         text: &str,
@@ -300,6 +318,7 @@ impl Client {
             id,
             provider: provider.map(str::to_string),
             auth: None,
+            prefer_strongest: false,
         };
         let json = serde_json::to_string(&request)? + "\n";
         self.writer.write_all(json.as_bytes()).await?;

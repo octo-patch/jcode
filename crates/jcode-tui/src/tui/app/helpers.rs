@@ -1,5 +1,7 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
+pub(crate) mod model_names;
+
 use crate::todo::TodoItem;
 use crate::tui::info_widget::{AmbientWidgetData, GitInfo, MemoryInfo};
 use crate::tui::session_picker::ResumeTarget;
@@ -11,6 +13,130 @@ use std::time::Duration;
 type AmbientInfoCacheEntry = (std::time::Instant, bool, Option<AmbientWidgetData>, bool);
 
 static AMBIENT_INFO_CACHE: Mutex<Option<AmbientInfoCacheEntry>> = Mutex::new(None);
+
+/// Stale-while-revalidate cache for the git status widget. Module-level so the
+/// app can force a refresh the moment it mutates the repo (commit, shell, file
+/// edits) instead of waiting out the TTL with a stale branch/dirty count.
+type GitInfoCacheEntry = (std::time::Instant, Option<GitInfo>, bool);
+static GIT_INFO_CACHE: Mutex<Option<GitInfoCacheEntry>> = Mutex::new(None);
+
+/// Stale-while-revalidate cache for per-session todos plus their goal-level
+/// assessments (hill-climbability etc.). Module-level so the app can force a
+/// refresh the moment it persists a todo write locally, instead of showing
+/// the previous list until the TTL lapses.
+type TodosCacheEntry = (
+    std::time::Instant,
+    Vec<TodoItem>,
+    Vec<crate::todo::TodoGoal>,
+    bool,
+);
+type TodosCache = std::collections::HashMap<String, TodosCacheEntry>;
+static TODOS_CACHE: std::sync::LazyLock<Mutex<TodosCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Backdate `Instant::now()` by up to `amount`, saturating instead of
+/// panicking when the clock's epoch is too recent.
+///
+/// `Instant` counts from boot on Windows (QPC) and Linux (CLOCK_MONOTONIC), so
+/// `Instant::now() - one_hour` panics with "overflow when subtracting duration
+/// from instant" when the machine booted more recently than that. This hit
+/// real users right after a reboot: the git cache invalidation below runs
+/// after every bash/edit tool, crashing the whole TUI (issue #424).
+pub(crate) fn backdated_now(amount: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let mut backdate = amount;
+    loop {
+        if let Some(instant) = now.checked_sub(backdate) {
+            return instant;
+        }
+        if backdate < Duration::from_millis(1) {
+            return now;
+        }
+        backdate /= 2;
+    }
+}
+
+/// Force the git-status widget cache to refetch on its next read.
+///
+/// Call this right after the app changes the working tree or HEAD (commits,
+/// shell commands, file edits) so the info widget reflects the new repo state
+/// immediately rather than after the 5s TTL. Stale-while-revalidate still
+/// applies: the next read returns the last value and kicks a background refresh.
+pub(crate) fn invalidate_git_info_cache() {
+    if let Ok(mut guard) = GIT_INFO_CACHE.lock()
+        && let Some((ts, _cached, refreshing)) = guard.as_mut()
+    {
+        // Backdate the timestamp past the TTL so the next `gather_git_info`
+        // treats the entry as expired and spawns a refresh, while still
+        // returning the last-known value (no flicker to empty).
+        *ts = backdated_now(Duration::from_secs(3600));
+        *refreshing = false;
+    }
+}
+
+/// Force the todos widget cache to refetch the given session on its next read.
+///
+/// Call this right after the app persists a local todo write so the info widget
+/// reflects the new list immediately rather than after the 1s TTL.
+pub(crate) fn invalidate_todos_cache(session_id: &str) {
+    if let Ok(mut cache) = TODOS_CACHE.lock()
+        && let Some((ts, _todos, _goals, refreshing)) = cache.get_mut(session_id)
+    {
+        *ts = backdated_now(Duration::from_secs(3600));
+        *refreshing = false;
+    }
+}
+
+/// Force the ambient widget cache to refetch on its next read.
+///
+/// Call this after the app changes ambient state (e.g. the `schedule` tool
+/// queues or cancels a task) so the ambient panel reflects the new queue/next
+/// wake immediately rather than after the 2s TTL.
+pub(crate) fn invalidate_ambient_info_cache() {
+    if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock()
+        && let Some((ts, _enabled, _cached, refreshing)) = guard.as_mut()
+    {
+        *ts = backdated_now(Duration::from_secs(3600));
+        *refreshing = false;
+    }
+}
+
+/// Open a file/URL with the system opener, unless suppressed.
+///
+/// Every TUI-initiated `open::that_detached` must go through here: it honors
+/// NO_BROWSER/JCODE_NO_BROWSER and refuses to open anything from test binaries
+/// (`browser_suppressed` detects the test harness), so `cargo test` runs never
+/// pop browser windows, image viewers, or OAuth pages on the developer's
+/// desktop.
+pub(crate) fn open_path_or_url_detached(
+    target: impl AsRef<std::ffi::OsStr>,
+) -> std::io::Result<()> {
+    if crate::auth::browser_suppressed(false) {
+        return Err(std::io::Error::other(
+            "opening files/URLs is suppressed (NO_BROWSER/JCODE_NO_BROWSER or test harness)",
+        ));
+    }
+    open::that_detached(target)
+}
+
+/// Test-only: snapshot `(elapsed_secs, refreshing)` for a session's todos cache
+/// entry, or `None` when no entry exists yet. Lets tests assert that
+/// invalidation backdates the entry so the next gather treats it as expired.
+#[cfg(test)]
+pub(crate) fn todos_cache_entry_age_for_tests(session_id: &str) -> Option<(u64, bool)> {
+    let cache = TODOS_CACHE.lock().ok()?;
+    cache
+        .get(session_id)
+        .map(|(ts, _todos, _goals, refreshing)| (ts.elapsed().as_secs(), *refreshing))
+}
+
+/// Test-only: clear the entire todos cache so tests start from a known state.
+#[cfg(test)]
+pub(crate) fn clear_todos_cache_for_tests() {
+    if let Ok(mut cache) = TODOS_CACHE.lock() {
+        cache.clear();
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct CachedContextSnapshot {
@@ -105,62 +231,9 @@ pub(super) fn debug_response_path() -> PathBuf {
     std::env::temp_dir().join("jcode_debug_response")
 }
 
-/// Parse rate limit reset time from error message
-/// Returns the Duration until rate limit resets, if this is a rate limit error
-pub(super) fn parse_rate_limit_error(error: &str) -> Option<Duration> {
-    let error_lower = error.to_lowercase();
-
-    if !error_lower.contains("rate limit")
-        && !error_lower.contains("rate_limit")
-        && !error_lower.contains("429")
-        && !error_lower.contains("too many requests")
-        && !error_lower.contains("hit your limit")
-    {
-        return None;
-    }
-
-    if let Some(idx) = error_lower.find("retry") {
-        let after = &error_lower[idx..];
-        for word in after.split_whitespace() {
-            if let Ok(secs) = word
-                .trim_matches(|c: char| !c.is_ascii_digit())
-                .parse::<u64>()
-                && secs > 0
-                && secs < 86400
-            {
-                return Some(Duration::from_secs(secs));
-            }
-        }
-    }
-
-    if let Some(idx) = error_lower.find("resets") {
-        let after = &error_lower[idx..];
-        for word in after.split_whitespace() {
-            let word = word.trim_matches(|c: char| c == '·' || c == ' ');
-            if (word.ends_with("am") || word.ends_with("pm"))
-                && let Some(duration) = parse_clock_time_to_duration(word)
-            {
-                return Some(duration);
-            }
-        }
-    }
-
-    if let Some(idx) = error_lower.find("reset") {
-        let after = &error_lower[idx..];
-        for word in after.split_whitespace() {
-            if let Ok(secs) = word
-                .trim_matches(|c: char| !c.is_ascii_digit())
-                .parse::<u64>()
-                && secs > 0
-                && secs < 86400
-            {
-                return Some(Duration::from_secs(secs));
-            }
-        }
-    }
-
-    None
-}
+#[path = "helpers_rate_limit_parse.rs"]
+mod rate_limit_parse;
+pub(super) use rate_limit_parse::parse_rate_limit_error;
 
 pub(super) fn is_context_limit_error(error: &str) -> bool {
     if crate::provider::openai_request::is_openai_encrypted_content_too_large_error(error) {
@@ -179,6 +252,14 @@ pub(super) fn is_context_limit_error(error: &str) -> bool {
         || lower.contains("length limit")
         || lower.contains("maximum tokens")
         || (lower.contains("exceeded") && lower.contains("tokens"))
+}
+
+/// Whether `error` is a provider HTTP 413 "request too large" / payload-size
+/// rejection. This is distinct from a token-context overflow: it is driven by
+/// the serialized request body size (dominated by inline base64 images), so it
+/// is recovered by stripping oversized images rather than by token compaction.
+pub(super) fn is_request_payload_too_large_error(error: &str) -> bool {
+    crate::compaction::is_request_payload_too_large_error(error)
 }
 
 /// Parse a clock time like "5am" or "12:30pm" and return duration until that time
@@ -248,31 +329,163 @@ pub(super) fn format_tokens(tokens: u64) -> String {
     }
 }
 
-/// Copy text to clipboard, trying wl-copy first (Wayland), then arboard as fallback.
-pub(super) fn copy_to_clipboard(text: &str) -> bool {
-    if let Ok(mut child) = std::process::Command::new("wl-copy")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        use std::io::Write;
-        if let Some(stdin) = child.stdin.as_mut()
-            && stdin.write_all(text.as_bytes()).is_ok()
-        {
-            drop(child.stdin.take());
-            return child.wait().map(|s| s.success()).unwrap_or(false);
-        }
+/// Test-only clipboard sink.
+///
+/// A headless CI runner has no Wayland socket, no X11 display, and a
+/// non-terminal stdout, so every real clipboard path correctly fails and
+/// `copy_to_clipboard` returns false. Tests that only care about shortcut
+/// wiring (does Alt+S reach the copy handler with the right text?) then fail
+/// for an environment reason rather than a code reason. Capturing into this
+/// sink lets those tests assert the wiring *and* the copied text without
+/// depending on a desktop session (refs #596).
+#[cfg(test)]
+static TEST_CLIPBOARD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Test-only: route clipboard writes into an in-process sink instead of the OS.
+#[cfg(test)]
+pub(crate) fn capture_clipboard_for_tests() {
+    if let Ok(mut sink) = TEST_CLIPBOARD.lock() {
+        *sink = Some(String::new());
     }
-    arboard::Clipboard::new()
-        .and_then(|mut cb| cb.set_text(text.to_string()))
-        .is_ok()
+}
+
+/// Test-only: the last text written while capture was enabled.
+#[cfg(test)]
+pub(crate) fn captured_clipboard_for_tests() -> Option<String> {
+    TEST_CLIPBOARD.lock().ok().and_then(|sink| sink.clone())
+}
+
+/// Test-only: stop capturing and drop any captured text.
+#[cfg(test)]
+pub(crate) fn stop_capturing_clipboard_for_tests() {
+    if let Ok(mut sink) = TEST_CLIPBOARD.lock() {
+        *sink = None;
+    }
+}
+
+/// Copy text to clipboard. On Windows and macOS, the native clipboard API
+/// (arboard) is authoritative, with OSC 52 as a remote-session fallback.
+/// Elsewhere, try wl-copy first (Wayland), then OSC 52 (works over SSH /
+/// Docker / tmux), then arboard as a final fallback.
+pub(super) fn copy_to_clipboard(text: &str) -> bool {
+    // Tests that opted into capture never touch the real clipboard, so they
+    // behave identically on a desktop and on a headless runner.
+    #[cfg(test)]
+    if let Ok(mut sink) = TEST_CLIPBOARD.lock()
+        && let Some(captured) = sink.as_mut()
+    {
+        captured.clear();
+        captured.push_str(text);
+        return true;
+    }
+
+    // On Windows, the native clipboard API must run before OSC 52. Writing an
+    // OSC 52 sequence to stdout "succeeds" even when the console (conhost,
+    // older Windows Terminal) silently ignores it, which reported "Copied"
+    // while leaving the clipboard empty (issue #497). arboard talks to the
+    // Win32 clipboard directly and is authoritative there.
+    #[cfg(windows)]
+    {
+        if arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text.to_string()))
+            .is_ok()
+        {
+            return true;
+        }
+        return copy_to_clipboard_osc52(text);
+    }
+
+    // Same class of bug on macOS: Apple Terminal (Terminal.app) silently
+    // ignores OSC 52, yet writing the sequence to stdout "succeeds", so we
+    // reported "Copied" while leaving the clipboard untouched. NSPasteboard
+    // via arboard (with pbcopy as a belt-and-braces fallback) is authoritative
+    // for local sessions; OSC 52 remains as the final remote-session fallback.
+    #[cfg(target_os = "macos")]
+    {
+        if arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text.to_string()))
+            .is_ok()
+        {
+            return true;
+        }
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut()
+                && stdin.write_all(text.as_bytes()).is_ok()
+            {
+                drop(child.stdin.take());
+                if child.wait().map(|s| s.success()).unwrap_or(false) {
+                    return true;
+                }
+            }
+        }
+        return copy_to_clipboard_osc52(text);
+    }
+
+    // Linux has the same failure class (issue #504, Kali/X11): wl-copy fails
+    // outside Wayland, and many terminals (xterm, older VTE) silently ignore
+    // OSC 52 while the stdout write still "succeeds", so the arboard fallback
+    // never ran. Prefer native clipboards when a display is available: wl-copy
+    // (Wayland), then arboard (X11), and only then OSC 52 for genuinely
+    // headless/remote sessions (SSH, Docker, tmux) where both native paths
+    // fail fast for lack of a display server.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        if let Ok(mut child) = std::process::Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut()
+                && stdin.write_all(text.as_bytes()).is_ok()
+            {
+                drop(child.stdin.take());
+                if child.wait().map(|s| s.success()).unwrap_or(false) {
+                    return true;
+                }
+            }
+        }
+        if arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text.to_string()))
+            .is_ok()
+        {
+            return true;
+        }
+        copy_to_clipboard_osc52(text)
+    }
+}
+
+/// Copy to clipboard using the OSC 52 terminal escape sequence. This asks the
+/// terminal emulator to set the system clipboard without needing a local
+/// display server, making it work over SSH, inside Docker, and under tmux
+/// (with `set -g set-clipboard on`). Returns false if stdout is not a TTY.
+fn copy_to_clipboard_osc52(text: &str) -> bool {
+    use base64::Engine as _;
+    use std::io::{IsTerminal, Write};
+
+    let mut out = std::io::stdout();
+    if !out.is_terminal() {
+        return false;
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    // OSC 52: ESC ] 52 ; c ; <base64> BEL
+    let seq = format!("\x1b]52;c;{}\x07", encoded);
+    out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok()
 }
 
 pub(super) fn effort_display_label(effort: &str) -> &str {
     match effort {
+        "swarm" => "Swarm (light fan-out) [Beta]",
+        "swarm-deep" => "Swarm Deep (Max + task graph) [Beta]",
         "max" => "Max",
-        "xhigh" => "Max",
+        "xhigh" => "xHigh",
         "high" => "High",
         "medium" => "Medium",
         "low" => "Low",
@@ -281,140 +494,11 @@ pub(super) fn effort_display_label(effort: &str) -> &str {
     }
 }
 
-/// Turn a raw model id into a friendlier display name for onboarding copy.
-///
-/// Examples:
-///   `gpt-5.5`            -> `GPT-5.5`
-///   `claude-opus-4-8`    -> `Claude Opus 4.8`
-///   `claude-opus-4-8[1m]`-> `Claude Opus 4.8 (1M)`
-///   `gemini-2.5-pro`     -> `Gemini 2.5 Pro`
-/// Unknown shapes are returned mostly as-is so we never hide the real id.
-pub(super) fn pretty_model_display_name(model: &str) -> String {
-    let model = model.trim();
-    if model.is_empty() {
-        return "your default model".to_string();
-    }
-
-    // Preserve and re-attach a `[1m]` long-context suffix as " (1M)".
-    let (core, long_context) = match model.strip_suffix("[1m]") {
-        Some(stripped) => (stripped, true),
-        None => (model, false),
-    };
-
-    let lower = core.to_ascii_lowercase();
-    let mut pretty = if let Some(rest) = lower.strip_prefix("gpt-") {
-        // OpenAI: keep the dotted version, just upcase the family.
-        format!("GPT-{}", rest)
-    } else if lower.starts_with("claude-") {
-        // Anthropic: claude-opus-4-8 -> Claude Opus 4.8. Convert the trailing
-        // `-<major>-<minor>` version into `<major>.<minor>` and title-case the
-        // family/tier words.
-        prettify_claude(core)
-    } else if lower.starts_with("gemini-") {
-        title_case_dashed(core)
-    } else {
-        title_case_dashed(core)
-    };
-
-    if long_context {
-        pretty.push_str(" (1M)");
-    }
-    pretty
-}
-
-/// Render `claude-opus-4-8` as `Claude Opus 4.8`.
-fn prettify_claude(core: &str) -> String {
-    let parts: Vec<&str> = core.split('-').collect();
-    let mut words: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < parts.len() {
-        let part = parts[i];
-        // Collapse a `<major>-<minor>` numeric pair into `<major>.<minor>`.
-        if part.chars().all(|c| c.is_ascii_digit())
-            && i + 1 < parts.len()
-            && parts[i + 1].chars().all(|c| c.is_ascii_digit())
-        {
-            words.push(format!("{}.{}", part, parts[i + 1]));
-            i += 2;
-            continue;
-        }
-        words.push(title_case_word(part));
-        i += 1;
-    }
-    words.join(" ")
-}
-
-/// Title-case a dash-separated id (`gemini-2.5-pro` -> `Gemini 2.5 Pro`).
-fn title_case_dashed(core: &str) -> String {
-    core.split('-')
-        .map(title_case_word)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Title-case a single token, leaving anything containing a digit untouched so
-/// version fragments like `4.8` or `2.5` are preserved.
-fn title_case_word(word: &str) -> String {
-    if word.is_empty() {
-        return String::new();
-    }
-    if word.chars().any(|c| c.is_ascii_digit()) {
-        return word.to_string();
-    }
-    let mut chars = word.chars();
-    let first = chars.next().unwrap().to_ascii_uppercase();
-    format!("{}{}", first, chars.as_str())
-}
-
 pub(super) fn inferred_reasoning_efforts(
     provider_name: Option<&str>,
     model_name: Option<&str>,
 ) -> Vec<&'static str> {
-    let provider = provider_name.unwrap_or_default().to_ascii_lowercase();
-    let model = model_name.unwrap_or_default().to_ascii_lowercase();
-
-    if provider.contains("openrouter") {
-        return vec!["none", "low", "medium", "high", "xhigh"];
-    }
-
-    let is_anthropic = provider.contains("anthropic")
-        || provider.contains("claude")
-        || model.starts_with("claude-");
-    if is_anthropic {
-        let supports_effort = model.contains("claude-mythos")
-            || model.contains("claude-opus-4-8")
-            || model.contains("claude-opus-4-7")
-            || model.contains("claude-opus-4-6")
-            || model.contains("claude-sonnet-4-6")
-            || model.contains("claude-opus-4-5")
-            || model.contains("claude-3-7-sonnet")
-            || model.contains("claude-sonnet-3-7");
-        if !supports_effort {
-            return Vec::new();
-        }
-        if model.contains("claude-opus-4-8") || model.contains("claude-opus-4-7") {
-            return vec!["none", "low", "medium", "high", "xhigh"];
-        }
-        return vec!["none", "low", "medium", "high"];
-    }
-
-    let is_deepseek = provider.contains("deepseek") || model.contains("deepseek");
-    if is_deepseek {
-        return vec!["none", "low", "medium", "high", "max"];
-    }
-
-    let is_openai = provider.contains("openai")
-        || provider.contains("codex")
-        || model.starts_with("gpt-")
-        || model.starts_with("o1")
-        || model.starts_with("o3")
-        || model.starts_with("o4")
-        || model.starts_with("o5");
-    if is_openai {
-        return vec!["none", "low", "medium", "high", "xhigh"];
-    }
-
-    Vec::new()
+    jcode_provider_core::inferred_reasoning_efforts(provider_name, model_name)
 }
 
 pub(super) fn effort_bar(index: usize, total: usize) -> String {
@@ -431,8 +515,11 @@ pub(super) fn effort_bar(index: usize, total: usize) -> String {
 
 pub(super) fn service_tier_display_label(service_tier: &str) -> &str {
     match service_tier {
-        "priority" => "Fast",
+        "priority" | "fast" => "Fast",
         "flex" => "Flex",
+        // Explicit disable values persisted by "/fast default off" (issue
+        // #506) and accepted by the OpenAI runtime.
+        "off" | "default" | "auto" | "none" => "Standard",
         other => other,
     }
 }
@@ -545,14 +632,17 @@ pub(super) fn build_resume_command(
             let exe = launch_client_executable();
             let imported_id = crate::import::imported_claude_code_session_id(session_id);
             let args = resume_invocation_args(&imported_id, socket);
-            let title = format!("🧵 Claude Code {}", &session_id[..session_id.len().min(8)]);
+            let title = format!(
+                "🧵 Claude Code {}",
+                jcode_core::util::truncate_str(session_id, 8)
+            );
             (exe, args, title)
         }
         ResumeTarget::CodexSession { session_id, .. } => {
             let exe = launch_client_executable();
             let imported_id = crate::import::imported_codex_session_id(session_id);
             let args = resume_invocation_args(&imported_id, socket);
-            let title = format!("🧠 Codex {}", &session_id[..session_id.len().min(8)]);
+            let title = format!("🧠 Codex {}", jcode_core::util::truncate_str(session_id, 8));
             (exe, args, title)
         }
         ResumeTarget::PiSession { session_path } => {
@@ -572,7 +662,17 @@ pub(super) fn build_resume_command(
             let exe = launch_client_executable();
             let imported_id = crate::import::imported_opencode_session_id(session_id);
             let args = resume_invocation_args(&imported_id, socket);
-            let title = format!("◌ OpenCode {}", &session_id[..session_id.len().min(8)]);
+            let title = format!(
+                "◌ OpenCode {}",
+                jcode_core::util::truncate_str(session_id, 8)
+            );
+            (exe, args, title)
+        }
+        ResumeTarget::CursorSession { session_id, .. } => {
+            let exe = launch_client_executable();
+            let imported_id = crate::import::imported_cursor_session_id(session_id);
+            let args = resume_invocation_args(&imported_id, socket);
+            let title = format!("▮ Cursor {}", jcode_core::util::truncate_str(session_id, 8));
             (exe, args, title)
         }
     }
@@ -589,6 +689,12 @@ fn spawn_command_in_new_terminal(
     title: &str,
     cwd: &Path,
 ) -> anyhow::Result<bool> {
+    if cfg!(test) {
+        // Never launch real terminal windows from unit tests. Server-event
+        // handlers (e.g. SplitResponse) call this with current_exe(), which in
+        // tests is the libtest harness and would pop up a broken window.
+        return Ok(false);
+    }
     let command = crate::terminal_launch::TerminalCommand::new(program, args.to_vec())
         .title(title.to_string());
     crate::terminal_launch::spawn_command_in_new_terminal(&command, cwd)
@@ -603,17 +709,53 @@ pub(super) fn spawn_resume_target_in_new_terminal(
     spawn_command_in_new_terminal(&program, &args, &title, cwd)
 }
 
+/// Build the terminal command used to spawn a brand-new jcode session.
+/// Split from `spawn_fresh_session_in_new_terminal` so tests can verify the
+/// invocation without launching a window.
+fn build_fresh_session_command(socket: Option<&str>) -> crate::terminal_launch::TerminalCommand {
+    let exe = launch_client_executable();
+    let mut args = vec!["--fresh-spawn".to_string()];
+    if let Some(socket) = socket.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("--socket".to_string());
+        args.push(socket.to_string());
+    }
+    crate::terminal_launch::TerminalCommand::new(&exe, args)
+        .title("jcode · new session".to_string())
+        .kind("new-terminal")
+        .fresh_spawn()
+}
+
+/// Spawn a brand-new jcode session in a new terminal window, staying on the
+/// same server socket when one is configured. Returns Ok(true) when a terminal
+/// was launched, Ok(false) when no supported terminal was found.
+pub(super) fn spawn_fresh_session_in_new_terminal(cwd: &Path) -> anyhow::Result<bool> {
+    if cfg!(test) {
+        // Never launch real terminal windows from unit tests.
+        return Ok(false);
+    }
+    let socket = std::env::var("JCODE_SOCKET").ok();
+    let command = build_fresh_session_command(socket.as_deref());
+    crate::terminal_launch::spawn_command_in_new_terminal(&command, cwd)
+}
+
 fn resumed_window_title(session_id: &str) -> String {
     let session_name = crate::process_title::session_name(session_id);
     let icon = crate::id::session_icon(&session_name);
-    let session_label = crate::process_title::terminal_session_label_for_id(session_id);
-    if let Some(server_info) =
+    let display_title = crate::process_title::terminal_display_title_for_id(session_id);
+    let session_label = crate::process_title::terminal_session_label(&session_name, None);
+    let fallback_label = if let Some(server_info) =
         crate::registry::find_server_by_socket_sync(&crate::server::socket_path())
     {
-        format!("{} jcode/{} {}", icon, server_info.name, session_label)
+        format!("jcode/{} {}", server_info.name, session_label)
     } else {
-        format!("{} jcode {}", icon, session_label)
-    }
+        format!("jcode {}", session_label)
+    };
+    crate::process_title::terminal_window_title(
+        icon,
+        display_title.as_deref(),
+        Some(&fallback_label),
+        false,
+    )
 }
 
 #[cfg(unix)]
@@ -699,7 +841,7 @@ pub(super) fn clipboard_image() -> Option<(String, String)> {
             if let Some(url) = extract_image_url(&html) {
                 crate::logging::info(&format!(
                     "clipboard_image: found image URL in HTML: {}",
-                    &url[..url.len().min(80)]
+                    jcode_core::util::truncate_str(&url, 80)
                 ));
                 if let Some(result) = download_image_url(&url) {
                     return Some(result);
@@ -845,14 +987,11 @@ pub(super) fn encode_rgba_as_png(width: usize, height: usize, rgba: &[u8]) -> Op
 }
 
 pub(super) fn gather_git_info() -> Option<GitInfo> {
-    use std::sync::Mutex;
     use std::time::Instant;
-
-    static CACHE: Mutex<Option<(Instant, Option<GitInfo>, bool)>> = Mutex::new(None);
 
     const TTL: Duration = Duration::from_secs(5);
 
-    if let Ok(mut guard) = CACHE.lock() {
+    if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
         if let Some((ts, cached, refreshing)) = guard.as_mut() {
             if ts.elapsed() < TTL {
                 return cached.clone();
@@ -864,17 +1003,17 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
             *refreshing = true;
             std::thread::spawn(|| {
                 let result = gather_git_info_inner();
-                if let Ok(mut guard) = CACHE.lock() {
+                if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
                     *guard = Some((Instant::now(), result, false));
                 }
             });
             return stale;
         }
 
-        *guard = Some((Instant::now() - TTL - Duration::from_secs(1), None, true));
+        *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
         std::thread::spawn(|| {
             let result = gather_git_info_inner();
-            if let Ok(mut guard) = CACHE.lock() {
+            if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
                 *guard = Some((Instant::now(), result, false));
             }
         });
@@ -882,35 +1021,42 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
     None
 }
 
-pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem> {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
+/// Fetch a session's todos plus its goal-level assessments through the same
+/// stale-while-revalidate cache, so the info widget can render goal metadata
+/// (hill-climbability and objectives) without extra disk reads per frame.
+pub(super) fn gather_todos_and_goals_for_session(
+    session_id: Option<&str>,
+) -> (Vec<TodoItem>, Vec<crate::todo::TodoGoal>) {
     use std::time::Instant;
 
-    type TodosCache = HashMap<String, (Instant, Vec<TodoItem>, bool)>;
-
-    static CACHE: LazyLock<Mutex<TodosCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     const TTL: Duration = Duration::from_secs(1);
 
     let Some(session_id) = session_id else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
-    if let Ok(mut cache) = CACHE.lock() {
-        if let Some((ts, todos, refreshing)) = cache.get_mut(session_id) {
+    fn fetch(session_id: &str) -> (Vec<TodoItem>, Vec<crate::todo::TodoGoal>) {
+        (
+            crate::todo::load_todos(session_id).unwrap_or_default(),
+            crate::todo::load_goals(session_id).unwrap_or_default(),
+        )
+    }
+
+    if let Ok(mut cache) = TODOS_CACHE.lock() {
+        if let Some((ts, todos, goals, refreshing)) = cache.get_mut(session_id) {
             if ts.elapsed() < TTL {
-                return todos.clone();
+                return (todos.clone(), goals.clone());
             }
             if *refreshing {
-                return todos.clone();
+                return (todos.clone(), goals.clone());
             }
-            let stale = todos.clone();
+            let stale = (todos.clone(), goals.clone());
             *refreshing = true;
             let session_id = session_id.to_string();
             std::thread::spawn(move || {
-                let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
-                if let Ok(mut cache) = CACHE.lock() {
-                    cache.insert(session_id, (Instant::now(), todos, false));
+                let (todos, goals) = fetch(&session_id);
+                if let Ok(mut cache) = TODOS_CACHE.lock() {
+                    cache.insert(session_id, (Instant::now(), todos, goals, false));
                 }
             });
             return stale;
@@ -920,34 +1066,41 @@ pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem
         cache.insert(
             session_id.clone(),
             (
-                Instant::now() - TTL - Duration::from_secs(1),
+                backdated_now(TTL + Duration::from_secs(1)),
+                Vec::new(),
                 Vec::new(),
                 true,
             ),
         );
         std::thread::spawn(move || {
-            let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
-            if let Ok(mut cache) = CACHE.lock() {
-                cache.insert(session_id, (Instant::now(), todos, false));
+            let (todos, goals) = fetch(&session_id);
+            if let Ok(mut cache) = TODOS_CACHE.lock() {
+                cache.insert(session_id, (Instant::now(), todos, goals, false));
             }
         });
     }
-    Vec::new()
+    (Vec::new(), Vec::new())
 }
 
-pub(super) fn gather_memory_info(memory_enabled: bool) -> Option<MemoryInfo> {
+pub(super) fn gather_memory_info(
+    memory_enabled: bool,
+    working_dir: Option<String>,
+) -> Option<MemoryInfo> {
     use std::sync::Mutex;
     use std::time::Instant;
 
     static CACHE: Mutex<Option<(Instant, Option<MemoryInfo>, bool)>> = Mutex::new(None);
     const TTL: Duration = Duration::from_secs(2);
 
-    if !memory_enabled {
-        return None;
-    }
-
-    let activity = crate::memory::get_activity();
-    let sidecar_model = if crate::memory::memory_sidecar_enabled() {
+    // When memory is disabled we still surface the stored counts (with a
+    // DISABLED badge) so the user can see they have memories but recall is off.
+    // Live activity and the sidecar model are suppressed in that case.
+    let activity = if memory_enabled {
+        crate::memory::get_activity()
+    } else {
+        None
+    };
+    let sidecar_model = if memory_enabled && crate::memory::memory_sidecar_enabled() {
         let sidecar = crate::sidecar::Sidecar::new();
         Some(format!(
             "{} · {}",
@@ -958,39 +1111,29 @@ pub(super) fn gather_memory_info(memory_enabled: bool) -> Option<MemoryInfo> {
         None
     };
 
+    let finalize = |mut info: MemoryInfo| {
+        info.activity = activity.clone();
+        info.sidecar_model = sidecar_model.clone();
+        info.disabled = !memory_enabled;
+        info
+    };
+
     if let Ok(mut guard) = CACHE.lock() {
         if let Some((ts, cached, refreshing)) = guard.as_mut() {
             if ts.elapsed() < TTL || *refreshing {
                 return match cached.clone() {
-                    Some(mut info) => {
-                        info.activity = activity.clone();
-                        info.sidecar_model = sidecar_model.clone();
-                        Some(info)
-                    }
-                    None => activity.clone().map(|activity| MemoryInfo {
-                        sidecar_available: crate::memory::memory_sidecar_enabled(),
-                        sidecar_model: sidecar_model.clone(),
-                        activity: Some(activity),
-                        ..Default::default()
-                    }),
+                    Some(info) => Some(finalize(info)),
+                    None => fallback_memory_info(memory_enabled, &activity, &sidecar_model),
                 };
             }
             let stale = match cached.clone() {
-                Some(mut info) => {
-                    info.activity = activity.clone();
-                    info.sidecar_model = sidecar_model.clone();
-                    Some(info)
-                }
-                None => activity.clone().map(|activity| MemoryInfo {
-                    sidecar_available: crate::memory::memory_sidecar_enabled(),
-                    sidecar_model: sidecar_model.clone(),
-                    activity: Some(activity),
-                    ..Default::default()
-                }),
+                Some(info) => Some(finalize(info)),
+                None => fallback_memory_info(memory_enabled, &activity, &sidecar_model),
             };
             *refreshing = true;
-            std::thread::spawn(|| {
-                let result = gather_memory_info_inner();
+            let working_dir = working_dir.clone();
+            std::thread::spawn(move || {
+                let result = gather_memory_info_inner(working_dir);
                 if let Ok(mut guard) = CACHE.lock() {
                     *guard = Some((Instant::now(), result, false));
                 }
@@ -998,24 +1141,37 @@ pub(super) fn gather_memory_info(memory_enabled: bool) -> Option<MemoryInfo> {
             return stale;
         }
 
-        *guard = Some((Instant::now() - TTL - Duration::from_secs(1), None, true));
-        std::thread::spawn(|| {
-            let result = gather_memory_info_inner();
+        *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
+        std::thread::spawn(move || {
+            let result = gather_memory_info_inner(working_dir);
             if let Ok(mut guard) = CACHE.lock() {
                 *guard = Some((Instant::now(), result, false));
             }
         });
     }
 
-    activity.map(|activity| MemoryInfo {
+    fallback_memory_info(memory_enabled, &activity, &sidecar_model)
+}
+
+fn fallback_memory_info(
+    memory_enabled: bool,
+    activity: &Option<crate::memory_types::MemoryActivity>,
+    sidecar_model: &Option<String>,
+) -> Option<MemoryInfo> {
+    // No cached counts yet. Show whatever live signal we have.
+    if activity.is_none() && sidecar_model.is_none() && memory_enabled {
+        return None;
+    }
+    Some(MemoryInfo {
         sidecar_available: crate::memory::memory_sidecar_enabled(),
-        sidecar_model,
-        activity: Some(activity),
+        sidecar_model: sidecar_model.clone(),
+        activity: activity.clone(),
+        disabled: !memory_enabled,
         ..Default::default()
     })
 }
 
-fn gather_memory_info_inner() -> Option<MemoryInfo> {
+fn gather_memory_info_inner(working_dir: Option<String>) -> Option<MemoryInfo> {
     let activity = crate::memory::get_activity();
     let sidecar_model = if crate::memory::memory_sidecar_enabled() {
         let sidecar = crate::sidecar::Sidecar::new();
@@ -1030,7 +1186,12 @@ fn gather_memory_info_inner() -> Option<MemoryInfo> {
 
     use crate::memory::MemoryManager;
 
-    let manager = MemoryManager::new();
+    // Scope the manager to the session working dir so the project count reads
+    // the same projects/<hash>.json store the memory tool writes (issue #491).
+    let manager = match working_dir.as_deref() {
+        Some(dir) if !dir.trim().is_empty() => MemoryManager::new().with_project_dir(dir),
+        _ => MemoryManager::new(),
+    };
     let project_graph = manager.load_project_graph().ok();
     let global_graph = manager.load_global_graph().ok();
 
@@ -1072,6 +1233,7 @@ fn gather_memory_info_inner() -> Option<MemoryInfo> {
             sidecar_available: crate::memory::memory_sidecar_enabled(),
             sidecar_model,
             activity,
+            disabled: false,
             graph_nodes,
             graph_edges,
         })
@@ -1109,7 +1271,7 @@ pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidget
         }
 
         *guard = Some((
-            Instant::now() - TTL - Duration::from_secs(1),
+            backdated_now(TTL + Duration::from_secs(1)),
             ambient_enabled,
             None,
             true,

@@ -273,10 +273,11 @@ fn test_incremental_renderer_streaming_heading_does_not_duplicate() {
 #[test]
 fn test_incremental_renderer_streaming_inline_math() {
     let mut renderer = IncrementalMarkdownRenderer::new(Some(80));
-    let _ = renderer.update("Compute $x");
-    let lines = renderer.update("Compute $x$");
+    let _ = renderer.update("Compute $x^");
+    let lines = renderer.update("Compute $x^2$");
     let rendered = lines_to_string(&lines);
-    assert!(rendered.contains("$x$"));
+    assert!(rendered.contains("x²"), "{rendered}");
+    assert!(!rendered.contains("$x^2$"), "{rendered}");
 }
 
 #[test]
@@ -300,6 +301,26 @@ fn test_incremental_renderer_streaming_display_math() {
 }
 
 #[test]
+fn test_incremental_renderer_streaming_bracketed_and_fenced_latex() {
+    let mut renderer = IncrementalMarkdownRenderer::new(Some(80));
+
+    let partial = renderer.update("Result:\n\n\\[\\frac{x+1}");
+    let partial_text = lines_to_string(&partial);
+    assert!(partial_text.contains("[\\frac{x+1}"), "{partial_text}");
+    assert!(!partial_text.contains("┌─ math"), "{partial_text}");
+
+    let complete = renderer.update("Result:\n\n\\[\\frac{x+1}{y}\\]");
+    let complete_text = lines_to_string(&complete);
+    assert!(complete_text.contains("─────"), "{complete_text}");
+    assert!(!complete_text.contains("\\frac"), "{complete_text}");
+
+    let fenced = renderer.update("```latex\n\\alpha_2 + x^2\n```");
+    let fenced_text = lines_to_string(&fenced);
+    assert!(fenced_text.contains("α₂ + x²"), "{fenced_text}");
+    assert!(fenced_text.contains("┌─ math"), "{fenced_text}");
+}
+
+#[test]
 fn test_incremental_renderer_streams_fenced_block_before_close() {
     let mut renderer = IncrementalMarkdownRenderer::new(Some(80));
     let _ = renderer.update("Plan:\n\n```\n");
@@ -320,7 +341,8 @@ fn test_incremental_renderer_defers_mermaid_render_until_background_ready() {
 
     let mut renderer = IncrementalMarkdownRenderer::new(Some(80));
     let text = "Plan:\n\n```mermaid\nflowchart LR\n  A[Start] --> B[End]\n```\n";
-    let lines = renderer.update(text);
+    let lines =
+        jcode_tui_mermaid::with_image_protocol_override(Some(true), || renderer.update(text));
     let rendered = lines_to_string(&lines);
 
     assert!(
@@ -328,6 +350,70 @@ fn test_incremental_renderer_defers_mermaid_render_until_background_ready() {
             || rendered.contains("mermaid diagram rendering"),
         "expected deferred mermaid placeholder on first completed streaming render: {}",
         rendered
+    );
+}
+
+#[test]
+fn test_pending_placeholder_line_detection() {
+    let placeholder = Line::from(Span::styled(
+        MERMAID_PENDING_PLACEHOLDER_TEXT.to_string(),
+        Style::default(),
+    ));
+    assert!(line_is_mermaid_pending_placeholder(&placeholder));
+
+    // Centered display modes prepend a padding span.
+    let padded = Line::from(vec![
+        Span::raw("        "),
+        Span::styled(
+            MERMAID_PENDING_PLACEHOLDER_TEXT.to_string(),
+            Style::default(),
+        ),
+    ]);
+    assert!(line_is_mermaid_pending_placeholder(&padded));
+
+    // A narrow wrap can truncate the tail; the prefix still matches.
+    let wrapped = Line::from(Span::raw("↻ rendering mermaid"));
+    assert!(line_is_mermaid_pending_placeholder(&wrapped));
+
+    assert!(!line_is_mermaid_pending_placeholder(&Line::from("")));
+    assert!(!line_is_mermaid_pending_placeholder(&Line::from(
+        "↗ mermaid diagram (image protocols unavailable)"
+    )));
+    assert!(!line_is_mermaid_pending_placeholder(&Line::from(vec![
+        Span::raw(MERMAID_PENDING_PLACEHOLDER_TEXT),
+        Span::raw("extra content"),
+    ])));
+}
+
+/// A completed background mermaid render advances the deferred epoch without
+/// changing the streamed text. The incremental renderer must not serve its
+/// identical-text fast path in that case, or the transcript placeholder
+/// ("rendering mermaid diagram...") never resolves into the diagram.
+#[cfg(feature = "mermaid-renderer")]
+#[test]
+fn test_incremental_renderer_rerenders_pending_mermaid_after_epoch_bump() {
+    let mut renderer = IncrementalMarkdownRenderer::new(Some(80));
+    // Unique content so no earlier test populated the render cache for it.
+    let text = "Plan:\n\n```mermaid\nflowchart LR\n  E1[EpochBump] --> E2[FastPath]\n```\n";
+
+    let lines =
+        jcode_tui_mermaid::with_image_protocol_override(Some(true), || renderer.update(text));
+    if !lines.iter().any(line_is_mermaid_pending_placeholder) {
+        // Cache already warm (render finished before this update); nothing to pin.
+        return;
+    }
+
+    // Simulate the background render completing. (The real worker may also
+    // bump concurrently; either way the epoch now differs from the stamp
+    // taken before the pending render above.)
+    jcode_tui_mermaid::debug_bump_deferred_render_epoch_for_tests();
+
+    let before = thread_render_count();
+    let _ = jcode_tui_mermaid::with_image_protocol_override(Some(true), || renderer.update(text));
+    assert!(
+        thread_render_count() > before,
+        "identical text with an advanced deferred epoch must re-render \
+         so the completed diagram replaces its placeholder"
     );
 }
 

@@ -1,12 +1,10 @@
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
-use tokio::sync::Mutex;
 
 /// Convert a filesystem path to a Windows named pipe path.
 ///
@@ -108,23 +106,13 @@ impl Stream {
     }
 
     pub fn into_split(self) -> (ReadHalf, WriteHalf) {
-        let shared = Arc::new(Mutex::new(self));
-        (
-            ReadHalf {
-                inner: Arc::clone(&shared),
-            },
-            WriteHalf { inner: shared },
-        )
+        let (read, write) = tokio::io::split(self);
+        (ReadHalf { inner: read }, WriteHalf { inner: write })
     }
 
     pub fn split(&mut self) -> (SplitReadRef<'_>, SplitWriteRef<'_>) {
-        let ptr = self as *mut Stream;
-        unsafe {
-            (
-                SplitReadRef { stream: &mut *ptr },
-                SplitWriteRef { stream: &mut *ptr },
-            )
-        }
+        let (read, write) = tokio::io::split(self);
+        (SplitReadRef { inner: read }, SplitWriteRef { inner: write })
     }
 
     pub fn pair() -> io::Result<(Self, Self)> {
@@ -132,7 +120,7 @@ impl Stream {
         static PAIR_COUNTER: AtomicU64 = AtomicU64::new(0);
         let counter = PAIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let pipe_name = format!(r"\\.\pipe\jcode-pair-{}-{}", std::process::id(), counter);
-        let mut server = ServerOptions::new()
+        let server = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&pipe_name)?;
         let client = ClientOptions::new().open(&pipe_name)?;
@@ -219,9 +207,8 @@ impl AsyncWrite for Stream {
 }
 
 /// Owned read half of a Stream, created by `into_split()`.
-/// Uses a shared Arc<Mutex<Stream>> since named pipes don't support native splitting.
 pub struct ReadHalf {
-    inner: Arc<Mutex<Stream>>,
+    inner: tokio::io::ReadHalf<Stream>,
 }
 
 impl AsyncRead for ReadHalf {
@@ -230,17 +217,13 @@ impl AsyncRead for ReadHalf {
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => return std::task::Poll::Pending,
-        };
-        std::pin::Pin::new(&mut *guard).poll_read(cx, buf)
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
 
 /// Owned write half of a Stream, created by `into_split()`.
 pub struct WriteHalf {
-    inner: Arc<Mutex<Stream>>,
+    inner: tokio::io::WriteHalf<Stream>,
 }
 
 impl AsyncWrite for WriteHalf {
@@ -249,39 +232,27 @@ impl AsyncWrite for WriteHalf {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => return std::task::Poll::Pending,
-        };
-        std::pin::Pin::new(&mut *guard).poll_write(cx, buf)
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => return std::task::Poll::Pending,
-        };
-        std::pin::Pin::new(&mut *guard).poll_flush(cx)
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => return std::task::Poll::Pending,
-        };
-        std::pin::Pin::new(&mut *guard).poll_shutdown(cx)
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
 /// Borrowed read reference for `stream.split()`.
 pub struct SplitReadRef<'a> {
-    stream: &'a mut Stream,
+    inner: tokio::io::ReadHalf<&'a mut Stream>,
 }
 
 impl<'a> AsyncRead for SplitReadRef<'a> {
@@ -290,13 +261,13 @@ impl<'a> AsyncRead for SplitReadRef<'a> {
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut *self.get_mut().stream).poll_read(cx, buf)
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
 
 /// Borrowed write reference for `stream.split()`.
 pub struct SplitWriteRef<'a> {
-    stream: &'a mut Stream,
+    inner: tokio::io::WriteHalf<&'a mut Stream>,
 }
 
 impl<'a> AsyncWrite for SplitWriteRef<'a> {
@@ -305,21 +276,21 @@ impl<'a> AsyncWrite for SplitWriteRef<'a> {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        std::pin::Pin::new(&mut *self.get_mut().stream).poll_write(cx, buf)
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut *self.get_mut().stream).poll_flush(cx)
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut *self.get_mut().stream).poll_shutdown(cx)
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -363,7 +334,19 @@ impl io::Write for SyncStream {
 
 pub fn is_socket_path(path: &Path) -> bool {
     let pipe_name = path_to_pipe_name(path);
-    ClientOptions::new().open(&pipe_name).is_ok()
+    match ClientOptions::new().open(&pipe_name) {
+        Ok(_) => true,
+        Err(error)
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) =>
+        {
+            // Every published instance being occupied proves that a server is
+            // listening. Do not report the endpoint as absent and race a second
+            // daemon against it merely because another client connected first.
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn remove_socket(path: &Path) {
@@ -384,7 +367,10 @@ pub fn stream_pair() -> io::Result<(Stream, Stream)> {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    static BUSY_PIPE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn pipe_name_is_stable_and_normalizes_case_and_separators() {
@@ -417,5 +403,48 @@ mod tests {
         let mut buf = [0u8; 4];
         b.read_exact(&mut buf).await.expect("read from pipe");
         assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn split_stream_supports_concurrent_read_and_write() {
+        let (a, mut b) = stream_pair().expect("create stream pair");
+        let (mut read, mut write) = a.into_split();
+
+        let peer = tokio::spawn(async move {
+            let mut request = [0u8; 4];
+            b.read_exact(&mut request).await.expect("read request");
+            assert_eq!(&request, b"ping");
+            b.write_all(b"pong").await.expect("write response");
+            b.flush().await.expect("flush response");
+        });
+
+        let exchange = async {
+            write.write_all(b"ping").await.expect("write request");
+            write.flush().await.expect("flush request");
+            let mut response = [0u8; 4];
+            read.read_exact(&mut response).await.expect("read response");
+            assert_eq!(&response, b"pong");
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), exchange)
+            .await
+            .expect("split stream exchange should not stall");
+        peer.await.expect("peer task");
+    }
+
+    #[tokio::test]
+    async fn busy_pipe_is_reported_as_a_live_socket_path() {
+        let path = std::env::temp_dir().join(format!(
+            "jcode-busy-pipe-probe-{}-{}.sock",
+            std::process::id(),
+            BUSY_PIPE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _listener = Listener::bind(&path).expect("bind named pipe");
+        let _client = Stream::connect(&path).await.expect("occupy named pipe");
+
+        assert!(
+            is_socket_path(&path),
+            "a busy named pipe must still be recognized as a live server endpoint"
+        );
     }
 }

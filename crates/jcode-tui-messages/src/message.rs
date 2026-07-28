@@ -79,6 +79,21 @@ impl DisplayMessage {
         }
     }
 
+    /// Create a display-only inline todo-list card. The content is either the
+    /// legacy JSON array of todo items or an object containing `todos` and
+    /// goal-level assessments in `goals`. Shown in the transcript UI but not
+    /// part of provider/model context.
+    pub fn todos(content: impl Into<String>) -> Self {
+        Self {
+            role: "todos".to_string(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            duration_secs: None,
+            title: Some("Todos".to_string()),
+            tool_data: None,
+        }
+    }
+
     /// Create a memory injection message (bordered box display).
     pub fn memory(title: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -167,6 +182,20 @@ impl DisplayMessage {
     pub fn meta(content: impl Into<String>) -> Self {
         Self {
             role: "meta".to_string(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        }
+    }
+
+    /// Create a display-only collapsing reasoning trace ("current" mode). The
+    /// content is sentinel-wrapped dim/italic markup; this message height-collapses
+    /// toward a one-line summary and is excluded from provider/model context.
+    pub fn reasoning(content: impl Into<String>) -> Self {
+        Self {
+            role: "reasoning".to_string(),
             content: content.into(),
             tool_calls: Vec::new(),
             duration_secs: None,
@@ -381,6 +410,7 @@ mod tests {
                 name: "read".to_string(),
                 input,
                 intent: None,
+                thought_signature: None,
             }),
         }
     }
@@ -408,6 +438,7 @@ mod tests {
             content: "done".to_string(),
             tool_calls: vec!["read".to_string()],
             tool_data: None,
+            stored_index: None,
         };
 
         let display = DisplayMessage::from_rendered_message(rendered);

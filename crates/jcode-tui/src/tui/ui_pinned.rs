@@ -68,6 +68,17 @@ fn side_panel_mermaid_preferred_aspect_ratio(
     super::diagram_pane::content_area_preferred_aspect_ratio(inner)
 }
 
+fn side_panel_mermaid_profile_area(inner: Rect, reserve_native_scrollbar: bool) -> Rect {
+    if reserve_native_scrollbar && inner.width > 1 {
+        Rect {
+            width: inner.width - 1,
+            ..inner
+        }
+    } else {
+        inner
+    }
+}
+
 #[path = "ui_pinned_selection.rs"]
 mod selection_support;
 use selection_support::apply_side_selection_highlight;
@@ -126,8 +137,6 @@ fn image_source_badge(source: &crate::session::RenderedImageSource) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PinnedCacheKey {
     messages_version: u64,
-    collect_diffs: bool,
-    collect_images: bool,
 }
 
 #[derive(Default)]
@@ -424,8 +433,9 @@ fn pinned_content_image_layout_with_font(
     lines_before_image: usize,
     has_following_content: bool,
     font_size: Option<(u16, u16)>,
+    force_full_width: bool,
 ) -> SidePanelImageLayout {
-    estimate_side_panel_image_layout_with_font(
+    let layout = estimate_side_panel_image_layout_with_font(
         width,
         height,
         inner.width,
@@ -433,7 +443,42 @@ fn pinned_content_image_layout_with_font(
         lines_before_image,
         has_following_content,
         font_size,
-    )
+    );
+
+    // Real pasted/read images (photos, screenshots) must always be shown in
+    // full. The viewport zoom heuristic is tuned for mermaid diagrams, which can
+    // pan horizontally, but for a wide screenshot it crops to the left edge.
+    // If the chosen zoom would overflow the pane width, fall back to a fully
+    // visible Fit render so the whole image is on screen.
+    if force_full_width
+        && let SidePanelImageRenderMode::ScrollableViewport { zoom_percent } = layout.render_mode
+    {
+        let (cell_w, cell_h) = font_size.unwrap_or((8, 16));
+        let cell_w = cell_w.max(1) as u32;
+        let cell_h = cell_h.max(1) as u32;
+        let avail_px = (inner.width.max(1) as u32).saturating_mul(cell_w);
+        let scaled_w_px = width
+            .saturating_mul(zoom_percent as u32)
+            .checked_div(100)
+            .unwrap_or(width);
+        if scaled_w_px > avail_px {
+            // Fit to width: scale the height by the same width ratio, then
+            // convert to terminal rows.
+            let fitted_h_px = height
+                .saturating_mul(avail_px)
+                .checked_div(width.max(1))
+                .unwrap_or(height);
+            let rows = super::diagram_pane::div_ceil_u32(fitted_h_px.max(1), cell_h)
+                .min(inner.height.max(1) as u32)
+                .max(SIDE_PANEL_INLINE_IMAGE_MIN_ROWS as u32) as u16;
+            return SidePanelImageLayout {
+                rows,
+                render_mode: SidePanelImageRenderMode::Fit,
+            };
+        }
+    }
+
+    layout
 }
 
 type SidePaneSnapshotCache = (
@@ -656,18 +701,16 @@ pub(crate) fn prewarm_focused_side_panel(
     true
 }
 
-pub(super) fn collect_pinned_content_cached(
+/// Collect the pinned file-diff entries used by the right-hand pane.
+///
+/// Inline images render in the transcript now. Keeping image payloads out of
+/// this frame-level probe is important because `TuiState::side_pane_images()`
+/// may materialize and clone multi-megabyte base64 strings.
+pub(super) fn collect_pinned_diffs_cached(
     messages: &[DisplayMessage],
-    images: &[crate::session::RenderedImage],
-    collect_diffs: bool,
-    collect_images: bool,
     messages_version: u64,
 ) -> bool {
-    let key = PinnedCacheKey {
-        messages_version,
-        collect_diffs,
-        collect_images,
-    };
+    let key = PinnedCacheKey { messages_version };
 
     let mut cache = match pinned_cache().lock() {
         Ok(c) => c,
@@ -678,7 +721,7 @@ pub(super) fn collect_pinned_content_cached(
         return !cache.entries.is_empty();
     }
 
-    let entries = collect_pinned_content(messages, images, collect_diffs, collect_images);
+    let entries = collect_pinned_content(messages, &[], true, false);
     let has_entries = !entries.is_empty();
     cache.key = Some(key);
     cache.entries = entries;
@@ -1074,6 +1117,7 @@ pub(super) fn draw_pinned_content_cached(
                             text_lines.len(),
                             i + 1 < entries.len(),
                             mermaid::get_font_size(),
+                            true,
                         );
                         image_placements.push(PinnedImagePlacement {
                             after_text_line: text_lines.len(),
@@ -1129,6 +1173,7 @@ pub(super) fn draw_pinned_content_cached(
     super::set_pinned_pane_total_lines(total_lines);
 
     let max_scroll = total_lines.saturating_sub(inner.height as usize);
+    super::set_last_diff_pane_max_scroll(max_scroll);
     let clamped_scroll = scroll.min(max_scroll);
     super::set_last_diff_pane_effective_scroll(clamped_scroll);
 
@@ -1295,9 +1340,18 @@ pub(super) fn draw_side_panel_markdown(
     };
     let has_protocol = mermaid::protocol_type().is_some();
     let image_zoom_percent = app.side_panel_image_zoom_percent();
-    let rendered_full_width = render_side_panel_markdown_cached_with_zoom(
+    // The first render measures whether a native scrollbar is needed. When one
+    // is enabled, use the eventual one-column-narrower content area for Mermaid's
+    // aspect profile on that measurement pass too. Otherwise each diagram queues
+    // one cold render at full width and another after the scrollbar is reserved.
+    let reserve_native_scrollbar =
+        app.side_panel_native_scrollbar() && content_shell_area.width > 1;
+    let mermaid_profile_area =
+        side_panel_mermaid_profile_area(content_shell_area, reserve_native_scrollbar);
+    let rendered_full_width = render_side_panel_markdown_cached_with_zoom_and_profile_area(
         page,
         content_shell_area,
+        mermaid_profile_area,
         has_protocol,
         centered,
         image_zoom_percent,
@@ -1391,6 +1445,7 @@ pub(super) fn draw_side_panel_markdown(
         .lines
         .len()
         .saturating_sub(content_inner.height as usize);
+    super::set_last_diff_pane_max_scroll(max_scroll);
     let clamped_scroll = scroll.min(max_scroll);
     super::set_last_diff_pane_effective_scroll(clamped_scroll);
 
@@ -1642,8 +1697,27 @@ fn render_side_panel_markdown_cached_with_zoom(
     centered: bool,
     image_zoom_percent: u8,
 ) -> PinnedRenderedCache {
+    render_side_panel_markdown_cached_with_zoom_and_profile_area(
+        page,
+        inner,
+        inner,
+        has_protocol,
+        centered,
+        image_zoom_percent,
+    )
+}
+
+fn render_side_panel_markdown_cached_with_zoom_and_profile_area(
+    page: &crate::side_panel::SidePanelPage,
+    inner: Rect,
+    mermaid_profile_area: Rect,
+    has_protocol: bool,
+    centered: bool,
+    image_zoom_percent: u8,
+) -> PinnedRenderedCache {
     let content_signature = side_panel_content_signature(page);
-    let mermaid_aspect_ratio = side_panel_mermaid_preferred_aspect_ratio(page, inner, has_protocol);
+    let mermaid_aspect_ratio =
+        side_panel_mermaid_preferred_aspect_ratio(page, mermaid_profile_area, has_protocol);
     let mermaid_aspect_bucket = mermaid::preferred_aspect_ratio_bucket(mermaid_aspect_ratio);
     let key = SidePanelRenderKey {
         page_id: page.id.clone(),
@@ -1818,13 +1892,17 @@ fn render_side_panel_markdown_lines_cached(
         debug.stats.markdown_cache_misses += 1;
     });
 
-    let saved_override = markdown::get_diagram_mode_override();
     let saved_centered = markdown::center_code_blocks();
-    markdown::set_diagram_mode_override(Some(crate::config::DiagramDisplayMode::None));
     markdown::set_center_code_blocks(centered);
-    let rendered_lines = mermaid::with_preferred_aspect_ratio(mermaid_aspect_ratio, || {
-        markdown::render_markdown_with_width(&page.content, Some(inner_width as usize))
-    });
+    // Pin the diagram mode for this render only (thread-local scope): the
+    // side panel always renders diagrams inline. Using the process-global
+    // override here would race concurrent renders/tests that read or set it.
+    let rendered_lines =
+        markdown::with_diagram_mode_scope(crate::config::DiagramDisplayMode::None, || {
+            mermaid::with_preferred_aspect_ratio(mermaid_aspect_ratio, || {
+                markdown::render_markdown_with_width(&page.content, Some(inner_width as usize))
+            })
+        });
     let rendered_lines = if has_protocol {
         rendered_lines
             .into_iter()
@@ -1835,10 +1913,19 @@ fn render_side_panel_markdown_lines_cached(
     };
     let lines = wrap_side_panel_markdown_lines(rendered_lines, inner_width as usize);
     markdown::set_center_code_blocks(saved_centered);
-    markdown::set_diagram_mode_override(saved_override);
 
     let placeholder_hashes: Vec<Option<u64>> = if has_protocol {
-        lines.iter().map(mermaid::parse_image_placeholder).collect()
+        lines
+            .iter()
+            .map(|line| {
+                mermaid::parse_image_placeholder(line).or_else(|| {
+                    // Mermaid diagrams now emit inline-fit markers (same as
+                    // raster images); the side panel draws them through its
+                    // own placement machinery, keyed by hash.
+                    mermaid::parse_inline_image_placeholder(line).map(|(hash, _, _)| hash)
+                })
+            })
+            .collect()
     } else {
         vec![None; lines.len()]
     };
@@ -1875,7 +1962,10 @@ fn wrap_side_panel_markdown_lines(lines: Vec<Line<'static>>, width: usize) -> Ve
     lines
         .into_iter()
         .flat_map(|line| {
-            if is_rendered_table_line(&line) || mermaid::parse_image_placeholder(&line).is_some() {
+            if is_rendered_table_line(&line)
+                || mermaid::parse_image_placeholder(&line).is_some()
+                || mermaid::parse_inline_image_placeholder(&line).is_some()
+            {
                 vec![line]
             } else {
                 markdown::wrap_line(line, width)

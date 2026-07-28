@@ -12,6 +12,7 @@ base64 = "0.22"
 bytemuck = { version = "1", features = ["derive"] }
 glyphon = "0.5"
 image = { version = "0.25", default-features = false, features = ["png"] }
+jcode-fuzzy = { path = "../jcode-fuzzy" }
 jcode-tui-messages = { path = "../jcode-tui-messages" }
 libc = "0.2"
 pollster = "0.3"

@@ -16,12 +16,69 @@ use crate::{
 };
 
 use super::{
-    acp, commands, debug, hot_exec, login, output, provider_init, selfdev, terminal, tui_launch,
+    account, acp, commands, debug, hot_exec, login, output, provider_init, selfdev, terminal,
+    tui_launch,
 };
 use provider_init::ProviderChoice;
 
+fn is_file_controlled_debug_client() -> bool {
+    std::env::var_os("JCODE_DEBUG_CMD_PATH").is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn is_orphan_adopter_name(name: &str) -> bool {
+    matches!(name.trim(), "init" | "systemd")
+}
+
+#[cfg(target_os = "linux")]
+fn parent_is_orphan_adopter(parent_pid: libc::pid_t) -> bool {
+    if parent_pid <= 1 {
+        return true;
+    }
+    std::fs::read_to_string(format!("/proc/{parent_pid}/comm"))
+        .is_ok_and(|name| is_orphan_adopter_name(&name))
+}
+
+/// Tie file-controlled debug clients to the process that launched them.
+///
+/// These clients are automation helpers, not user-owned terminals. Without a
+/// parent-death signal they are reparented to init when a verification script
+/// or debug server exits, retaining a full TUI and session history indefinitely.
+#[cfg(target_os = "linux")]
+fn arm_debug_client_parent_death_signal() {
+    if !is_file_controlled_debug_client() {
+        return;
+    }
+
+    // Capture the parent first, then check it again after prctl. This closes the
+    // race where the launcher exits immediately before the signal is armed.
+    // Safety: getppid has no preconditions and does not dereference pointers.
+    let parent_pid = unsafe { libc::getppid() };
+    // Safety: PR_SET_PDEATHSIG accepts a signal number as its scalar argument.
+    let armed = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } == 0;
+    // Safety: getppid has no preconditions and does not dereference pointers.
+    let current_parent_pid = unsafe { libc::getppid() };
+    if armed
+        && (parent_is_orphan_adopter(parent_pid)
+            || current_parent_pid != parent_pid
+            || parent_is_orphan_adopter(current_parent_pid))
+    {
+        std::process::exit(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn arm_debug_client_parent_death_signal() {}
+
 pub(crate) async fn run_main(mut args: Args) -> Result<()> {
+    arm_debug_client_parent_death_signal();
     resolve_resume_arg(&mut args)?;
+
+    // One-time config migration: users whose config.toml still carries the old
+    // baked-in `swarm_spawn_mode = "visible"` default get flipped to the
+    // current `inline` default. Cheap (single file read, marker-gated), and it
+    // must run before the config cache is first populated.
+    crate::config::Config::migrate_legacy_swarm_spawn_mode_once();
 
     if let Some(profile_name) = args
         .provider_profile
@@ -60,6 +117,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             temporary_server,
             owner_pid,
             temp_idle_timeout_secs,
+            server_name,
         }) => {
             let serve_start = Instant::now();
             crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
@@ -71,7 +129,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                 provider_init::init_provider(&args.provider, args.model.as_deref()).await?;
             let provider_ms = provider_start.elapsed().as_millis();
             let server_new_start = Instant::now();
-            let server = server::Server::new(provider);
+            let server = server::Server::new_with_name(provider, server_name);
             let server_new_ms = server_new_start.elapsed().as_millis();
             crate::logging::info(&format!(
                 "[TIMING] serve bootstrap: provider_init={}ms, server_new={}ms, before_run={}ms",
@@ -94,6 +152,32 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             tui_launch::run_client().await?;
         }
         Some(Command::Server { action }) => match action {
+            ServerCommand::Start { json } => {
+                spawn_server(
+                    &args.provider,
+                    args.model.as_deref(),
+                    args.provider_profile.as_deref(),
+                )
+                .await?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "running",
+                        })
+                    );
+                } else {
+                    println!("Jcode server is running.");
+                }
+            }
+            ServerCommand::Keepalive => {
+                run_server_keepalive(
+                    &args.provider,
+                    args.model.as_deref(),
+                    args.provider_profile.as_deref(),
+                )
+                .await?;
+            }
             ServerCommand::Reload { force, json } => {
                 commands::run_server_reload_command(force, json).await?;
             }
@@ -158,6 +242,14 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             )
             .await?;
         }
+        Some(Command::Account { action }) => match action {
+            super::args::AccountCommand::Login { no_browser } => {
+                account::run_login(no_browser).await?
+            }
+            super::args::AccountCommand::Status { json } => account::run_status(json).await?,
+            super::args::AccountCommand::Manage => account::run_manage()?,
+            super::args::AccountCommand::Logout => account::run_logout().await?,
+        },
         Some(Command::Repl) => {
             let (provider, registry) =
                 provider_init::init_provider_and_registry(&args.provider, args.model.as_deref())
@@ -278,8 +370,16 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         }
         Some(Command::SetupHotkey {
             listen_macos_hotkey,
+            notify_cli_launch,
+            listen_windows_hotkey,
+            uninstall,
         }) => {
-            setup_hints::run_setup_hotkey(listen_macos_hotkey)?;
+            setup_hints::run_setup_hotkey(
+                listen_macos_hotkey,
+                listen_windows_hotkey,
+                uninstall,
+                notify_cli_launch.as_deref(),
+            )?;
         }
         Some(Command::SetupLauncher) => {
             setup_hints::run_setup_launcher()?;
@@ -426,6 +526,9 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             RestartCommand::Status => commands::run_restart_status_command()?,
             RestartCommand::Clear => commands::run_restart_clear_command()?,
         },
+        Some(Command::Menubar { once, json }) => {
+            commands::run_menubar_command(once, json)?;
+        }
         None => run_default_command(args).await?,
     }
 
@@ -451,21 +554,69 @@ fn resolve_resume_arg(args: &mut Args) -> Result<()> {
             return tui_launch::list_sessions();
         }
 
-        match resolve_resume_id(resume_id) {
+        let resume_id = resume_id.clone();
+        match resolve_resume_id(&resume_id) {
             Ok(full_id) => {
                 args.resume = Some(full_id);
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
-                if !output::quiet_enabled() {
-                    eprintln!("\nUse `jcode --resume` to list available sessions.");
+                match resume_resolution_failure_action(&resume_id, |key| std::env::var_os(key)) {
+                    // During a reload/update/restart handoff the client re-execs
+                    // itself with `--resume <id>` and `JCODE_RESUMING=1`. In the
+                    // client/server architecture the shared server is the authority
+                    // for session lifecycle, so an id that is not in the local store
+                    // can still be valid server-side. Hard-exiting here dumped the
+                    // user back to a shell with "No session found matching ...",
+                    // making jcode unusable after an auto-update (issue #328).
+                    // Instead, keep the raw id and let the remote connection resolve
+                    // it; if the server cannot find it either, the TUI surfaces a
+                    // recoverable message and falls back to a fresh session rather
+                    // than killing the process.
+                    ResumeResolutionFailureAction::DeferToServer => {
+                        crate::logging::warn(&format!(
+                            "Resume id '{}' not found locally during reload handoff ({}); deferring resolution to the server instead of exiting",
+                            resume_id, e
+                        ));
+                        // Leave args.resume as the raw id for the server to resolve.
+                    }
+                    ResumeResolutionFailureAction::Exit => {
+                        eprintln!("Error: {}", e);
+                        if !output::quiet_enabled() {
+                            eprintln!("\nUse `jcode --resume` to list available sessions.");
+                        }
+                        std::process::exit(1);
+                    }
                 }
-                std::process::exit(1);
             }
         }
     }
 
     Ok(())
+}
+
+/// What to do when a `--resume <id>` cannot be resolved from the local session
+/// store. Extracted as a pure function so the reload-handoff recovery path can
+/// be unit-tested without invoking `std::process::exit` (issue #328).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeResolutionFailureAction {
+    /// Keep the raw id and let the shared server resolve it (reload handoff).
+    DeferToServer,
+    /// No live handoff in progress; the id is genuinely bad, so exit.
+    Exit,
+}
+
+fn resume_resolution_failure_action<F, V>(
+    _resume_id: &str,
+    var_os: F,
+) -> ResumeResolutionFailureAction
+where
+    F: Fn(&str) -> Option<V>,
+{
+    if var_os("JCODE_RESUMING").is_some() {
+        ResumeResolutionFailureAction::DeferToServer
+    } else {
+        ResumeResolutionFailureAction::Exit
+    }
 }
 
 fn resolve_resume_id(resume_id: &str) -> Result<String> {
@@ -675,9 +826,37 @@ async fn run_default_command(args: Args) -> Result<()> {
     let startup_hints = if args.fresh_spawn {
         None
     } else {
+        // One-time: bake per-repo launch hotkeys from session history into config,
+        // then reinstall so the new chords take effect. Scanning session history
+        // can take a few hundred ms, so run it on a detached thread to keep it off
+        // the first-frame critical path. It is gated by an `imported` flag, so it
+        // does real work at most once and no-ops on every later launch.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            std::thread::Builder::new()
+                .name("launch-hotkey-bake".to_string())
+                .spawn(|| {
+                    if crate::config::Config::bake_launch_hotkeys_once() {
+                        setup_hints::reinstall_launch_hotkeys_after_config_change();
+                    }
+                })
+                .ok();
+        }
+
+        // Prefer existing setup hints (alignment/welcome/terminal nudges); only
+        // surface the keybinding-conflict heads-up when nothing else is queued,
+        // so we never clobber an early-launch tip. The conflict hint is
+        // self-debouncing (shown once per distinct conflict set).
         setup_hints::maybe_show_setup_hints()
+            .or_else(|| {
+                setup_hints::maybe_show_keymap_conflict_hint(&crate::config::config().keybindings)
+            })
+            .or_else(setup_hints::maybe_show_glyph_safe_notice)
     };
     startup_profile::mark("setup_hints");
+
+    // Best-effort: make sure the macOS menu bar session-count indicator is
+    // running so it shows up automatically for every macOS user.
+    commands::ensure_menubar_helper_running();
 
     if args.resume.is_none() {
         terminal::show_crash_resume_hint();
@@ -688,6 +867,15 @@ async fn run_default_command(args: Args) -> Result<()> {
     let in_jcode_repo = build::is_jcode_repo(&cwd);
     startup_profile::mark("is_jcode_repo");
     let already_in_selfdev = crate::cli::selfdev::client_selfdev_requested();
+
+    // Record where this interactive launch happened so the system-wide launch
+    // hotkeys can reopen jcode in the last project directory (Cmd+') and the
+    // last jcode repo for self-dev (Cmd+Shift+'). Best-effort; ignored unless a
+    // real TTY and not a fresh-spawn re-entry.
+    if !args.fresh_spawn && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let repo_dir = build::get_repo_dir();
+        setup_hints::record_launch_dirs(&cwd, repo_dir.as_deref());
+    }
 
     if in_jcode_repo && !already_in_selfdev && !args.no_selfdev {
         output::stderr_info("📍 Detected jcode repository - enabling self-dev mode");
@@ -768,6 +956,8 @@ async fn run_default_command(args: Args) -> Result<()> {
         startup_hints,
         !server_running,
         args.fresh_spawn,
+        args.remote_working_dir,
+        args.onboarding_sim,
     )
     .await?;
 
@@ -867,7 +1057,11 @@ pub(crate) async fn wait_for_reloading_server() -> bool {
 }
 
 async fn server_is_running_at(path: &std::path::Path) -> bool {
-    server::is_server_ready(path).await || server::has_live_listener(path).await
+    // Check liveness before performing a protocol handshake. On Windows the
+    // named pipe may be busy while another client is connecting; that already
+    // proves a daemon exists, while a handshake connect can otherwise wait in
+    // the transport's ERROR_PIPE_BUSY retry loop and block server startup.
+    server::has_live_listener(path).await || server::is_server_ready(path).await
 }
 
 #[cfg(unix)]
@@ -948,6 +1142,19 @@ pub(crate) async fn maybe_prompt_server_bootstrap_login(
     provider_choice: &ProviderChoice,
 ) -> Result<()> {
     startup_profile::mark("cred_check_start");
+
+    // Normal interactive launches perform onboarding inside the TUI, and an
+    // explicit provider choice never needs auto-detection here. Avoid probing
+    // every credential backend unless the caller explicitly opted into the
+    // legacy headless CLI bootstrap flow. On Windows those reads may trigger
+    // expensive security-product inspection even when credentials are already
+    // configured, delaying every cold launch before the server is spawned.
+    let cli_bootstrap_requested = std::env::var_os("JCODE_CLI_BOOTSTRAP_LOGIN").is_some();
+    if !should_detect_cli_bootstrap_credentials(provider_choice, cli_bootstrap_requested) {
+        startup_profile::mark("cred_check_done");
+        return Ok(());
+    }
+
     let cred_state = detect_bootstrap_credentials().await;
     startup_profile::mark("cred_check_done");
 
@@ -962,10 +1169,7 @@ pub(crate) async fn maybe_prompt_server_bootstrap_login(
     // The only thing left to honor at the CLI layer is an explicit headless
     // bootstrap (e.g. CI / non-interactive provisioning), which opts in via the
     // `JCODE_CLI_BOOTSTRAP_LOGIN` env var.
-    if cred_state.has_any || *provider_choice != ProviderChoice::Auto {
-        return Ok(());
-    }
-    if std::env::var_os("JCODE_CLI_BOOTSTRAP_LOGIN").is_none() {
+    if cred_state.has_any {
         return Ok(());
     }
 
@@ -987,6 +1191,13 @@ pub(crate) async fn maybe_prompt_server_bootstrap_login(
     Ok(())
 }
 
+fn should_detect_cli_bootstrap_credentials(
+    provider_choice: &ProviderChoice,
+    cli_bootstrap_requested: bool,
+) -> bool {
+    cli_bootstrap_requested && *provider_choice == ProviderChoice::Auto
+}
+
 struct BootstrapCredentialState {
     has_any: bool,
 }
@@ -998,7 +1209,7 @@ async fn detect_bootstrap_credentials() -> BootstrapCredentialState {
     );
     let has_claude = has_claude.unwrap_or(false);
     let has_openai = has_openai.unwrap_or(false);
-    let has_openrouter = provider::openrouter::OpenRouterProvider::has_credentials();
+    let has_openrouter = provider::openrouter::has_credentials();
     let has_copilot = auth::copilot::has_copilot_credentials();
     let has_api_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
 
@@ -1075,16 +1286,17 @@ pub(crate) async fn spawn_server(
 
         let mut child = cmd.spawn()?;
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
+        // Windows server bootstrap can legitimately take tens of seconds on
+        // slow hosts (auth preflights + provider init were observed at 15-60s
+        // on a Windows Server VPS, issue #503). The child's liveness is
+        // checked every poll, so a generous budget only delays the error for
+        // a genuinely hung server, while a crashed server still fails fast
+        // with its stderr.
+        let timeout = std::time::Duration::from_secs(120);
         while start.elapsed() < timeout {
-            if crate::transport::is_socket_path(&server::socket_path()) {
-                if crate::transport::Stream::connect(server::socket_path())
-                    .await
-                    .is_ok()
-                {
-                    startup_profile::mark("server_ready");
-                    return Ok(());
-                }
+            if server::has_live_listener(&socket_path).await {
+                startup_profile::mark("server_ready");
+                return Ok(());
             }
 
             if let Some(status) = child.try_wait()? {
@@ -1113,7 +1325,67 @@ pub(crate) async fn spawn_server(
         );
     }
 
+    #[cfg(unix)]
     Ok(())
+}
+
+async fn run_server_keepalive(
+    provider_choice: &ProviderChoice,
+    model: Option<&str>,
+    provider_profile: Option<&str>,
+) -> Result<()> {
+    let mut owner_closed = tokio::task::spawn_blocking(|| {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0u8; 256];
+        loop {
+            match std::io::Read::read(&mut stdin, &mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    });
+    let mut client: Option<server::Client> = None;
+    let mut first_attempt = true;
+
+    loop {
+        let delay = if first_attempt {
+            first_attempt = false;
+            std::time::Duration::ZERO
+        } else if client.is_some() {
+            std::time::Duration::from_secs(30)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+        tokio::select! {
+            _ = &mut owner_closed => return Ok(()),
+            _ = tokio::time::sleep(delay) => {
+                if client.is_some() {
+                    // A Ping is a one-shot control request, so sending it over
+                    // the held connection would make the server close that
+                    // connection after replying. Probe through a short-lived
+                    // client instead and leave the counted keepalive connected.
+                    let healthy = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        async {
+                            let mut probe = server::Client::connect().await?;
+                            probe.ping().await
+                        },
+                    )
+                    .await
+                    .is_ok_and(|result| result.unwrap_or(false));
+                    if healthy {
+                        continue;
+                    }
+                    client = None;
+                }
+                if spawn_server(provider_choice, model, provider_profile).await.is_ok()
+                    && let Ok(connected) = server::Client::connect().await
+                {
+                    client = Some(connected);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

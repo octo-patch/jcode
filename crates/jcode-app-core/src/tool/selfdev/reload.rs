@@ -188,7 +188,13 @@ pub fn persisted_background_tasks_note(session_id: &str) -> String {
         ));
     }
 
-    let pending_awaits = crate::server::pending_await_members_for_session(session_id);
+    // Background awaits auto-resume on the new server and report via
+    // notify/wake, so they need no agent action. Only blocking awaits, whose
+    // socket waiter dies with the old process, must be rerun by the agent.
+    let pending_awaits: Vec<_> = crate::server::pending_await_members_for_session(session_id)
+        .into_iter()
+        .filter(|state| !state.background)
+        .collect();
     if !pending_awaits.is_empty() {
         let await_list = pending_awaits
             .iter()
@@ -210,7 +216,7 @@ pub fn persisted_background_tasks_note(session_id: &str) -> String {
             .join("; ");
 
         notes.push_str(&format!(
-            "\nPersisted `communicate await_members` wait(s) are still pending: {}. If you still need those coordination points after reload, rerun the same `communicate` call with action `await_members` to resume them with the remaining timeout instead of starting over.",
+            "\nPersisted blocking `swarm await_members` wait(s) are still pending: {}. If you still need those coordination points after reload, rerun the same `swarm` call with action `await_members` to resume them with the remaining timeout instead of starting over. (Background awaits resume automatically and will notify you.)",
             await_list
         ));
     }
@@ -244,7 +250,13 @@ impl SelfDevTool {
 
         let target_binary = build::find_dev_binary(&repo_dir)
             .unwrap_or_else(|| build::release_binary_path(&repo_dir));
-        if !target_binary.exists() {
+        // In a test session the rest of this method fakes the build source,
+        // hash and published state, so the real on-disk binary check is both
+        // inconsistent and environment-dependent (CI builds a release binary;
+        // a local debug/selfdev checkout may not have target/release/jcode).
+        // Skipping it lets the reload-signal/ack contract be exercised
+        // deterministically regardless of which profile was built locally.
+        if !SelfDevTool::is_test_session() && !target_binary.exists() {
             return Ok(ToolOutput::new(
                 format!(
                     "No binary found at {}.\n\
@@ -270,7 +282,7 @@ impl SelfDevTool {
             build::current_source_state(&repo_dir)?
         };
         let hash = source.version_label.clone();
-        let version_before = jcode_build_meta::VERSION.to_string();
+        let version_before = jcode_build_meta::version().to_string();
         let published = if SelfDevTool::is_test_session() {
             None
         } else {

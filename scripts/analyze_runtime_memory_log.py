@@ -23,6 +23,7 @@ class Sample:
     timestamp_ms: int
     kind: str
     target: str
+    instance_id: str
     source: str
     trigger_category: str
     trigger_reason: str
@@ -60,6 +61,30 @@ class Sample:
             "retained_bytes"
         )
         return int(value) if isinstance(value, int | float) else None
+
+    @property
+    def os_info(self) -> dict[str, Any]:
+        value = (self.raw.get("process") or {}).get("os")
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def process_info(self) -> dict[str, Any]:
+        value = self.raw.get("process")
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def process_diagnostics(self) -> dict[str, Any]:
+        value = self.raw.get("process_diagnostics")
+        return value if isinstance(value, dict) else {}
+
+
+def first_int(mapping: dict[str, Any], *keys: str) -> int | None:
+    """Return the first present integer value among candidate key names."""
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, int | float):
+            return int(value)
+    return None
 
 
 @dataclass
@@ -104,6 +129,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--days", type=int, default=None, help="Only include files from the last N daily logs")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP_N, help="How many spikes/sessions/deltas to show")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary")
+    instance_mode = parser.add_mutually_exclusive_group()
+    instance_mode.add_argument(
+        "--all-instances",
+        action="store_true",
+        help="Analyze all process instances in the selected files instead of the latest server/client instance",
+    )
+    instance_mode.add_argument(
+        "--instance",
+        help="Analyze one exact server or client process instance ID",
+    )
+    instance_mode.add_argument(
+        "--list-instances",
+        action="store_true",
+        help="List available process instance IDs and their time ranges, then exit",
+    )
     parser.add_argument(
         "--min-spike-mb",
         type=float,
@@ -177,6 +217,7 @@ def load_samples(paths: Iterable[Path]) -> list[Sample]:
             source = str(raw.get("source") or "")
             kind = infer_kind(raw, source)
             target = infer_target(raw, path)
+            instance_id = infer_instance_id(raw, target)
             trigger_category, trigger_reason = infer_trigger(raw, kind, source, trigger)
             samples.append(
                 Sample(
@@ -186,6 +227,7 @@ def load_samples(paths: Iterable[Path]) -> list[Sample]:
                     timestamp_ms=int(raw.get("timestamp_ms") or 0),
                     kind=kind,
                     target=target,
+                    instance_id=instance_id,
                     source=source,
                     trigger_category=trigger_category,
                     trigger_reason=trigger_reason,
@@ -195,6 +237,67 @@ def load_samples(paths: Iterable[Path]) -> list[Sample]:
             )
     samples.sort(key=lambda sample: (sample.timestamp_ms, str(sample.path), sample.line_no))
     return samples
+
+
+def infer_instance_id(raw: dict[str, Any], target: str) -> str:
+    if target == "server":
+        server = raw.get("server") or {}
+        value = server.get("id")
+    else:
+        client = raw.get("client") or {}
+        value = client.get("client_instance_id")
+    return str(value) if value else "legacy"
+
+
+def select_latest_instances(samples: list[Sample]) -> list[Sample]:
+    """Keep one coherent process lifetime per target.
+
+    Daily JSONL files contain multiple server reloads and client processes. PSS
+    deltas across process boundaries are meaningless and previously produced
+    multi-gigabyte false spikes. The default report now follows the latest
+    instance for each target; --all-instances preserves the old forensic view.
+    """
+    latest_by_target: dict[str, tuple[str, int]] = {}
+    for sample in samples:
+        current = latest_by_target.get(sample.target)
+        if current is None or sample.timestamp_ms > current[1]:
+            latest_by_target[sample.target] = (sample.instance_id, sample.timestamp_ms)
+    selected = [
+        sample
+        for sample in samples
+        if latest_by_target.get(sample.target, (None, 0))[0] == sample.instance_id
+    ]
+    selected.sort(key=lambda sample: (sample.timestamp_ms, str(sample.path), sample.line_no))
+    return selected
+
+
+def select_instance(samples: list[Sample], instance_id: str) -> list[Sample]:
+    selected = [sample for sample in samples if sample.instance_id == instance_id]
+    selected.sort(key=lambda sample: (sample.timestamp_ms, str(sample.path), sample.line_no))
+    return selected
+
+
+def instance_inventory(samples: list[Sample]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[Sample]] = {}
+    for sample in samples:
+        grouped.setdefault((sample.target, sample.instance_id), []).append(sample)
+
+    inventory: list[dict[str, Any]] = []
+    for (target, instance_id), group in grouped.items():
+        ordered = sorted(group, key=lambda sample: (sample.timestamp_ms, str(sample.path), sample.line_no))
+        inventory.append(
+            {
+                "target": target,
+                "instance_id": instance_id,
+                "sample_count": len(ordered),
+                "first_timestamp_ms": ordered[0].timestamp_ms,
+                "last_timestamp_ms": ordered[-1].timestamp_ms,
+                "duration_ms": max(0, ordered[-1].timestamp_ms - ordered[0].timestamp_ms),
+                "kinds": dict(Counter(sample.kind for sample in ordered)),
+            }
+        )
+    inventory.sort(key=lambda item: (item["last_timestamp_ms"], item["target"]), reverse=True)
+    return inventory
 
 
 def infer_kind(raw: dict[str, Any], source: str) -> str:
@@ -370,6 +473,100 @@ def last_attribution_sample(samples: list[Sample]) -> Sample | None:
     return None
 
 
+def build_coverage_report(sample: Sample) -> dict[str, Any]:
+    """Decompose PSS into attributed live, unattributed live heap, allocator
+    retention, file-backed, and stack buckets.
+
+    Uses allocator stats (mallinfo2/jemalloc) plus the newer smaps_rollup and
+    process_diagnostics fields when present; older logs degrade gracefully to
+    whatever fields exist. The key outputs are two coverage ratios:
+    - coverage_ratio_pss: attributed / PSS (the historical, misleading one; the
+      denominator includes allocator retention and file maps).
+    - coverage_ratio_live_heap: attributed / allocator live bytes (estimator
+      quality against the memory the app actually holds).
+
+    Explained PSS follows the in-binary summary definition:
+    total_attributed + allocator_retained_resident_estimate + pss_file +
+    thread_stack_estimate.
+    """
+    pss = sample.pss_bytes
+    attributed = attributed_total_bytes(sample)
+    allocator_live = sample.allocator_allocated_bytes
+    allocator_retained = sample.allocator_retained_bytes
+
+    process_info = sample.process_info
+    os_info = sample.os_info
+    pss_file = first_int(os_info, "pss_file_bytes")
+    pss_anon = first_int(os_info, "pss_anon_bytes")
+    pss_shmem = first_int(os_info, "pss_shmem_bytes")
+    anon_huge_pages = first_int(os_info, "anon_huge_pages_bytes")
+    rss_file = first_int(os_info, "rss_file_bytes")
+    stack_bytes = first_int(process_info, "main_stack_bytes") or first_int(
+        os_info, "main_stack_bytes", "stack_bytes", "vm_stk_bytes"
+    )
+    thread_count = first_int(process_info, "thread_count") or first_int(
+        os_info, "thread_count", "threads"
+    )
+
+    diagnostics = sample.process_diagnostics
+    retained_resident = first_int(
+        diagnostics,
+        "allocator_retained_resident_estimate_bytes",
+        "allocator_retained_bytes",
+    )
+    if retained_resident is None:
+        retained_resident = allocator_retained
+    thread_stack_estimate = first_int(diagnostics, "thread_stack_estimate_bytes")
+    if thread_stack_estimate is None:
+        thread_stack_estimate = stack_bytes
+
+    report: dict[str, Any] = {
+        "timestamp_ms": sample.timestamp_ms,
+        "pss_bytes": pss,
+        "pss_anon_bytes": pss_anon,
+        "pss_file_bytes": pss_file,
+        "pss_shmem_bytes": pss_shmem,
+        "anon_huge_pages_bytes": anon_huge_pages,
+        "rss_file_bytes": rss_file,
+        "main_stack_bytes": stack_bytes,
+        "thread_stack_estimate_bytes": thread_stack_estimate,
+        "thread_count": thread_count,
+        "attributed_live_bytes": attributed,
+        "allocator_live_bytes": allocator_live,
+        "allocator_retained_bytes": allocator_retained,
+        "allocator_retained_resident_estimate_bytes": retained_resident,
+    }
+
+    if attributed is not None and allocator_live is not None:
+        report["unattributed_live_heap_bytes"] = max(0, allocator_live - attributed)
+    if pss is not None and attributed is not None:
+        report["coverage_ratio_pss"] = round(attributed / pss, 4) if pss else 0.0
+    if allocator_live is not None and attributed is not None:
+        report["coverage_ratio_live_heap"] = (
+            round(attributed / allocator_live, 4) if allocator_live else 0.0
+        )
+
+    # Explained PSS matches the in-binary summary: attributed live + allocator
+    # retention (resident estimate) + file-backed PSS + thread stacks. The
+    # remainder is what the buckets still miss (unattributed live heap, shared
+    # anon, allocator metadata).
+    if pss is not None:
+        explained = 0
+        for key in (
+            "attributed_live_bytes",
+            "allocator_retained_resident_estimate_bytes",
+            "pss_file_bytes",
+            "thread_stack_estimate_bytes",
+        ):
+            value = report.get(key)
+            if isinstance(value, int):
+                explained += value
+        report["explained_pss_bytes"] = explained
+        report["unexplained_pss_bytes"] = max(0, pss - explained)
+        report["explained_ratio"] = round(explained / pss, 4) if pss else 0.0
+    return report
+
+
 def count_event_categories(samples: list[Sample]) -> Counter[str]:
     counter: Counter[str] = Counter()
     for sample in samples:
@@ -407,6 +604,226 @@ def process_summary(samples: list[Sample]) -> dict[str, Any]:
     }
 
 
+def session_population_summary(samples: list[Sample]) -> dict[str, Any]:
+    attribution = [
+        sample
+        for sample in samples
+        if sample.sessions and isinstance(sample.sessions.get("live_count"), int | float)
+    ]
+    if not attribution:
+        return {}
+    first = attribution[0]
+    last = attribution[-1]
+    peak = max(attribution, key=lambda sample: int((sample.sessions or {}).get("live_count") or 0))
+    baseline_live = int((first.sessions or {}).get("live_count") or 0)
+    final_live = int((last.sessions or {}).get("live_count") or 0)
+    peak_live = int((peak.sessions or {}).get("live_count") or 0)
+    baseline_allocated = first.allocator_allocated_bytes
+    final_allocated = last.allocator_allocated_bytes
+    net_allocated_growth = (
+        final_allocated - baseline_allocated
+        if final_allocated is not None and baseline_allocated is not None
+        else None
+    )
+    added_sessions = final_live - baseline_live
+    connected_count = first_int(last.raw.get("clients") or {}, "connected_count", "connected_clients")
+    return {
+        "baseline_timestamp_ms": first.timestamp_ms,
+        "final_timestamp_ms": last.timestamp_ms,
+        "baseline_live_sessions": baseline_live,
+        "final_live_sessions": final_live,
+        "peak_live_sessions": peak_live,
+        "peak_timestamp_ms": peak.timestamp_ms,
+        "net_live_session_growth": added_sessions,
+        "final_connected_clients": connected_count,
+        "detached_or_headless_live_sessions": (
+            max(0, final_live - connected_count) if connected_count is not None else None
+        ),
+        "baseline_allocator_live_bytes": baseline_allocated,
+        "final_allocator_live_bytes": final_allocated,
+        "net_allocator_live_growth_bytes": net_allocated_growth,
+        "allocator_growth_per_added_session_bytes": (
+            max(0, net_allocated_growth) // added_sessions
+            if net_allocated_growth is not None and added_sessions > 0
+            else None
+        ),
+    }
+
+
+def build_incident_assessment(
+    samples: list[Sample],
+    process: dict[str, Any],
+    coverage: dict[str, Any] | None,
+    population: dict[str, Any],
+) -> dict[str, Any]:
+    if not samples:
+        return {}
+    final_pss = int(process.get("final_pss_bytes") or 0)
+    growth = int(process.get("net_pss_growth_bytes") or 0)
+    final_live = int(population.get("final_live_sessions") or 0)
+    live_growth = int(population.get("net_live_session_growth") or 0)
+    connected = population.get("final_connected_clients")
+    detached = population.get("detached_or_headless_live_sessions")
+    allocator_live = int((coverage or {}).get("allocator_live_bytes") or 0)
+    attributed = int((coverage or {}).get("attributed_live_bytes") or 0)
+    retained_resident = int(
+        (coverage or {}).get("allocator_retained_resident_estimate_bytes") or 0
+    )
+    coverage_live = (coverage or {}).get("coverage_ratio_live_heap")
+
+    runaway_population = final_live >= 128 and (
+        live_growth >= 64
+        or (isinstance(detached, int) and detached >= 128)
+        or (isinstance(connected, int) and final_live >= max(128, connected * 16))
+    )
+    retention_dominates = (
+        retained_resident >= 256 * 1024 * 1024
+        and final_pss > 0
+        and retained_resident * 4 >= final_pss
+    )
+    attributed_state_dominates = (
+        allocator_live > 0 and attributed >= 512 * 1024 * 1024 and attributed * 2 >= allocator_live
+    )
+
+    if runaway_population:
+        cause = "runaway_live_session_population"
+        confidence = "high"
+        summary = (
+            f"Live Agent population grew from {population.get('baseline_live_sessions')} to "
+            f"{final_live} while allocator live memory grew by "
+            f"{fmt_mb(population.get('net_allocator_live_growth_bytes'))}."
+        )
+        evidence = [
+            f"{final_live} live sessions vs {connected if connected is not None else 'unknown'} connected clients",
+            f"{live_growth:+d} live sessions during this process lifetime",
+            f"{fmt_mb(population.get('allocator_growth_per_added_session_bytes'))} allocator growth per added session",
+            f"allocator live {fmt_mb(allocator_live)} vs attributed session JSON {fmt_mb(attributed)}",
+        ]
+        actions = [
+            {
+                "priority": 1,
+                "action": "Pause or cap the workload creating headless sessions.",
+                "why": "These are live allocations; allocator purge is not the first response.",
+                "commands": ["jcode debug 'server:memory-incident'", "jcode debug 'swarm:list'"],
+            },
+            {
+                "priority": 2,
+                "action": "Inspect the largest live swarm and clean only workers confirmed disposable by its owning coordinator.",
+                "commands": ["Use `swarm list` and `swarm cleanup` from the owning coordinator"],
+            },
+            {
+                "priority": 3,
+                "action": "Re-measure and require live_sessions, allocator live, and PSS to fall together.",
+                "commands": ["python scripts/analyze_runtime_memory_log.py --days 1"],
+            },
+            {
+                "priority": 4,
+                "action": "Purge only after session cleanup if freed-but-held memory remains high.",
+                "commands": ["jcode debug 'allocator:purge'"],
+            },
+        ]
+    elif retention_dominates:
+        cause = "allocator_retention"
+        confidence = "high"
+        summary = "Freed-but-held allocator pages are a material share of current PSS."
+        evidence = [
+            f"retained resident estimate {fmt_mb(retained_resident)}",
+            f"allocator live {fmt_mb(allocator_live)} vs PSS {fmt_mb(final_pss)}",
+        ]
+        actions = [
+            {
+                "priority": 1,
+                "action": "Capture a before/after allocator purge and compare PSS.",
+                "commands": ["jcode debug 'allocator:purge'", "jcode debug 'server:memory-incident'"],
+            },
+            {
+                "priority": 2,
+                "action": "If retained pages repeatedly regrow, inspect allocation churn and allocator decay.",
+                "commands": ["jcode debug 'allocator'", "jcode debug 'allocator:decay:1000'"],
+            },
+        ]
+    elif attributed_state_dominates:
+        cause = "session_payload_growth"
+        confidence = "high"
+        summary = "Tracked transcript, provider-cache, tool-result, or blob state explains most live heap."
+        evidence = [
+            f"attributed live {fmt_mb(attributed)}",
+            f"live-heap attribution coverage {coverage_live:.1%}"
+            if isinstance(coverage_live, int | float)
+            else "live-heap attribution coverage unavailable",
+        ]
+        actions = [
+            {
+                "priority": 1,
+                "action": "Start with the heaviest sessions and dominant payload category in this report.",
+                "commands": ["jcode debug 'server:memory'"],
+            }
+        ]
+    elif allocator_live >= 1024 * 1024 * 1024:
+        cause = "unattributed_live_heap"
+        confidence = "medium"
+        summary = "Live allocator bytes are high, but current application attribution is incomplete."
+        evidence = [
+            f"allocator live {fmt_mb(allocator_live)}",
+            f"attributed live {fmt_mb(attributed)}",
+            f"live-heap attribution coverage {coverage_live:.1%}"
+            if isinstance(coverage_live, int | float)
+            else "live-heap attribution coverage unavailable",
+        ]
+        actions = [
+            {
+                "priority": 1,
+                "action": "Capture full server attribution and add counters for the missing owner.",
+                "commands": ["jcode debug 'server:memory'"],
+            },
+            {
+                "priority": 2,
+                "action": "Use a jemalloc-prof build and heap dump if coverage remains below 50%.",
+                "commands": [
+                    "jcode debug 'allocator:profile:on'",
+                    "jcode debug 'allocator:profile:dump /tmp/jcode-server.heap'",
+                ],
+            },
+        ]
+    elif final_pss >= 1024 * 1024 * 1024:
+        cause = "non_heap_or_mapping_growth"
+        confidence = "medium"
+        summary = "PSS is high without matching allocator live bytes; inspect mappings and threads."
+        evidence = [f"PSS {fmt_mb(final_pss)}", f"allocator live {fmt_mb(allocator_live)}"]
+        actions = [
+            {
+                "priority": 1,
+                "action": "Inspect smaps, pmap, thread count, and shared mappings.",
+                "commands": ["cat /proc/<pid>/smaps_rollup", "pmap -x <pid> | sort -k3 -nr | head"],
+            }
+        ]
+    else:
+        cause = "within_normal_operating_range"
+        confidence = "high"
+        summary = "No server memory incident threshold is exceeded in this process lifetime."
+        evidence = [f"final PSS {fmt_mb(final_pss)}", f"net PSS growth {fmt_signed_mb(growth)}"]
+        actions = [
+            {
+                "priority": 1,
+                "action": "Continue normal monitoring and preserve this process-lifetime baseline.",
+                "commands": ["python scripts/analyze_runtime_memory_log.py --days 1"],
+            }
+        ]
+
+    critical = final_pss >= 2 * 1024 * 1024 * 1024 or growth >= 1024 * 1024 * 1024 or final_live >= 512
+    warning = final_pss >= 1024 * 1024 * 1024 or growth >= 256 * 1024 * 1024 or final_live >= 128
+    severity = "critical" if critical else "warning" if warning else "healthy"
+    return {
+        "severity": severity,
+        "primary_cause": cause,
+        "confidence": confidence,
+        "summary": summary,
+        "evidence": evidence,
+        "recommended_actions": actions,
+        "runbook": "docs/MEMORY_INCIDENT_RUNBOOK.md",
+    }
+
+
 def build_server_hints(samples: list[Sample], session_peaks: list[dict[str, Any]]) -> list[str]:
     hints: list[str] = []
     last_attr = last_attribution_sample(samples)
@@ -419,6 +836,13 @@ def build_server_hints(samples: list[Sample], session_peaks: list[dict[str, Any]
     tool_result_bytes = int(sessions.get("total_tool_result_bytes") or 0)
     large_blob_bytes = int(sessions.get("total_large_blob_bytes") or 0)
     payload_text_bytes = int(sessions.get("total_payload_text_bytes") or 0)
+    population = session_population_summary(samples)
+
+    if int(population.get("final_live_sessions") or 0) >= 128:
+        hints.append(
+            f"Live session population is high ({population['final_live_sessions']} sessions, "
+            f"{population.get('final_connected_clients') or 0} connected clients). Reduce or cap session population before optimizing individual transcripts."
+        )
 
     if total_json > 0 and provider_cache_json / total_json >= 0.35:
         hints.append(
@@ -525,6 +949,25 @@ def build_client_hints(samples: list[Sample], client_peaks: list[dict[str, Any]]
             f"Remote session metadata is non-trivial ({remote_state / total:.0%} of attributed client memory). Review retained model/session lists and remote bootstrap state."
         )
 
+    coverage = build_coverage_report(last_attr)
+    pss = coverage.get("pss_bytes")
+    retained = coverage.get("allocator_retained_resident_estimate_bytes")
+    if isinstance(pss, int) and isinstance(retained, int) and pss > 0 and retained / pss >= 0.30:
+        hints.append(
+            f"Allocator retention dominates PSS ({retained / pss:.0%}, {fmt_mb(retained)}). This is freed-but-held heap, not live app state; malloc_trim/purge cadence matters more than estimator coverage here."
+        )
+    unattributed_live = coverage.get("unattributed_live_heap_bytes")
+    live = coverage.get("allocator_live_bytes")
+    if (
+        isinstance(unattributed_live, int)
+        and isinstance(live, int)
+        and live > 0
+        and unattributed_live / live >= 0.40
+    ):
+        hints.append(
+            f"Estimators miss {unattributed_live / live:.0%} of live heap ({fmt_mb(unattributed_live)}). The real estimator gap is tokio/render/runtime structures, not allocator slack."
+        )
+
     if client_peaks:
         heaviest = client_peaks[0]
         hints.append(
@@ -545,13 +988,24 @@ def summarize_target(samples: list[Sample], top_n: int, min_spike_bytes: int) ->
     event_counts = count_event_categories(samples)
     proc = process_summary(samples)
     last_attr = last_attribution_sample(samples)
+    coverage = build_coverage_report(last_attr) if last_attr else None
+    population = session_population_summary(samples) if target == "server" else {}
+    incident = (
+        build_incident_assessment(samples, proc, coverage, population)
+        if target == "server"
+        else {}
+    )
     summary = {
         "target": target,
+        "instance_id": samples[-1].instance_id if samples else None,
         "sample_count": len(samples),
         "first_timestamp_ms": samples[0].timestamp_ms if samples else None,
         "last_timestamp_ms": samples[-1].timestamp_ms if samples else None,
         "kinds": Counter(sample.kind for sample in samples),
         "process": proc,
+        "coverage": coverage,
+        "session_population": population,
+        "incident": incident,
         "last_attribution": {
             "timestamp_ms": last_attr.timestamp_ms,
             "sessions": last_attr.sessions,
@@ -636,6 +1090,8 @@ def print_human(summary: dict[str, Any], paths: list[Path]) -> None:
         for path in paths:
             print(f"  - {path}")
     print(f"samples: {summary['sample_count']}")
+    if summary.get("instance_id"):
+        print(f"instance: {summary['instance_id']}")
     if summary.get("first_timestamp_ms") is not None:
         print(f"window: {fmt_ts(summary['first_timestamp_ms'])} -> {fmt_ts(summary['last_timestamp_ms'])}")
         print(
@@ -658,6 +1114,77 @@ def print_human(summary: dict[str, Any], paths: list[Path]) -> None:
         print(
             f"allocator: allocated {fmt_mb(proc.get('allocator_allocated_bytes'))} | resident {fmt_mb(proc.get('allocator_resident_bytes'))} | retained {fmt_mb(proc.get('allocator_retained_bytes'))}"
         )
+
+    population = summary.get("session_population") or {}
+    if population:
+        print("\nSession population")
+        print("------------------")
+        print(
+            f"live sessions:     {population.get('baseline_live_sessions')} -> {population.get('final_live_sessions')} "
+            f"({population.get('net_live_session_growth'):+d}) | peak {population.get('peak_live_sessions')}"
+        )
+        print(
+            f"connected clients: {population.get('final_connected_clients') if population.get('final_connected_clients') is not None else 'n/a'} | "
+            f"detached/headless {population.get('detached_or_headless_live_sessions') if population.get('detached_or_headless_live_sessions') is not None else 'n/a'}"
+        )
+        print(
+            f"allocator growth:  {fmt_signed_mb(population.get('net_allocator_live_growth_bytes'))} | "
+            f"{fmt_mb(population.get('allocator_growth_per_added_session_bytes'))} per added session"
+        )
+
+    incident = summary.get("incident") or {}
+    if incident:
+        print("\nIncident assessment")
+        print("-------------------")
+        print(
+            f"severity: {incident.get('severity')} | cause: {incident.get('primary_cause')} | confidence: {incident.get('confidence')}"
+        )
+        print(incident.get("summary") or "")
+        for item in incident.get("evidence") or []:
+            print(f"- evidence: {item}")
+        print("next actions:")
+        for action in incident.get("recommended_actions") or []:
+            print(f"  {action.get('priority')}. {action.get('action')}")
+            if action.get("why"):
+                print(f"     why: {action['why']}")
+            for command in action.get("commands") or []:
+                print(f"     $ {command}")
+
+    coverage = summary.get("coverage") or {}
+    if coverage:
+        print("\nAttribution coverage (last attribution sample)")
+        print("----------------------------------------------")
+        print(f"PSS:                {fmt_mb(coverage.get('pss_bytes'))}")
+        if coverage.get("pss_anon_bytes") is not None or coverage.get("pss_file_bytes") is not None:
+            print(
+                f"PSS split:          anon {fmt_mb(coverage.get('pss_anon_bytes'))} | file {fmt_mb(coverage.get('pss_file_bytes'))} | shmem {fmt_mb(coverage.get('pss_shmem_bytes'))}"
+            )
+        print(f"attributed live:    {fmt_mb(coverage.get('attributed_live_bytes'))}")
+        print(f"allocator live:     {fmt_mb(coverage.get('allocator_live_bytes'))}")
+        if coverage.get("unattributed_live_heap_bytes") is not None:
+            print(f"unattributed live:  {fmt_mb(coverage.get('unattributed_live_heap_bytes'))}")
+        print(
+            f"allocator retained: {fmt_mb(coverage.get('allocator_retained_resident_estimate_bytes'))}"
+        )
+        if coverage.get("main_stack_bytes") is not None or coverage.get("thread_count") is not None:
+            threads = coverage.get("thread_count")
+            print(
+                f"stacks/threads:     main stack {fmt_mb(coverage.get('main_stack_bytes'))} | stack estimate {fmt_mb(coverage.get('thread_stack_estimate_bytes'))} | threads {threads if threads is not None else 'n/a'}"
+            )
+        ratio_pss = coverage.get("coverage_ratio_pss")
+        ratio_live = coverage.get("coverage_ratio_live_heap")
+        if ratio_pss is not None or ratio_live is not None:
+            pss_text = f"{ratio_pss:.1%}" if isinstance(ratio_pss, int | float) else "n/a"
+            live_text = f"{ratio_live:.1%}" if isinstance(ratio_live, int | float) else "n/a"
+            print(f"coverage:           vs PSS {pss_text} | vs live heap {live_text}")
+        if coverage.get("explained_pss_bytes") is not None:
+            explained_ratio = coverage.get("explained_ratio")
+            ratio_text = (
+                f"{explained_ratio:.1%}" if isinstance(explained_ratio, int | float) else "n/a"
+            )
+            print(
+                f"explained PSS:      {fmt_mb(coverage.get('explained_pss_bytes'))} ({ratio_text}) | unexplained {fmt_mb(coverage.get('unexplained_pss_bytes'))}"
+            )
 
     print("\nEvent counts")
     print("------------")
@@ -721,6 +1248,18 @@ def to_jsonable(value: Any) -> Any:
     return value
 
 
+def print_instance_inventory(inventory: list[dict[str, Any]], paths: list[Path]) -> None:
+    print("Runtime Memory Process Instances")
+    print("================================")
+    print(f"files: {len(paths)}")
+    for item in inventory:
+        print(
+            f"{item['instance_id']} | target={item['target']} | samples={item['sample_count']} | "
+            f"{fmt_ts(item['first_timestamp_ms'])} -> {fmt_ts(item['last_timestamp_ms'])} | "
+            f"duration={fmt_duration_ms(item['duration_ms'])}"
+        )
+
+
 def main() -> int:
     args = parse_args()
     paths = resolve_paths(args)
@@ -729,6 +1268,30 @@ def main() -> int:
     samples = load_samples(paths)
     if not samples:
         raise SystemExit("No runtime memory samples found in selected files.")
+    inventory = instance_inventory(samples)
+    if args.list_instances:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "files": [str(path) for path in paths],
+                        "instances": inventory,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print_instance_inventory(inventory, paths)
+        return 0
+    if args.instance:
+        samples = select_instance(samples, args.instance)
+        if not samples:
+            available = ", ".join(item["instance_id"] for item in inventory)
+            raise SystemExit(
+                f"Process instance {args.instance!r} was not found. Available instances: {available}"
+            )
+    elif not args.all_instances:
+        samples = select_latest_instances(samples)
     summary = summarize(samples, top_n=args.top, min_spike_bytes=int(args.min_spike_mb * 1024 * 1024))
     if args.json:
         payload = to_jsonable(summary)

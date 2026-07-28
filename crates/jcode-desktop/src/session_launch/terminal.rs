@@ -1,6 +1,7 @@
 use super::launch_resume_session;
 use anyhow::{Context, Result};
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub(super) fn launch_first_available_terminal(
@@ -34,12 +35,32 @@ pub(super) fn launch_first_available_terminal(
 }
 
 pub(super) fn terminal_candidates(title: &str, jcode_args: &[&str]) -> Vec<Command> {
+    terminal_candidates_with_working_dir(
+        title,
+        jcode_args,
+        super::default_desktop_working_dir().as_deref(),
+    )
+}
+
+pub(super) fn terminal_candidates_in_dir(
+    title: &str,
+    jcode_args: &[&str],
+    working_dir: &Path,
+) -> Vec<Command> {
+    terminal_candidates_with_working_dir(title, jcode_args, Some(working_dir))
+}
+
+fn terminal_candidates_with_working_dir(
+    title: &str,
+    jcode_args: &[&str],
+    working_dir: Option<&Path>,
+) -> Vec<Command> {
     let mut candidates = Vec::new();
 
     if let Ok(raw_terminal) = std::env::var("JCODE_DESKTOP_TERMINAL") {
         match terminal_env_command(&raw_terminal, jcode_args) {
             Ok(mut command) => {
-                apply_default_working_dir(&mut command);
+                apply_working_dir(&mut command, working_dir);
                 candidates.push(command);
             }
             Err(error) => crate::desktop_log::warn(format_args!(
@@ -52,19 +73,37 @@ pub(super) fn terminal_candidates(title: &str, jcode_args: &[&str]) -> Vec<Comma
         "footclient",
         &["-T", title, "--"],
         jcode_args,
+        working_dir,
     ));
-    candidates.push(terminal_command("foot", &["-T", title, "--"], jcode_args));
-    candidates.push(terminal_command("kitty", &["--title", title], jcode_args));
+    candidates.push(terminal_command(
+        "foot",
+        &["-T", title, "--"],
+        jcode_args,
+        working_dir,
+    ));
+    candidates.push(terminal_command(
+        "kitty",
+        &["--title", title],
+        jcode_args,
+        working_dir,
+    ));
     candidates.push(terminal_command(
         "alacritty",
         &["-t", title, "-e"],
         jcode_args,
+        working_dir,
     ));
-    candidates.push(terminal_command("wezterm", &["start", "--"], jcode_args));
+    candidates.push(terminal_command(
+        "wezterm",
+        &["start", "--"],
+        jcode_args,
+        working_dir,
+    ));
     candidates.push(terminal_command(
         "x-terminal-emulator",
         &["-T", title, "-e"],
         jcode_args,
+        working_dir,
     ));
 
     candidates
@@ -155,6 +194,7 @@ fn terminal_command(
     program: impl AsRef<str>,
     prefix_args: &[&str],
     jcode_args: &[&str],
+    working_dir: Option<&Path>,
 ) -> Command {
     let mut command = Command::new(program.as_ref());
     command
@@ -164,12 +204,12 @@ fn terminal_command(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    apply_default_working_dir(&mut command);
+    apply_working_dir(&mut command, working_dir);
     command
 }
 
-fn apply_default_working_dir(command: &mut Command) {
-    if let Some(working_dir) = super::default_desktop_working_dir() {
+fn apply_working_dir(command: &mut Command, working_dir: Option<&Path>) {
+    if let Some(working_dir) = working_dir {
         command.current_dir(working_dir);
     }
 }

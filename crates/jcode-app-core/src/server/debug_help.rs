@@ -32,7 +32,7 @@ SERVER COMMANDS (server: prefix or no prefix):
   agent:info               - Get comprehensive agent internal state
   agent:memory             - Get process + session memory breakdown
   allocator                - Get allocator info and jemalloc stats, if available
-  allocator:purge          - Flush/purge jemalloc arenas to test retained-memory behavior
+  allocator:purge          - Release retained heap (jemalloc arena purge / glibc malloc_trim)
   allocator:decay:<ms>     - Set jemalloc dirty/muzzy decay for all arenas to <ms>
   allocator:profile:on     - Enable jemalloc sampling at runtime (jemalloc-prof builds)
   allocator:profile:off    - Disable jemalloc sampling at runtime (jemalloc-prof builds)
@@ -45,8 +45,10 @@ SERVER COMMANDS (server: prefix or no prefix):
   jobs:purge               - Remove completed/failed jobs
   jobs:session:<id>        - List jobs for a session
   background:tasks         - List background tasks
+  server:memory-incident   - Fast cause classification + prescribed next actions
   server:memory            - Get global server memory breakdown
   server:memory-history    - Recent server process memory samples
+  memory-judge             - No-LLM memory-mode conversion + degradation rates
   embeddings:stats         - Get embedding model/cache runtime stats
   embeddings:load          - Force-load the shared embedding model
   embeddings:unload        - Force-unload the shared embedding model and cache
@@ -116,7 +118,8 @@ CLIENT COMMANDS (client: prefix):
   client:layout            - Get latest layout JSON
   client:margins           - Get layout margins JSON
   client:widgets           - Get info widget summary/placements
-  client:render-stats      - Get render timing + order JSON
+  client:render-stats      - Get render timing + order + draw-call attribution JSON
+  client:draw-stats [n]    - Get per-draw attribution history (render_ms, changed cells)
   client:render-order      - Get render order list
   client:anomalies         - Get latest visual debug anomalies
   client:theme             - Get palette snapshot
@@ -124,6 +127,7 @@ CLIENT COMMANDS (client: prefix):
   client:mermaid:memory    - Mermaid memory profile (RSS + cache estimates)
   client:mermaid:memory-bench [n] - Synthetic Mermaid memory benchmark
   client:mermaid:flicker-bench [n] - Benchmark viewport protocol churn / flicker risk
+  client:image-scroll-bench [imgs] [frames] [visible] - Benchmark inline-image scroll latency (stat syscalls + fit-state rebuilds)
   client:mermaid:ui-bench[:<j>] - Benchmark live Mermaid UI render path
   client:mermaid:cache     - List mermaid cache entries
   client:mermaid:state     - Get image state (resize modes)
@@ -135,6 +139,8 @@ CLIENT COMMANDS (client: prefix):
   client:markdown:memory   - Markdown highlight cache memory estimate
   client:memory            - Aggregate client memory profile
   client:memory-history    - Recent client process memory samples
+  client:allocator         - Get the target TUI client's allocator stats
+  client:allocator:purge   - Release the target TUI client's retained heap
   client:flicker-frames [n] - Recent frame-stability / flicker records
   client:slow-frames [n]  - Recent slow-frame records
   client:overlay:on/off    - Toggle overlay boxes
@@ -194,6 +200,7 @@ PLANS (server-scoped plan items):
   swarm:plans              - List all swarm plans with item counts
   swarm:plan:<swarm_id>    - Get plan items for specific swarm
   swarm:plan_version:<id>  - Show current plan version for a swarm
+  swarm:clear_plan:<id>    - Admin: delete a swarm's plan (memory + persisted state)
 
 PLAN PROPOSALS (pending approval):
   swarm:proposals          - List all pending proposals across swarms

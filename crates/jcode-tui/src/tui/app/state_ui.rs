@@ -22,9 +22,23 @@ pub(super) struct RestoredReloadInput {
     pub observe_page_updated_at_ms: u64,
     pub split_view_enabled: bool,
     pub todos_view_enabled: bool,
+    pub todo_confidence_spike_challenged: bool,
 }
 
 impl App {
+    pub(super) fn append_live_inline_images(
+        &mut self,
+        images: Vec<crate::session::RenderedImage>,
+    ) -> bool {
+        if images.is_empty() {
+            return false;
+        }
+        self.remote_side_pane_images.extend(images);
+        self.invalidate_side_pane_images_signature();
+        self.update_pinned_images_auto_hide();
+        true
+    }
+
     fn recompute_display_message_stats(&mut self) {
         self.display_user_message_count = self
             .display_messages
@@ -34,14 +48,35 @@ impl App {
         self.display_edit_tool_message_count = self
             .display_messages
             .iter()
-            .filter(|message| {
-                message
-                    .tool_data
-                    .as_ref()
-                    .map(|tool| tools_ui::is_edit_tool_name(&tool.name))
-                    .unwrap_or(false)
-            })
+            .filter(|message| Self::display_message_is_edit_tool(message))
             .count();
+    }
+
+    /// Whether a single display message counts as an edit-tool message for the
+    /// incrementally-maintained `display_edit_tool_message_count`.
+    fn display_message_is_edit_tool(message: &DisplayMessage) -> bool {
+        message
+            .tool_data
+            .as_ref()
+            .map(|tool| tools_ui::is_edit_tool_name(&tool.name))
+            .unwrap_or(false)
+    }
+
+    /// Fold a single message into the cached display-message counters with the
+    /// given sign (+1 when added, -1 when removed). This keeps the counters
+    /// O(1) per mutation instead of rescanning the whole transcript via
+    /// `recompute_display_message_stats`, which made appending M messages one at
+    /// a time cumulatively O(M^2).
+    pub(super) fn adjust_display_message_stats(&mut self, message: &DisplayMessage, added: bool) {
+        let delta: isize = if added { 1 } else { -1 };
+        if message.effective_role() == "user" {
+            self.display_user_message_count =
+                (self.display_user_message_count as isize + delta).max(0) as usize;
+        }
+        if Self::display_message_is_edit_tool(message) {
+            self.display_edit_tool_message_count =
+                (self.display_edit_tool_message_count as isize + delta).max(0) as usize;
+        }
     }
 
     pub(super) fn active_client_session_id(&self) -> Option<&str> {
@@ -74,9 +109,59 @@ impl App {
     }
 
     pub(super) fn note_client_interaction(&mut self) {
+        // A terminal only delivers key/mouse/paste events to the focused window,
+        // so receiving one is proof this window is focused *right now*. Adopt that
+        // focus state directly instead of relying solely on FocusGained reports:
+        // some compositors/multiplexers (Wayland tiling WMs, tmux, certain SSH
+        // setups) can drop a FocusGained after a FocusLost, leaving the window
+        // wrongly stuck as "unfocused idle". In that state the run loop throttles
+        // repaints to ~1 Hz, so scrolling updates state but the screen only
+        // repaints about once a second -- the intermittent "can't scroll" bug.
+        if !self.client_focused {
+            self.set_client_focused(true);
+        }
         if !crate::perf::tui_policy().enable_focus_change {
             self.note_client_focus(false);
         }
+    }
+
+    /// Whether the client terminal currently has focus. Used to pause decorative
+    /// animations and periodic idle redraws for backgrounded windows/tabs.
+    pub(crate) fn client_focused(&self) -> bool {
+        self.client_focused
+    }
+
+    /// Record a terminal focus-state change (from crossterm FocusGained/FocusLost).
+    /// Returns true when a redraw is warranted (focus regained, so we repaint at
+    /// full fidelity immediately).
+    pub(super) fn set_client_focused(&mut self, focused: bool) -> bool {
+        if self.client_focused == focused {
+            return false;
+        }
+        self.client_focused = focused;
+        if focused {
+            // Repaint immediately so a newly-focused window is not stuck on the
+            // last paused frame, and resume animation timing from "now".
+            self.request_full_redraw();
+            self.note_client_focus(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a redraw is worth performing while the terminal is unfocused.
+    ///
+    /// In a tiling WM an unfocused window can still be visible, so sessions with
+    /// live output (streaming/processing, scroll/scroll-copy animations, an active
+    /// notification, a rate-limit countdown, or a transient remote startup phase)
+    /// keep painting. A purely idle unfocused session skips redraws triggered by
+    /// shared-server bus chatter from other sessions; it repaints fully on refocus.
+    ///
+    /// Reuses `periodic_redraw_required`, which already enumerates the live-activity
+    /// conditions, minus the purely decorative idle donut (gated off when unfocused).
+    pub(crate) fn unfocused_redraw_warranted(&self) -> bool {
+        crate::tui::periodic_redraw_required(self)
     }
 
     pub fn display_messages(&self) -> &[DisplayMessage] {
@@ -85,6 +170,20 @@ impl App {
 
     pub(super) fn bump_display_messages_version(&mut self) {
         self.recompute_display_message_stats();
+        self.bump_display_messages_version_no_stats();
+    }
+
+    /// Drop the cached inline-image signature so the next prepared frame
+    /// recomputes it. Needed when the image set changes without a
+    /// display-messages mutation (e.g. a live SidePaneImages event).
+    pub(super) fn invalidate_side_pane_images_signature(&mut self) {
+        self.side_pane_images_signature_cache.set(None);
+    }
+
+    /// Bump the display-messages version without rescanning the transcript to
+    /// recompute counters. Callers that have already maintained the cached
+    /// counters incrementally (e.g. a single append) use this to stay O(1).
+    pub(super) fn bump_display_messages_version_no_stats(&mut self) {
         self.display_messages_version = self.display_messages_version.wrapping_add(1);
         self.bump_context_revision();
         self.refresh_split_view_if_needed();
@@ -100,6 +199,17 @@ impl App {
                 && !pending.is_system
                 && (!pending.content.trim().is_empty() || !pending.images.is_empty())
         });
+        // A queued follow-up that was dequeued and is currently in flight lives
+        // only in `rate_limit_pending_message` (is_system). Without a scheduled
+        // retry reset, that shape has no dispatch path after a restore (the
+        // tick resend requires `rate_limit_reset`), so persist it back into
+        // the queued/hidden lists instead; the restored queue re-sends it once
+        // the turn is proven idle (issue #391).
+        let inflight_continuation = self.rate_limit_pending_message.as_ref().filter(|pending| {
+            pending.is_system
+                && self.rate_limit_reset.is_none()
+                && (!pending.content.trim().is_empty() || pending.system_reminder.is_some())
+        });
         if self.input.is_empty()
             && self.pending_images.is_empty()
             && self.queued_messages.is_empty()
@@ -112,37 +222,67 @@ impl App {
             && !self.observe_mode_enabled
             && !self.split_view_enabled
             && !self.todos_view_enabled
+            && !self.todo_confidence_spike_challenged
         {
+            // Nothing to save, but a stale file from an earlier run could
+            // still hold old queued messages/input. Leaving it behind would
+            // resurrect that stale state on the next restore. Only remove
+            // clearly stale files: another client attached to the same session
+            // may have just saved ITS queued messages during the same reload
+            // handoff, and deleting a fresh file here would drop them.
+            if let Ok(jcode_dir) = crate::storage::jcode_dir() {
+                let path = jcode_dir.join(format!("client-input-{}", session_id));
+                let is_stale = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(300));
+                if is_stale {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
             return;
         }
         if let Ok(jcode_dir) = crate::storage::jcode_dir() {
             let path = jcode_dir.join(format!("client-input-{}", session_id));
-            let rate_limit_reset_in_ms = if resume_prompt.is_some() {
-                None
-            } else {
-                self.rate_limit_reset.map(|reset| {
-                    let now = Instant::now();
-                    if reset <= now {
-                        0
-                    } else {
-                        (reset - now).as_millis().min(u64::MAX as u128) as u64
-                    }
-                })
-            };
-            let rate_limit_pending_message = if resume_prompt.is_some() {
-                None
-            } else {
-                self.rate_limit_pending_message.as_ref().map(|pending| {
-                    serde_json::json!({
-                        "content": pending.content,
-                        "images": pending.images,
-                        "is_system": pending.is_system,
-                        "system_reminder": pending.system_reminder,
-                        "auto_retry": pending.auto_retry,
-                        "retry_attempts": pending.retry_attempts,
+            let rate_limit_reset_in_ms =
+                if resume_prompt.is_some() || inflight_continuation.is_some() {
+                    None
+                } else {
+                    self.rate_limit_reset.map(|reset| {
+                        let now = Instant::now();
+                        if reset <= now {
+                            0
+                        } else {
+                            (reset - now).as_millis().min(u64::MAX as u128) as u64
+                        }
                     })
-                })
-            };
+                };
+            let rate_limit_pending_message =
+                if resume_prompt.is_some() || inflight_continuation.is_some() {
+                    None
+                } else {
+                    self.rate_limit_pending_message.as_ref().map(|pending| {
+                        serde_json::json!({
+                            "content": pending.content,
+                            "images": pending.images,
+                            "is_system": pending.is_system,
+                            "system_reminder": pending.system_reminder,
+                            "auto_retry": pending.auto_retry,
+                            "retry_attempts": pending.retry_attempts,
+                        })
+                    })
+                };
+            let mut queued_messages = self.queued_messages.clone();
+            let mut hidden_queued_system_messages = self.hidden_queued_system_messages.clone();
+            if let Some(pending) = inflight_continuation {
+                if !pending.content.trim().is_empty() {
+                    queued_messages.insert(0, pending.content.clone());
+                }
+                if let Some(reminder) = pending.system_reminder.clone() {
+                    hidden_queued_system_messages.insert(0, reminder);
+                }
+            }
             let resume_input = resume_prompt.map(|pending| pending.content.as_str());
             let resume_images = resume_prompt.map(|pending| pending.images.as_slice());
             let rate_limit_reset_in_ms =
@@ -160,8 +300,8 @@ impl App {
                     "data": data,
                 })).collect::<Vec<_>>(),
                 "submit_on_restore": resume_prompt.is_some(),
-                "queued_messages": self.queued_messages,
-                "hidden_queued_system_messages": self.hidden_queued_system_messages,
+                "queued_messages": queued_messages,
+                "hidden_queued_system_messages": hidden_queued_system_messages,
                 "interleave_message": self.interleave_message,
                 "pending_soft_interrupts": self.pending_soft_interrupts,
                 "pending_soft_interrupt_resend": pending_soft_interrupt_resend,
@@ -172,6 +312,7 @@ impl App {
                 "observe_page_updated_at_ms": self.observe_page_updated_at_ms,
                 "split_view_enabled": self.split_view_enabled,
                 "todos_view_enabled": self.todos_view_enabled,
+                "todo_confidence_spike_challenged": self.todo_confidence_spike_challenged,
             });
             let _ = std::fs::write(&path, data.to_string());
         }
@@ -388,6 +529,10 @@ impl App {
                 .get("todos_view_enabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let todo_confidence_spike_challenged = value
+                .get("todo_confidence_spike_challenged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let cursor = cursor.min(input.len());
             return Some(RestoredReloadInput {
                 input,
@@ -408,6 +553,7 @@ impl App {
                 observe_page_updated_at_ms,
                 split_view_enabled,
                 todos_view_enabled,
+                todo_confidence_spike_challenged,
             });
         }
 
@@ -433,6 +579,7 @@ impl App {
             observe_page_updated_at_ms: 0,
             split_view_enabled: false,
             todos_view_enabled: false,
+            todo_confidence_spike_challenged: false,
         })
     }
 
@@ -600,6 +747,28 @@ impl App {
         self.prewarm_focused_side_panel();
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_remote_server_identity_for_tests(
+        &mut self,
+        name: Option<&str>,
+        icon: Option<&str>,
+        version: Option<&str>,
+        session_id: Option<&str>,
+    ) {
+        self.is_remote = true;
+        self.remote_server_short_name = name.map(str::to_string);
+        self.remote_server_icon = icon.map(str::to_string);
+        self.remote_server_version = version.map(str::to_string);
+        self.remote_session_id = session_id.map(str::to_string);
+    }
+
+    /// Set the displayed remote connection type (e.g. "https/sse") for header
+    /// tests. `None` clears it (unknown connection).
+    #[cfg(test)]
+    pub(crate) fn set_connection_type_for_tests(&mut self, connection_type: Option<&str>) {
+        self.connection_type = connection_type.map(str::to_string);
+    }
+
     fn prewarm_focused_side_panel(&self) {
         let Ok((terminal_width, terminal_height)) = crossterm::terminal::size() else {
             return;
@@ -649,7 +818,7 @@ impl App {
                     tool_data: m.tool_data.clone(),
                 })
                 .collect(),
-            streaming_text: self.streaming_text.clone(),
+            streaming_text: self.streaming.streaming_text.clone(),
             streaming_tool_calls: self.streaming_tool_calls.clone(),
             input: self.input.clone(),
             cursor_pos: self.cursor_pos,
@@ -670,10 +839,10 @@ impl App {
                 .map(|s| s.name.clone())
                 .collect(),
             session_id: self.provider_session_id.clone(),
-            input_tokens: self.streaming_input_tokens,
-            output_tokens: self.streaming_output_tokens,
-            cache_read_input_tokens: self.streaming_cache_read_tokens,
-            cache_creation_input_tokens: self.streaming_cache_creation_tokens,
+            input_tokens: self.streaming.streaming_input_tokens,
+            output_tokens: self.streaming.streaming_output_tokens,
+            cache_read_input_tokens: self.streaming.streaming_cache_read_tokens,
+            cache_creation_input_tokens: self.streaming.streaming_cache_creation_tokens,
             queued_messages: self.queued_messages.clone(),
         }
     }
@@ -782,7 +951,7 @@ fn grouped_u64(value: u64) -> String {
     let raw = value.to_string();
     let mut grouped = String::with_capacity(raw.len() + raw.len() / 3);
     for (index, ch) in raw.chars().enumerate() {
-        if index > 0 && (raw.len() - index) % 3 == 0 {
+        if index > 0 && (raw.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(ch);
@@ -828,7 +997,7 @@ fn human_count(value: u64) -> String {
 }
 
 fn bold_count(value: u64) -> String {
-    format!("{}", human_count(value))
+    human_count(value).to_string()
 }
 
 fn bold_count_usize(value: usize) -> String {
@@ -847,7 +1016,7 @@ fn opt_usize(value: Option<usize>) -> String {
 
 fn opt_string(value: Option<&str>) -> String {
     value
-        .map(|value| format!("{}", value))
+        .map(|value| value.to_string())
         .unwrap_or_else(|| "None".to_string())
 }
 
@@ -956,44 +1125,65 @@ fn format_cache_stats(app: &App) -> String {
     let remote_cache_write = remote_usage
         .map(|usage| usage.cache_creation_input_tokens)
         .unwrap_or(0);
-    let reported = remote_cache_reported.saturating_add(app.total_cache_reported_input_tokens);
-    let read = remote_cache_read.saturating_add(app.total_cache_read_tokens);
-    let write = remote_cache_write.saturating_add(app.total_cache_creation_tokens);
-    let optimal = app.total_cache_optimal_input_tokens;
-    let read_pct = cache_ratio_pct(read, reported);
-    let write_pct = cache_ratio_pct(write, reported);
+    let reported = remote_cache_reported
+        .saturating_add(app.token_accounting.total_cache_reported_input_tokens);
+    let read = remote_cache_read.saturating_add(app.token_accounting.total_cache_read_tokens);
+    let write = remote_cache_write.saturating_add(app.token_accounting.total_cache_creation_tokens);
+    let optimal = app.token_accounting.total_cache_optimal_input_tokens;
+    // `reported` is the aggregate of provider-reported `input_tokens`, which for
+    // split-accounting providers (Anthropic) excludes cached + cache-creation
+    // tokens. Percentages must use the effective prompt size so they stay in
+    // 0-100% instead of clamping at 100%.
+    let effective_reported =
+        crate::tui::info_widget::effective_prompt_tokens(reported, read, write);
+    let read_pct = cache_ratio_pct(read, effective_reported);
+    let write_pct = cache_ratio_pct(write, effective_reported);
     let optimal_pct = (optimal > 0).then(|| cache_ratio_pct(read, optimal));
     let cache_totals_source = match (
         remote_usage.is_some(),
-        app.total_cache_reported_input_tokens > 0,
+        app.token_accounting.total_cache_reported_input_tokens > 0,
     ) {
         (true, true) => "remote_history+client_observed_api_calls",
         (true, false) => "remote_history",
         (false, true) => "client_observed_api_calls",
         (false, false) => "none_yet",
     };
-    let live_cache_telemetry = app.streaming_input_tokens > 0
-        && !app.current_api_usage_recorded
-        && (app.streaming_cache_read_tokens.is_some()
-            || app.streaming_cache_creation_tokens.is_some());
+    let live_cache_telemetry = app.streaming.streaming_input_tokens > 0
+        && !app.kv_cache.current_api_usage_recorded
+        && (app.streaming.streaming_cache_read_tokens.is_some()
+            || app.streaming.streaming_cache_creation_tokens.is_some());
     let live_reported = if live_cache_telemetry {
-        app.streaming_input_tokens
+        app.streaming.streaming_input_tokens
     } else {
         0
     };
     let reported_including_live = reported.saturating_add(live_reported);
     let read_including_live = read.saturating_add(if live_cache_telemetry {
-        app.streaming_cache_read_tokens.unwrap_or(0)
+        app.streaming.streaming_cache_read_tokens.unwrap_or(0)
     } else {
         0
     });
     let write_including_live = write.saturating_add(if live_cache_telemetry {
-        app.streaming_cache_creation_tokens.unwrap_or(0)
+        app.streaming.streaming_cache_creation_tokens.unwrap_or(0)
     } else {
         0
     });
-    let read_pct_including_live = cache_ratio_pct(read_including_live, reported_including_live);
-    let write_pct_including_live = cache_ratio_pct(write_including_live, reported_including_live);
+    let read_pct_including_live = cache_ratio_pct(
+        read_including_live,
+        crate::tui::info_widget::effective_prompt_tokens(
+            reported_including_live,
+            read_including_live,
+            write_including_live,
+        ),
+    );
+    let write_pct_including_live = cache_ratio_pct(
+        write_including_live,
+        crate::tui::info_widget::effective_prompt_tokens(
+            reported_including_live,
+            read_including_live,
+            write_including_live,
+        ),
+    );
     let ttl = if crate::provider::anthropic::is_cache_ttl_1h() {
         "1 hour"
     } else {
@@ -1082,9 +1272,11 @@ fn format_cache_stats(app: &App) -> String {
     let (history_input_tokens, history_output_tokens, totals_source) = if app.is_remote {
         if let Some((input, output)) = remote_history_tokens {
             (
-                input.saturating_add(app.total_input_tokens),
-                output.saturating_add(app.total_output_tokens),
-                if app.total_input_tokens > 0 || app.total_output_tokens > 0 {
+                input.saturating_add(app.token_accounting.total_input_tokens),
+                output.saturating_add(app.token_accounting.total_output_tokens),
+                if app.token_accounting.total_input_tokens > 0
+                    || app.token_accounting.total_output_tokens > 0
+                {
                     "remote_history+client_observed_api_calls"
                 } else {
                     "remote_history"
@@ -1092,27 +1284,27 @@ fn format_cache_stats(app: &App) -> String {
             )
         } else {
             (
-                app.total_input_tokens,
-                app.total_output_tokens,
+                app.token_accounting.total_input_tokens,
+                app.token_accounting.total_output_tokens,
                 "client_observed_api_calls",
             )
         }
     } else {
         (
-            app.total_input_tokens,
-            app.total_output_tokens,
+            app.token_accounting.total_input_tokens,
+            app.token_accounting.total_output_tokens,
             "local_completed_turns",
         )
     };
     let live_unrecorded_input_tokens =
-        if app.streaming_input_tokens > 0 && !app.current_api_usage_recorded {
-            app.streaming_input_tokens
+        if app.streaming.streaming_input_tokens > 0 && !app.kv_cache.current_api_usage_recorded {
+            app.streaming.streaming_input_tokens
         } else {
             0
         };
     let live_unrecorded_output_tokens =
-        if app.streaming_output_tokens > 0 && !app.current_api_usage_recorded {
-            app.streaming_output_tokens
+        if app.streaming.streaming_output_tokens > 0 && !app.kv_cache.current_api_usage_recorded {
+            app.streaming.streaming_output_tokens
         } else {
             0
         };
@@ -1163,28 +1355,24 @@ fn format_cache_stats(app: &App) -> String {
     ));
     lines.push(format!(
         "- client_observed_completed_input_tokens: {}",
-        bold_count(app.total_input_tokens)
+        bold_count(app.token_accounting.total_input_tokens)
     ));
     lines.push(format!(
         "- client_observed_completed_output_tokens: {}",
-        bold_count(app.total_output_tokens)
+        bold_count(app.token_accounting.total_output_tokens)
     ));
-    lines.push(format!("- total_cost_usd: {:.6}", app.total_cost));
-    lines.push(format!(
-        "- estimated_cost_usd: {}",
-        app.estimated_cost
-            .map(|cost| format!("{:.6}", cost))
-            .unwrap_or_else(|| "None".to_string())
-    ));
+    lines.push(format!("- total_cost_usd: {:.6}", app.cost.total_cost));
     lines.push(format!(
         "- cached_prompt_price_per_1m: {}",
-        app.cached_prompt_price
+        app.cost
+            .cached_prompt_price
             .map(|price| format!("{:.6}", price))
             .unwrap_or_else(|| "None".to_string())
     ));
     lines.push(format!(
         "- cached_completion_price_per_1m: {}",
-        app.cached_completion_price
+        app.cost
+            .cached_completion_price
             .map(|price| format!("{:.6}", price))
             .unwrap_or_else(|| "None".to_string())
     ));
@@ -1227,9 +1415,16 @@ fn format_cache_stats(app: &App) -> String {
         "- total_cache_optimal_input_tokens: {}",
         bold_count(optimal)
     ));
-    lines.push(format!("- cache_read_pct_of_reported_input: {}%", read_pct));
     lines.push(format!(
-        "- cache_write_pct_of_reported_input: {}%",
+        "- effective_prompt_tokens (input+read+creation for split providers): {}",
+        bold_count(effective_reported)
+    ));
+    lines.push(format!(
+        "- cache_read_pct_of_effective_prompt: {}%",
+        read_pct
+    ));
+    lines.push(format!(
+        "- cache_write_pct_of_effective_prompt: {}%",
         write_pct
     ));
     lines.push(format!(
@@ -1245,11 +1440,11 @@ fn format_cache_stats(app: &App) -> String {
         bold_count(write_including_live)
     ));
     lines.push(format!(
-        "- cache_read_pct_of_reported_input_including_unrecorded_live: {}%",
+        "- cache_read_pct_of_effective_prompt_including_unrecorded_live: {}%",
         read_pct_including_live
     ));
     lines.push(format!(
-        "- cache_write_pct_of_reported_input_including_unrecorded_live: {}%",
+        "- cache_write_pct_of_effective_prompt_including_unrecorded_live: {}%",
         write_pct_including_live
     ));
     lines.push(format!(
@@ -1260,46 +1455,50 @@ fn format_cache_stats(app: &App) -> String {
     ));
     lines.push(format!(
         "- last_cache_reported_input_tokens: {}",
-        opt_u64(app.last_cache_reported_input_tokens)
+        opt_u64(app.token_accounting.last_cache_reported_input_tokens)
     ));
     lines.push(format!(
         "- last_cache_read_tokens: {}",
-        opt_u64(app.last_cache_read_tokens)
+        opt_u64(app.token_accounting.last_cache_read_tokens)
+    ));
+    lines.push(format!(
+        "- last_cache_creation_tokens: {}",
+        opt_u64(app.token_accounting.last_cache_creation_tokens)
     ));
     lines.push(format!(
         "- last_cache_optimal_input_tokens: {}",
-        opt_u64(app.last_cache_optimal_input_tokens)
+        opt_u64(app.token_accounting.last_cache_optimal_input_tokens)
     ));
     lines.push(format!(
         "- cache_next_optimal_input_tokens: {}",
-        opt_u64(app.cache_next_optimal_input_tokens)
+        opt_u64(app.token_accounting.cache_next_optimal_input_tokens)
     ));
     lines.push(String::new());
 
     lines.push("Current / live stream counters".to_string());
     lines.push(format!(
         "- streaming_input_tokens: {}",
-        bold_count(app.streaming_input_tokens)
+        bold_count(app.streaming.streaming_input_tokens)
     ));
     lines.push(format!(
         "- streaming_output_tokens: {}",
-        bold_count(app.streaming_output_tokens)
+        bold_count(app.streaming.streaming_output_tokens)
     ));
     lines.push(format!(
         "- streaming_total_output_tokens: {}",
-        bold_count(app.streaming_total_output_tokens)
+        bold_count(app.streaming.streaming_total_output_tokens)
     ));
     lines.push(format!(
         "- streaming_cache_read_tokens: {}",
-        opt_u64(app.streaming_cache_read_tokens)
+        opt_u64(app.streaming.streaming_cache_read_tokens)
     ));
     lines.push(format!(
         "- streaming_cache_creation_tokens: {}",
-        opt_u64(app.streaming_cache_creation_tokens)
+        opt_u64(app.streaming.streaming_cache_creation_tokens)
     ));
     lines.push(format!(
         "- current_api_usage_recorded: {}",
-        app.current_api_usage_recorded
+        app.kv_cache.current_api_usage_recorded
     ));
     lines.push(format!("- status: {:?}", app.status));
     lines.push(format!("- is_processing: {}", app.is_processing));
@@ -1328,18 +1527,22 @@ fn format_cache_stats(app: &App) -> String {
     lines.push("KV cache tracker state".to_string());
     lines.push(format!(
         "- kv_cache_turn_number: {}",
-        opt_usize(app.kv_cache_turn_number)
+        opt_usize(app.kv_cache.kv_cache_turn_number)
     ));
     lines.push(format!(
         "- kv_cache_turn_call_index: {}",
-        app.kv_cache_turn_call_index
+        app.kv_cache.kv_cache_turn_call_index
     ));
     lines.push(format!(
         "- kv_cache_miss_samples_len: {}",
-        app.kv_cache_miss_samples.len()
+        app.kv_cache.kv_cache_miss_samples.len()
     ));
-    push_cache_baseline(&mut lines, "baseline", app.kv_cache_baseline.as_ref());
-    if let Some(request) = app.pending_kv_cache_request.as_ref() {
+    push_cache_baseline(
+        &mut lines,
+        "baseline",
+        app.kv_cache.kv_cache_baseline.as_ref(),
+    );
+    if let Some(request) = app.kv_cache.pending_kv_cache_request.as_ref() {
         lines.push("- pending_request: present".to_string());
         lines.push(format!(
             "- pending_request.turn_number: {}",
@@ -1416,10 +1619,10 @@ fn format_cache_stats(app: &App) -> String {
     lines.push(String::new());
 
     lines.push("Recent miss attributions".to_string());
-    if app.kv_cache_miss_samples.is_empty() {
+    if app.kv_cache.kv_cache_miss_samples.is_empty() {
         lines.push("- none attributed".to_string());
     } else {
-        for sample in app.kv_cache_miss_samples.iter().rev() {
+        for sample in app.kv_cache.kv_cache_miss_samples.iter().rev() {
             lines.push(format!(
                 "- turn={} call={} missed_tokens={} reason={}",
                 sample.turn_number,
@@ -1433,9 +1636,125 @@ fn format_cache_stats(app: &App) -> String {
     lines.join("\n")
 }
 
+/// Build the `/skills` report: currently loaded skills (marking the active one)
+/// plus the curated list of jcode-endorsed skills (marking which are installed).
+fn build_skills_report(app: &App) -> String {
+    let mut out = String::new();
+
+    let active = app.active_skill().map(|s| s.to_string());
+
+    // Loaded skills. In remote mode we only have names; locally we have full
+    // skill metadata (description + path).
+    out.push_str("Loaded skills\n");
+    if app.is_remote && !app.remote_skills.is_empty() {
+        let mut names = app.remote_skills.clone();
+        names.sort();
+        for name in &names {
+            let marker = if active.as_deref() == Some(name.as_str()) {
+                " (active)"
+            } else {
+                ""
+            };
+            out.push_str(&format!("- /{}{}\n", name, marker));
+        }
+    } else {
+        let snapshot = app.current_skills_snapshot();
+        let mut skills = snapshot.list();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        if skills.is_empty() {
+            out.push_str(
+                "- none loaded\n  Add skills under ~/.jcode/skills/<name>/SKILL.md or ./.jcode/skills/<name>/SKILL.md\n",
+            );
+        } else {
+            for skill in skills {
+                let marker = if active.as_deref() == Some(skill.name.as_str()) {
+                    " (active)"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("- /{}{}\n", skill.name, marker));
+                out.push_str(&format!("    {}\n", skill.description));
+                out.push_str(&format!("    path: {}\n", skill.path.display()));
+            }
+        }
+    }
+
+    // Endorsed skills, marking which are installed. Build the installed set in a
+    // remote-aware way (the inherent `available_skills()` ignores remote skills).
+    let installed: std::collections::HashSet<String> =
+        if app.is_remote && !app.remote_skills.is_empty() {
+            app.remote_skills.iter().cloned().collect()
+        } else {
+            app.current_skills_snapshot()
+                .list()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+    out.push_str("\nEndorsed skills (recommended by jcode)\n");
+    // Group by category, preserving first-seen category order.
+    let mut category_order: Vec<&str> = Vec::new();
+    for endorsed in crate::skill::endorsed_skills() {
+        if !category_order.contains(&endorsed.category) {
+            category_order.push(endorsed.category);
+        }
+    }
+    for category in category_order {
+        let installed_in_category = crate::skill::endorsed_skills()
+            .iter()
+            .filter(|e| e.category == category && installed.contains(e.name))
+            .count();
+        let total_in_category = crate::skill::endorsed_skills()
+            .iter()
+            .filter(|e| e.category == category)
+            .count();
+        out.push_str(&format!(
+            "\n  {} ({}/{} installed)\n",
+            category, installed_in_category, total_in_category
+        ));
+        for endorsed in crate::skill::endorsed_skills()
+            .iter()
+            .filter(|e| e.category == category)
+        {
+            let is_installed = installed.contains(endorsed.name);
+            let status = if is_installed {
+                "installed"
+            } else {
+                "not installed"
+            };
+            out.push_str(&format!("  - /{} [{}]\n", endorsed.name, status));
+            out.push_str(&format!("      {}\n", endorsed.description));
+            out.push_str(&format!("      source: {}\n", endorsed.source));
+            if !is_installed && let Some(install) = endorsed.install {
+                out.push_str(&format!("      install: {}\n", install));
+            }
+        }
+    }
+
+    out.push_str("\nActivate a skill by typing its slash command (e.g. /optimization).\n");
+    out.push_str("Manage skills with the skill_manage tool (list/load/read/reload).\n");
+    out.push_str(
+        "NVIDIA CUDA-X skills come from the official catalog at https://github.com/NVIDIA/skills.\n",
+    );
+
+    out.trim_end().to_string()
+}
+
 pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed == "/skills" {
+        // Sync from disk first so skills added by agent-side `skill_manage
+        // reload_all` (which only updates the server process registry) show up
+        // without a restart (issue #431).
+        app.refresh_skills_snapshot();
+        app.push_display_message(
+            DisplayMessage::system(build_skills_report(app)).with_title("Skills"),
+        );
+        app.set_status_notice("Skills");
+        return true;
+    }
+
     if trimmed == "/version" {
-        let version = jcode_build_meta::VERSION;
+        let version = jcode_build_meta::version();
         let is_canary = if app.session.is_canary {
             " (canary/self-dev)"
         } else {
@@ -1533,7 +1852,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/info" {
-        let version = jcode_build_meta::VERSION;
+        let version = jcode_build_meta::version();
         let terminal_size = crossterm::terminal::size()
             .map(|(w, h)| format!("{}x{}", w, h))
             .unwrap_or_else(|_| "unknown".to_string());
@@ -1573,7 +1892,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
         ));
         info.push_str(&format!(
             "Tokens: ↑{} ↓{}\n",
-            app.total_input_tokens, app.total_output_tokens
+            app.token_accounting.total_input_tokens, app.token_accounting.total_output_tokens
         ));
         info.push_str(&format!("Terminal: {}\n", terminal_size));
         info.push_str(&format!("CWD: {}\n", cwd));
@@ -1589,7 +1908,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
         if let Some(ref provider_id) = app.provider_session_id {
             info.push_str(&format!(
                 "Provider Session: {}...\n",
-                &provider_id[..provider_id.len().min(16)]
+                jcode_core::util::truncate_str(provider_id, 16)
             ));
         }
 
@@ -1653,7 +1972,10 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
                     app.provider.reasoning_effort(),
                     app.provider.service_tier(),
                     app.provider.transport(),
-                    Some((app.total_input_tokens, app.total_output_tokens)),
+                    Some((
+                        app.token_accounting.total_input_tokens,
+                        app.token_accounting.total_output_tokens,
+                    )),
                 )
             };
 
@@ -1802,7 +2124,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
             context.tool_definition_tokens(),
         ));
         context_report.push_str(&format!(
-            "- system prompt: {} chars\n- session context: {} chars\n- project AGENTS.md: {} ({})\n- global ~/.AGENTS.md: {} ({})\n- prompt overlays: {} chars\n- preferred tools: {} chars\n- skills section: {} chars\n- self-dev section: {} chars\n- memory section: {} chars\n- tool definitions: {} chars across {} tools\n- user messages: {} chars across {} messages\n- assistant messages: {} chars across {} messages\n- tool calls: {} chars across {} calls\n- tool results: {} chars across {} results\n",
+            "- system prompt: {} chars\n- session context: {} chars\n- project AGENTS.md: {} ({})\n- global ~/AGENTS.md: {} ({})\n- prompt overlays: {} chars\n- preferred tools: {} chars\n- skills section: {} chars\n- self-dev section: {} chars\n- memory section: {} chars\n- tool definitions: {} chars across {} tools\n- user messages: {} chars across {} messages\n- assistant messages: {} chars across {} messages\n- tool calls: {} chars across {} calls\n- tool results: {} chars across {} results\n",
             context.system_prompt_chars,
             context.session_context_chars,
             if context.has_project_agents_md { "loaded" } else { "not loaded" },

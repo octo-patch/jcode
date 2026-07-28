@@ -102,6 +102,8 @@ pub enum KeyInput {
     RetrieveQueuedDraft,
     SubmitDraft,
     SpawnPanel,
+    SpawnSelfDevSession,
+    SpawnHomeSession,
     HotkeyHelp,
     ToggleInputMode,
     ToggleSessionInfo,
@@ -122,6 +124,8 @@ pub enum KeyOutcome {
         title: String,
     },
     SpawnSession,
+    SpawnSelfDevSession,
+    SpawnHomeSession,
     SendDraft {
         session_id: String,
         title: String,
@@ -493,10 +497,12 @@ impl Workspace {
 
         match self.mode {
             InputMode::Navigation if self.zoomed => format!(
-                "Jcode Desktop · {mode}{zoom} · workspace {workspace} · panel {panel_size} · {focused} · j/k or Super+J/K scroll · g/G or Ctrl+Home/End top/bottom · z unzoom · o/Enter open · Esc quit"
+                "{product} · {mode}{zoom} · workspace {workspace} · panel {panel_size} · {focused} · j/k or Super+J/K scroll · g/G or Ctrl+Home/End top/bottom · z unzoom · o/Enter open · Esc quit",
+                product = crate::DESKTOP_PRODUCT_NAME
             ),
             InputMode::Navigation => format!(
-                "Jcode Desktop · {mode}{zoom} · workspace {workspace} · panel {panel_size} · {focused} · h/l columns · j/k workspaces · Ctrl+1-4 panel size · Ctrl+R refresh · Ctrl+; new · Ctrl+? help · z zoom · i insert · Esc quit"
+                "{product} · {mode}{zoom} · workspace {workspace} · panel {panel_size} · {focused} · h/l columns · j/k workspaces · Ctrl+1-4 panel size · Ctrl+R refresh · Ctrl+; new · Ctrl+? help · z zoom · i insert · Esc quit",
+                product = crate::DESKTOP_PRODUCT_NAME
             ),
             InputMode::Insert => {
                 let images = match self.pending_images.len() {
@@ -505,7 +511,8 @@ impl Workspace {
                     count => format!(" · {count} images"),
                 };
                 format!(
-                    "Jcode Desktop · {mode}{zoom} · workspace {workspace} · {focused}{images} · Enter send · Shift+Enter newline · Ctrl+I image · Esc NAV"
+                    "{product} · {mode}{zoom} · workspace {workspace} · {focused}{images} · Enter send · Shift+Enter newline · Ctrl+I image · Esc NAV",
+                    product = crate::DESKTOP_PRODUCT_NAME
                 )
             }
         }
@@ -687,6 +694,12 @@ impl Workspace {
             KeyInput::SpawnPanel => {
                 return KeyOutcome::SpawnSession;
             }
+            KeyInput::SpawnSelfDevSession => {
+                return KeyOutcome::SpawnSelfDevSession;
+            }
+            KeyInput::SpawnHomeSession => {
+                return KeyOutcome::SpawnHomeSession;
+            }
             KeyInput::HotkeyHelp => {
                 self.open_hotkey_help();
                 return KeyOutcome::Redraw;
@@ -801,6 +814,8 @@ impl Workspace {
     fn handle_insert_key(&mut self, key: KeyInput) -> KeyOutcome {
         match key {
             KeyInput::SpawnPanel => KeyOutcome::SpawnSession,
+            KeyInput::SpawnSelfDevSession => KeyOutcome::SpawnSelfDevSession,
+            KeyInput::SpawnHomeSession => KeyOutcome::SpawnHomeSession,
             KeyInput::HotkeyHelp => {
                 self.open_hotkey_help();
                 KeyOutcome::Redraw
@@ -1547,7 +1562,7 @@ fn complete_slash_command(
         [only] => *only,
         _ => longest_common_prefix(&matches)?,
     };
-    if completion.len() <= prefix.len() {
+    if completion.eq_ignore_ascii_case(prefix) {
         return None;
     }
     let mut completed = completion.to_string();
@@ -1564,43 +1579,15 @@ fn fuzzy_slash_completion(needle: &str, completions: &[&'static str]) -> Option<
         })
         .collect::<Vec<_>>();
     matches.sort_by(|a, b| {
-        a.0.cmp(&b.0)
+        b.0.cmp(&a.0)
             .then_with(|| a.1.cmp(&b.1))
             .then_with(|| a.2.cmp(b.2))
     });
     matches.first().map(|(_, _, command)| *command)
 }
 
-fn slash_fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-
-    let needle = needle.strip_prefix('/').unwrap_or(needle);
-    let haystack = haystack.strip_prefix('/').unwrap_or(haystack);
-    if needle.is_empty() {
-        return Some(0);
-    }
-
-    if let Some(first_char) = needle.chars().next()
-        && !haystack.starts_with(&needle[..first_char.len_utf8()])
-    {
-        return None;
-    }
-
-    let mut score = 0usize;
-    let mut position = 0usize;
-    for ch in needle.chars() {
-        let offset = haystack[position..].find(ch)?;
-        score += offset;
-        position += offset + ch.len_utf8();
-    }
-
-    if needle.len() > 1 && score > needle.len() * 3 {
-        return None;
-    }
-
-    Some(score)
+fn slash_fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    jcode_fuzzy::command_fuzzy_score(needle, haystack)
 }
 
 fn longest_common_prefix<'a>(values: &'a [&'a str]) -> Option<&'a str> {

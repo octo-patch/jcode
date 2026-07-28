@@ -35,6 +35,7 @@ fn format_content_block_for_relevance(block: &crate::message::ContentBlock) -> O
             }
         }
         crate::message::ContentBlock::Reasoning { .. }
+        | crate::message::ContentBlock::ReasoningTrace { .. }
         | crate::message::ContentBlock::AnthropicThinking { .. }
         | crate::message::ContentBlock::OpenAIReasoning { .. } => None,
         crate::message::ContentBlock::Image { .. } => Some("[Image]".to_string()),
@@ -72,6 +73,7 @@ fn format_content_block_for_extraction(block: &crate::message::ContentBlock) -> 
             Some(format!("[{}: {}]", label, content))
         }
         crate::message::ContentBlock::Reasoning { .. }
+        | crate::message::ContentBlock::ReasoningTrace { .. }
         | crate::message::ContentBlock::AnthropicThinking { .. }
         | crate::message::ContentBlock::OpenAIReasoning { .. } => None,
         crate::message::ContentBlock::Image { .. } => Some("[Image]".to_string()),
@@ -131,6 +133,96 @@ pub fn format_context_for_relevance(messages: &[crate::message::Message]) -> Str
 
     chunks.reverse();
     chunks.join("\n").trim().to_string()
+}
+
+/// Build a focused retrieval query from recent messages.
+///
+/// Unlike [`format_context_for_relevance`], which concatenates up to a dozen
+/// role-prefixed messages (including tool output) into one blob, this produces a
+/// tighter query centered on the user's *current intent*. Memory retrieval and
+/// (especially) cross-encoder reranking degrade badly on long, noisy inputs:
+/// embeddings get diluted and rerankers trained on short search queries fail to
+/// score relevance. This builder:
+///   - drops `<system-reminder>...</system-reminder>` blocks (session boilerplate),
+///   - drops tool-call / tool-result lines,
+///   - keeps human/assistant prose,
+///   - over-weights the most recent user message (the strongest intent signal)
+///     by placing it first.
+///
+/// Falls back to the raw relevance context if stripping leaves nothing.
+pub fn format_focused_query_for_relevance(messages: &[crate::message::Message]) -> String {
+    let raw = format_context_for_relevance(messages);
+    focus_query_text(&raw)
+}
+
+/// Pure text transform powering [`format_focused_query_for_relevance`]. Split out
+/// so it can be unit-tested without constructing `Message` values.
+pub fn focus_query_text(raw: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut last_user: Option<String> = None;
+    let mut in_reminder = false;
+    let mut current_role_is_user = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        // Skip system-reminder blocks (session bootstrap / memory injections).
+        if trimmed.starts_with("<system-reminder>") {
+            in_reminder = true;
+            // A single-line reminder both opens and closes.
+            if trimmed.ends_with("</system-reminder>") {
+                in_reminder = false;
+            }
+            continue;
+        }
+        if in_reminder {
+            if trimmed.ends_with("</system-reminder>") {
+                in_reminder = false;
+            }
+            continue;
+        }
+
+        // Role markers emitted by format_message_context_with ("User:" / "Assistant:").
+        if trimmed == "User:" {
+            current_role_is_user = true;
+            continue;
+        }
+        if trimmed == "Assistant:" {
+            current_role_is_user = false;
+            continue;
+        }
+
+        // Drop tool noise; keep human/assistant prose.
+        if trimmed.is_empty()
+            || trimmed.starts_with("[Tool:")
+            || trimmed.starts_with("[Tool error:")
+            || trimmed.starts_with("[Result:")
+            || trimmed.starts_with("[Image]")
+            || trimmed.starts_with("[OpenAI native compaction]")
+        {
+            continue;
+        }
+
+        kept.push(trimmed.to_string());
+        if current_role_is_user {
+            last_user = Some(trimmed.to_string());
+        }
+    }
+
+    let mut out = String::new();
+    // Lead with the most recent user intent so the query is anchored on it.
+    if let Some(user) = last_user {
+        out.push_str(&user);
+        out.push('\n');
+    }
+    out.push_str(&kept.join("\n"));
+
+    let out = out.trim();
+    if out.is_empty() {
+        raw.to_string()
+    } else {
+        out.to_string()
+    }
 }
 
 /// Format messages into a wider context string for extraction.

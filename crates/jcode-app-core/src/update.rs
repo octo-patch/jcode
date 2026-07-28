@@ -7,17 +7,35 @@ use jcode_update_core::{
     verify_asset_checksum_text, version_is_newer,
 };
 pub use jcode_update_core::{
-    DownloadProgress, GitHubAsset, GitHubRelease, PreparedUpdate, UpdateCheckResult,
-    UpdateEstimate, format_download_progress_bar,
+    DownloadProgress, GIT_PULL_DIVERGED_SUMMARY, GitHubAsset, GitHubRelease, PreparedUpdate,
+    UpdateCheckResult, UpdateEstimate, format_download_progress_bar, summarize_update_error,
+    summary_is_divergence,
 };
-use serde::{Deserialize, Serialize};
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "update_metadata.rs"]
+mod update_metadata;
+#[path = "update_rate_limit.rs"]
+mod update_rate_limit;
+pub use update_metadata::UpdateMetadata;
+use update_metadata::{record_release_update_duration, record_source_update_duration};
+pub use update_rate_limit::{RATE_LIMIT_ERROR_PREFIX, is_rate_limit_error};
+use update_rate_limit::{clear_rate_limit_backoff, rate_limit_error};
+
 const GITHUB_REPO: &str = "1jehuang/jcode";
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60); // minimum gap between checks
+/// Minimum gap between *automatic* update checks.
+///
+/// Every automatic check costs one or two unauthenticated `api.github.com`
+/// requests, which share a 60 req/hour per-IP bucket with everything else on
+/// the machine (and everything behind the same NAT). A 60s gap meant a user
+/// who opens jcode a few dozen times an hour exhausted the bucket and then saw
+/// spurious 403s. Half an hour is far below any realistic release cadence and
+/// keeps automatic checks to at most a couple of requests per hour.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time allowed for the initial TCP/TLS connect to the download host.
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -38,8 +56,8 @@ const DOWNLOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// connection eventually fails.
 const DOWNLOAD_MAX_ATTEMPTS: usize = 10;
 const DOWNLOAD_PROGRESS_UPDATE_STEP: u64 = 1_048_576;
-
 pub fn print_centered(msg: &str) {
+    let msg = crate::output_style::terminal_text(msg);
     let width = crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(80);
@@ -79,63 +97,7 @@ pub fn is_release_build() -> bool {
 }
 
 fn current_update_semver() -> &'static str {
-    jcode_build_meta::UPDATE_SEMVER
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateMetadata {
-    pub last_check: SystemTime,
-    pub installed_version: Option<String>,
-    pub installed_from: Option<String>,
-    #[serde(default)]
-    pub last_release_update_secs: Option<f64>,
-    #[serde(default)]
-    pub last_source_update_secs: Option<f64>,
-}
-
-impl Default for UpdateMetadata {
-    fn default() -> Self {
-        Self {
-            last_check: SystemTime::UNIX_EPOCH,
-            installed_version: None,
-            installed_from: None,
-            last_release_update_secs: None,
-            last_source_update_secs: None,
-        }
-    }
-}
-
-impl UpdateMetadata {
-    pub fn load() -> Result<Self> {
-        let path = metadata_path()?;
-        if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            Ok(serde_json::from_str(&content)?)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
-    pub fn save(&self) -> Result<()> {
-        let path = metadata_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = serde_json::to_string_pretty(self)?;
-        fs::write(&path, content)?;
-        Ok(())
-    }
-
-    pub fn should_check(&self) -> bool {
-        match self.last_check.elapsed() {
-            Ok(elapsed) => elapsed > UPDATE_CHECK_INTERVAL,
-            Err(_) => true,
-        }
-    }
-}
-
-fn metadata_path() -> Result<PathBuf> {
-    Ok(storage::jcode_dir()?.join("update_metadata.json"))
+    jcode_build_meta::update_semver()
 }
 
 fn source_build_root() -> Result<PathBuf> {
@@ -144,20 +106,6 @@ fn source_build_root() -> Result<PathBuf> {
 
 fn source_build_repo_dir() -> Result<PathBuf> {
     Ok(source_build_root()?.join("jcode"))
-}
-
-fn record_release_update_duration(duration: Duration) {
-    if let Ok(mut metadata) = UpdateMetadata::load() {
-        metadata.last_release_update_secs = Some(duration.as_secs_f64());
-        let _ = metadata.save();
-    }
-}
-
-fn record_source_update_duration(duration: Duration) {
-    if let Ok(mut metadata) = UpdateMetadata::load() {
-        metadata.last_source_update_secs = Some(duration.as_secs_f64());
-        let _ = metadata.save();
-    }
 }
 
 pub fn should_auto_update() -> bool {
@@ -223,8 +171,7 @@ pub fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
         .user_agent("jcode-updater")
         .build()?;
 
-    let response = client
-        .get(&url)
+    let response = github_api_request(&client, &url)
         .send()
         .context("Failed to fetch release info")?;
 
@@ -232,13 +179,37 @@ pub fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
         anyhow::bail!("No releases found");
     }
 
+    if let Some(error) = rate_limit_error(&response) {
+        return Err(error);
+    }
+
     if !response.status().is_success() {
         anyhow::bail!("GitHub API error: {}", response.status());
     }
 
     let release: GitHubRelease = response.json().context("Failed to parse release info")?;
-
+    clear_rate_limit_backoff();
     Ok(release)
+}
+
+fn github_api_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> reqwest::blocking::RequestBuilder {
+    let request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+
+    // Authenticated requests use the user's 5000 req/h quota instead of the
+    // shared unauthenticated 60 req/h per-IP bucket, which other tools on the
+    // same machine or NAT can exhaust and cause spurious 403s on update
+    // checks. Falls back to unauthenticated when no token is available.
+    if let Some(token) = jcode_base::github::github_public_api_token() {
+        request.bearer_auth(token)
+    } else {
+        request
+    }
 }
 
 fn latest_main_sha_blocking() -> Result<String> {
@@ -248,10 +219,12 @@ fn latest_main_sha_blocking() -> Result<String> {
         .user_agent("jcode-updater")
         .build()?;
 
-    let response = client
-        .get(&url)
+    let response = github_api_request(&client, &url)
         .send()
         .context("Failed to check main branch")?;
+    if let Some(error) = rate_limit_error(&response) {
+        return Err(error);
+    }
     if !response.status().is_success() {
         anyhow::bail!("GitHub API error checking main: {}", response.status());
     }
@@ -349,7 +322,7 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
 }
 
 fn prepare_stable_update_blocking() -> Result<PreparedUpdate> {
-    let current_version = jcode_build_meta::VERSION;
+    let current_version = jcode_build_meta::version();
     let current_update_version = current_update_semver();
     let release = fetch_latest_release_blocking()?;
     let release_version = release.tag_name.trim_start_matches('v');
@@ -393,11 +366,11 @@ fn prepare_stable_update_blocking() -> Result<PreparedUpdate> {
 }
 
 fn prepare_main_update_blocking() -> Result<PreparedUpdate> {
-    let current_hash = jcode_build_meta::GIT_HASH;
+    let current_hash = jcode_build_meta::git_hash();
     if current_hash.is_empty() || current_hash == "unknown" {
         crate::logging::info("Main channel: no git hash in binary, skipping update check");
         return Ok(PreparedUpdate::None {
-            current: jcode_build_meta::VERSION.to_string(),
+            current: jcode_build_meta::version().to_string(),
         });
     }
 
@@ -470,6 +443,15 @@ pub fn prepare_update_blocking() -> Result<PreparedUpdate> {
     }
 }
 
+/// Log the full error and return a single short line for the UI.
+///
+/// Update failures come from many layers and are often multi-line, so the
+/// verbose text belongs in the log while the card/notice stay one line.
+fn short_update_error(context: &str, error: &anyhow::Error) -> String {
+    crate::logging::warn(&format!("update: {}: {:#}", context, error));
+    summarize_update_error(&format!("{:#}", error))
+}
+
 pub fn spawn_background_session_update(session_id: String) {
     std::thread::spawn(move || {
         use crate::bus::{Bus, BusEvent, ClientMaintenanceAction, SessionUpdateStatus};
@@ -521,7 +503,7 @@ pub fn spawn_background_session_update(session_id: String) {
                     Err(error) => publish(SessionUpdateStatus::Error {
                         session_id,
                         action,
-                        message: format!("Update failed: {}", error),
+                        message: short_update_error("update failed", &error),
                     }),
                 }
             }
@@ -552,14 +534,14 @@ pub fn spawn_background_session_update(session_id: String) {
                     Err(error) => publish(SessionUpdateStatus::Error {
                         session_id,
                         action,
-                        message: format!("Update failed: {}", error),
+                        message: short_update_error("update failed", &error),
                     }),
                 }
             }
             Err(error) => publish(SessionUpdateStatus::Error {
                 session_id,
                 action,
-                message: format!("Update check failed: {}", error),
+                message: short_update_error("update check failed", &error),
             }),
         }
     });
@@ -603,7 +585,7 @@ fn check_for_stable_update_blocking() -> Result<Option<GitHubRelease>> {
 ///   - Tries to build from source if cargo is available
 ///   - Falls back to latest GitHub Release if not
 fn check_for_main_update_blocking() -> Result<Option<GitHubRelease>> {
-    let current_hash = jcode_build_meta::GIT_HASH;
+    let current_hash = jcode_build_meta::git_hash();
     if current_hash.is_empty() || current_hash == "unknown" {
         crate::logging::info("Main channel: no git hash in binary, skipping update check");
         return Ok(None);
@@ -1036,6 +1018,7 @@ pub fn download_and_install_blocking_with_progress(
         let version = release.tag_name.trim_start_matches('v');
         let dest_dir = build::builds_dir()?.join("versions").join(version);
         fs::create_dir_all(&dest_dir).context("Failed to create version install dir")?;
+        let mut installed_files = Vec::new();
         for entry in fs::read_dir(&extract_dir).context("Failed to read extracted archive")? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
@@ -1062,6 +1045,17 @@ pub fn download_and_install_blocking_with_progress(
                 || dest.extension().is_some_and(|ext| ext == "bin")
             {
                 crate::platform::set_permissions_executable(&dest)?;
+            }
+            installed_files.push(dest);
+        }
+        // Give every installed file the same mtime. The wrapper script and the
+        // `.bin` payload otherwise land with whatever sub-second skew the copy
+        // loop produced, and any code comparing binary freshness by mtime then
+        // sees two "different age" files for one logical install.
+        let install_stamp = SystemTime::now();
+        for path in &installed_files {
+            if let Ok(file) = fs::File::options().write(true).open(path) {
+                let _ = file.set_modified(install_stamp);
             }
         }
         let _ = fs::remove_dir_all(&extract_dir);
@@ -1116,7 +1110,7 @@ pub fn check_and_maybe_update(auto_install: bool) -> UpdateCheckResult {
 
     match check_for_update_blocking() {
         Ok(Some(release)) => {
-            let current = jcode_build_meta::VERSION.to_string();
+            let current = jcode_build_meta::version().to_string();
             let latest = release.tag_name.clone();
 
             Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Available {
@@ -1157,6 +1151,7 @@ pub fn check_and_maybe_update(auto_install: bool) -> UpdateCheckResult {
             }
         }
         Ok(None) => {
+            repair_stale_shared_server_after_no_update();
             Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
             let mut metadata = UpdateMetadata::load().unwrap_or_default();
             metadata.last_check = SystemTime::now();
@@ -1164,9 +1159,38 @@ pub fn check_and_maybe_update(auto_install: bool) -> UpdateCheckResult {
             UpdateCheckResult::NoUpdate
         }
         Err(e) => {
-            let msg = format!("Check failed: {}", e);
+            let msg = short_update_error("update check failed", &e);
+            if is_rate_limit_error(&msg) {
+                // Throttling is not an update failure and there is nothing the
+                // user needs to do, so keep it out of the UI. The backoff was
+                // already persisted, so we stop retrying too.
+                crate::logging::info(&msg);
+                Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
+                return UpdateCheckResult::NoUpdate;
+            }
             Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Error(msg.clone())));
             UpdateCheckResult::Error(msg)
+        }
+    }
+}
+
+fn repair_stale_shared_server_after_no_update() {
+    match build::repair_stale_shared_server_channel() {
+        Ok(build::SharedServerRepair::Repaired {
+            previous,
+            repaired_to,
+        }) => {
+            crate::logging::info(&format!(
+                "update: repaired stale shared-server channel {:?} -> {} after no-op update check",
+                previous, repaired_to
+            ));
+        }
+        Ok(build::SharedServerRepair::AlreadyCurrent) => {}
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "update: failed to repair stale shared-server channel after no-op update check: {}",
+                error
+            ));
         }
     }
 }
@@ -1285,8 +1309,11 @@ mod tests {
         let stderr = b"hint: You have divergent branches and need to specify how to reconcile them.\nfatal: Need to specify how to reconcile divergent branches.\n";
         assert_eq!(
             summarize_git_pull_failure(stderr),
-            "git pull requires manual reconciliation (local and upstream have diverged)"
+            jcode_update_core::GIT_PULL_DIVERGED_SUMMARY
         );
+        assert!(jcode_update_core::summary_is_divergence(
+            &summarize_git_pull_failure(stderr)
+        ));
     }
 
     #[test]
@@ -1401,10 +1428,9 @@ mod tests {
                         let trimmed = line.trim_end();
                         if let Some(rest) =
                             trimmed.to_ascii_lowercase().strip_prefix("range: bytes=")
+                            && let Some(start) = rest.split('-').next()
                         {
-                            if let Some(start) = rest.split('-').next() {
-                                range_start = start.trim().parse().unwrap_or(0);
-                            }
+                            range_start = start.trim().parse().unwrap_or(0);
                         }
                         if trimmed.is_empty() {
                             break;
@@ -1675,5 +1701,17 @@ mod tests {
             total as u64,
             "final progress must reach the full size"
         );
+    }
+}
+
+#[cfg(test)]
+mod github_auth_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "live network test"]
+    fn live_fetch_latest_release_uses_auth() {
+        let release = fetch_latest_release_blocking().expect("release fetch should succeed");
+        assert!(!release.tag_name.is_empty());
     }
 }

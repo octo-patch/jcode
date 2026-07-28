@@ -15,9 +15,19 @@ pub enum MarkdownSpacingMode {
     Document,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LatexRenderingMode {
+    None,
+    Unicode,
+    #[default]
+    Image,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyTargetKind {
     CodeBlock { language: Option<String> },
+    Blockquote,
+    Math { display: bool },
     Error,
     ToolOutput,
 }
@@ -30,6 +40,8 @@ impl CopyTargetKind {
                 .filter(|lang| !lang.is_empty())
                 .unwrap_or("code")
                 .to_string(),
+            Self::Blockquote => "quote".to_string(),
+            Self::Math { .. } => "math".to_string(),
             Self::Error => "error".to_string(),
             Self::ToolOutput => "output".to_string(),
         }
@@ -44,6 +56,8 @@ impl CopyTargetKind {
                     .unwrap_or("code block");
                 format!("Copied {}", label)
             }
+            Self::Blockquote => "Copied quote".to_string(),
+            Self::Math { .. } => "Copied math".to_string(),
             Self::Error => "Copied error".to_string(),
             Self::ToolOutput => "Copied output".to_string(),
         }

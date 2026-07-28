@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
+
 use super::*;
 use crate::message::{Message, ToolDefinition};
 use crate::provider::{EventStream, Provider};
@@ -62,6 +64,37 @@ fn test_resolve_skill_aliases_to_skill_manage() {
     assert_eq!(Registry::resolve_tool_name("skill_manage"), "skill_manage");
 }
 
+#[tokio::test]
+async fn test_discover_tools_not_registered_when_sponsors_disabled() {
+    // sponsors.enabled defaults to false; the discovery tool must not exist.
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let names = registry.tool_names().await;
+    if crate::config::config().sponsors.enabled {
+        assert!(names.iter().any(|n| n == "discover_tools"));
+    } else {
+        assert!(
+            !names.iter().any(|n| n == "discover_tools"),
+            "discover_tools must not be registered when sponsors are disabled"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subagent_tool_is_not_registered() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+
+    assert!(
+        !registry
+            .tool_names()
+            .await
+            .iter()
+            .any(|name| name == "subagent"),
+        "the deprecated direct subagent tool must not be exposed; use swarm instead"
+    );
+}
+
 struct BareSchemaTool;
 
 #[async_trait]
@@ -89,17 +122,34 @@ impl Tool for BareSchemaTool {
     }
 }
 
+/// `to_definition` deliberately injects a required `intent` into every
+/// object-shaped tool schema (8505080a6), so a tool that omits `intent` from its
+/// own `parameters_schema` still advertises it. This pins that central
+/// behaviour: a bare schema gains `intent` as both a property and a requirement.
 #[test]
-fn tool_definitions_do_not_auto_inject_intent() {
+fn tool_definitions_auto_inject_required_intent() {
     let def = BareSchemaTool.to_definition();
-    assert!(def.input_schema["properties"]["intent"].is_null());
+    assert_eq!(def.input_schema["properties"]["intent"]["type"], "string");
+    let required = def.input_schema["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        required.iter().any(|value| value == "intent"),
+        "intent must be required after central injection: {required:?}"
+    );
+    assert!(
+        required.iter().any(|value| value == "command"),
+        "injection must preserve the tool's own required fields: {required:?}"
+    );
 }
 
 #[tokio::test]
-async fn first_party_tool_definitions_include_optional_intent_explicitly() {
+async fn first_party_tool_definitions_require_intent_with_display_only_docs() {
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
     registry.register_ambient_tools().await;
+    registry.register_selfdev_tools().await;
 
     let defs = registry.definitions(None).await;
     assert!(!defs.is_empty());
@@ -125,8 +175,8 @@ async fn first_party_tool_definitions_include_optional_intent_explicitly() {
         );
         let required = schema["required"].as_array().cloned().unwrap_or_default();
         assert!(
-            !required.iter().any(|value| value == "intent"),
-            "{} must not require intent",
+            required.iter().any(|value| value == "intent"),
+            "{} must require intent",
             def.name
         );
     }
@@ -134,11 +184,9 @@ async fn first_party_tool_definitions_include_optional_intent_explicitly() {
 
 #[test]
 fn test_resolve_tool_name_oauth_aliases() {
-    assert_eq!(Registry::resolve_tool_name("file_grep"), "grep");
     assert_eq!(Registry::resolve_tool_name("file_read"), "read");
     assert_eq!(Registry::resolve_tool_name("file_write"), "write");
     assert_eq!(Registry::resolve_tool_name("file_edit"), "edit");
-    assert_eq!(Registry::resolve_tool_name("file_glob"), "glob");
     assert_eq!(Registry::resolve_tool_name("shell_exec"), "bash");
     assert_eq!(Registry::resolve_tool_name("shell"), "bash");
     assert_eq!(Registry::resolve_tool_name("read_file"), "read");
@@ -147,14 +195,80 @@ fn test_resolve_tool_name_oauth_aliases() {
     assert_eq!(Registry::resolve_tool_name("task_runner"), "subagent");
     assert_eq!(Registry::resolve_tool_name("task"), "subagent");
     assert_eq!(Registry::resolve_tool_name("launch"), "open");
+    assert_eq!(Registry::resolve_tool_name("grep"), "agentgrep");
+    assert_eq!(Registry::resolve_tool_name("file_grep"), "agentgrep");
     assert_eq!(Registry::resolve_tool_name("todo_read"), "todo");
     assert_eq!(Registry::resolve_tool_name("todo_write"), "todo");
     assert_eq!(Registry::resolve_tool_name("todoread"), "todo");
     assert_eq!(Registry::resolve_tool_name("todowrite"), "todo");
     assert_eq!(Registry::resolve_tool_name("bash"), "bash");
-    assert_eq!(Registry::resolve_tool_name("grep"), "grep");
+    assert_eq!(Registry::resolve_tool_name("functions.bash"), "bash");
+    assert_eq!(Registry::resolve_tool_name("functions.shell_exec"), "bash");
     assert_eq!(Registry::resolve_tool_name("batch"), "batch");
     assert_eq!(Registry::resolve_tool_name("memory"), "memory");
+}
+
+#[tokio::test]
+async fn test_batch_resolves_function_namespaced_tools() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let ctx = ToolContext {
+        session_id: "test-batch-function-namespace".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(std::env::temp_dir()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let result = registry
+        .execute(
+            "batch",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool": "functions.bash", "command": "true"},
+                    {"tool": "functions.shell_exec", "command": "true"}
+                ]
+            }),
+            ctx,
+        )
+        .await
+        .expect("namespaced batch subcalls should execute");
+
+    assert!(result.output.contains("Completed: 2 succeeded, 0 failed"));
+    assert!(!result.output.contains("Unknown tool"));
+    assert!(result.output.contains("--- [1] bash ---"));
+    assert!(result.output.contains("--- [2] bash ---"));
+    assert!(!result.output.contains("functions."));
+}
+
+#[tokio::test]
+async fn test_batch_rejects_function_namespaced_batch_recursion() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let ctx = ToolContext {
+        session_id: "test-batch-function-namespace-recursion".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(std::env::temp_dir()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let error = registry
+        .execute(
+            "batch",
+            serde_json::json!({
+                "tool_calls": [{"tool": "functions.batch", "tool_calls": []}]
+            }),
+            ctx,
+        )
+        .await
+        .expect_err("namespaced batch recursion should be rejected");
+
+    assert!(error.to_string().contains("Cannot batch the 'batch' tool"));
 }
 
 #[tokio::test]
@@ -162,7 +276,6 @@ async fn test_batch_resolves_oauth_names() {
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
     let temp_dir = std::env::temp_dir();
-    let temp_dir_str = temp_dir.to_string_lossy().to_string();
 
     let ctx = ToolContext {
         session_id: "test".to_string(),
@@ -175,13 +288,9 @@ async fn test_batch_resolves_oauth_names() {
     };
 
     let result = registry
-        .execute(
-            "file_grep",
-            serde_json::json!({"pattern": "nonexistent_xyz", "path": temp_dir_str}),
-            ctx,
-        )
+        .execute("shell_exec", serde_json::json!({"command": "true"}), ctx)
         .await;
-    assert!(result.is_ok(), "file_grep should resolve to grep tool");
+    assert!(result.is_ok(), "shell_exec should resolve to bash tool");
 }
 
 #[tokio::test]
@@ -190,7 +299,7 @@ async fn registry_execute_enforces_session_tool_policy_after_alias_resolution() 
     let registry = Registry::new(provider).await;
     let temp_dir = std::env::temp_dir();
     let session_id = "test-policy-deny";
-    set_session_tool_policy(session_id, None, HashSet::from(["grep".to_string()]));
+    set_session_tool_policy(session_id, None, HashSet::from(["bash".to_string()]));
 
     let ctx = ToolContext {
         session_id: session_id.to_string(),
@@ -203,21 +312,86 @@ async fn registry_execute_enforces_session_tool_policy_after_alias_resolution() 
     };
 
     let result = registry
-        .execute(
-            "file_grep",
-            serde_json::json!({"pattern": "nonexistent_xyz", "path": temp_dir.to_string_lossy()}),
-            ctx,
-        )
+        .execute("shell_exec", serde_json::json!({"command": "true"}), ctx)
         .await;
 
     clear_session_tool_policy(session_id);
-    assert!(result.is_err(), "deny-list should block aliased grep calls");
+    assert!(result.is_err(), "deny-list should block aliased bash calls");
     assert!(
         result
             .unwrap_err()
             .to_string()
-            .contains("Tool 'grep' is disabled")
+            .contains("Tool 'bash' is disabled")
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn registry_execute_pre_tool_hook_blocks_and_allows() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp = tempfile::TempDir::new().expect("temp dir");
+
+    // Policy script: block bash calls whose input mentions "secret".
+    let policy = temp.path().join("policy.sh");
+    std::fs::write(
+        &policy,
+        "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *secret*) echo \"no secrets\" >&2; exit 2 ;;\nesac\nexit 0\n",
+    )
+    .expect("write policy");
+    std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod policy");
+
+    let prev = std::env::var_os("JCODE_HOOK_PRE_TOOL");
+    crate::env::set_var("JCODE_HOOK_PRE_TOOL", policy.to_string_lossy().to_string());
+    // jcode-base is compiled without cfg(test) here, so the config cache only
+    // re-checks env every 500ms; force a reload so the hook is visible now.
+    crate::config::invalidate_config_cache();
+
+    let ctx = || ToolContext {
+        session_id: "test-pre-tool-hook".to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(std::env::temp_dir()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let blocked = registry
+        .execute(
+            "bash",
+            serde_json::json!({
+                "command": "echo secret"
+            }),
+            ctx(),
+        )
+        .await;
+    let allowed = registry
+        .execute(
+            "bash",
+            serde_json::json!({
+                "command": "true"
+            }),
+            ctx(),
+        )
+        .await;
+
+    match prev {
+        Some(value) => crate::env::set_var("JCODE_HOOK_PRE_TOOL", value),
+        None => crate::env::remove_var("JCODE_HOOK_PRE_TOOL"),
+    }
+    crate::config::invalidate_config_cache();
+
+    let error = blocked.expect_err("pre_tool hook should block matching input");
+    assert!(
+        error.to_string().contains("no secrets"),
+        "hook stderr should surface in the error: {error}"
+    );
+    assert!(allowed.is_ok(), "non-matching input should pass the gate");
 }
 
 #[tokio::test]
@@ -511,4 +685,34 @@ async fn unknown_tool_error_lists_available_tools_and_suggestions() {
         msg.contains("end_ambient_cycle"),
         "available list should include registered ambient tools: {msg}"
     );
+}
+
+#[tokio::test]
+async fn gemini_build_tools_from_registry_definitions_omits_const_keywords() {
+    // Moved from jcode-base/src/provider/gemini_tests.rs: this is the one test
+    // that needs the upper-layer tool::Registry, so it lives here instead of
+    // forcing a base -> app-core dev-dependency cycle.
+    fn schema_contains_key(schema: &serde_json::Value, key: &str) -> bool {
+        match schema {
+            serde_json::Value::Object(map) => {
+                map.contains_key(key) || map.values().any(|value| schema_contains_key(value, key))
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().any(|value| schema_contains_key(value, key))
+            }
+            _ => false,
+        }
+    }
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let defs = registry.definitions(None).await;
+
+    let built = crate::provider::gemini::build_tools(&defs).expect("gemini tools");
+    let parameters = &built[0].function_declarations;
+
+    assert!(!schema_contains_key(
+        &serde_json::json!(parameters),
+        "const"
+    ));
 }

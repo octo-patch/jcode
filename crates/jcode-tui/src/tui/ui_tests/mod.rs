@@ -1,13 +1,11 @@
 use super::*;
 use crate::tui::session_picker;
 use crate::tui::ui::tools_ui;
-use std::sync::{Mutex, OnceLock};
 
+/// Delegates to the single shared render-state lock so viewport-snapshot tests
+/// serialize against every other rendering test, not just each other (#593).
 fn viewport_snapshot_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::tui::ui::render_state_test_lock()
 }
 
 #[test]
@@ -114,6 +112,11 @@ fn native_scrollbar_visibility_requires_overflow() {
 struct TestState {
     input: String,
     cursor_pos: usize,
+    provider_name: Option<String>,
+    provider_model: Option<String>,
+    working_dir: Option<String>,
+    info_widget_data: info_widget::InfoWidgetData,
+    suppress_info_widgets: bool,
     display_messages: Vec<DisplayMessage>,
     messages_version: u64,
     streaming_text: String,
@@ -136,6 +139,17 @@ struct TestState {
     onboarding_preview: bool,
     suggestions: Vec<(String, String)>,
     compacted_hidden_user_prompts: usize,
+    side_pane_images: Vec<crate::session::RenderedImage>,
+    pin_images: bool,
+    inline_images_visible: bool,
+    chat_overscroll_active: bool,
+    cache_ttl_status: Option<crate::tui::CacheTtlInfo>,
+    status_notice: Option<String>,
+    swarm_members: Vec<crate::protocol::SwarmMemberStatus>,
+    transcript_swarm_members: Option<Vec<crate::protocol::SwarmMemberStatus>>,
+    swarm_panel_selected: usize,
+    swarm_panel_focused: bool,
+    swarm_panel_full_page: bool,
 }
 
 impl crate::tui::TuiState for TestState {
@@ -161,7 +175,7 @@ impl crate::tui::TuiState for TestState {
         })
     }
     fn side_pane_images(&self) -> Vec<crate::session::RenderedImage> {
-        Vec::new()
+        self.side_pane_images.clone()
     }
     fn display_messages_version(&self) -> u64 {
         self.messages_version
@@ -194,10 +208,14 @@ impl crate::tui::TuiState for TestState {
         false
     }
     fn provider_name(&self) -> String {
-        "mock".to_string()
+        self.provider_name
+            .clone()
+            .unwrap_or_else(|| "mock".to_string())
     }
     fn provider_model(&self) -> String {
-        "mock-model".to_string()
+        self.provider_model
+            .clone()
+            .unwrap_or_else(|| "mock-model".to_string())
     }
     fn upstream_provider(&self) -> Option<String> {
         None
@@ -247,6 +265,14 @@ impl crate::tui::TuiState for TestState {
     fn time_since_activity(&self) -> Option<Duration> {
         self.time_since_activity
     }
+    fn chat_overscroll_active(&self) -> bool {
+        self.chat_overscroll_active
+    }
+    fn chat_overscroll_remaining(&self) -> Option<f32> {
+        // TestState models the elastic reveal: while active, a countdown is
+        // depleting (a config-pinned line would report None here instead).
+        self.chat_overscroll_active.then_some(1.0)
+    }
     fn total_session_tokens(&self) -> Option<(u64, u64)> {
         None
     }
@@ -281,7 +307,27 @@ impl crate::tui::TuiState for TestState {
         None
     }
     fn status_notice(&self) -> Option<String> {
-        None
+        self.status_notice.clone()
+    }
+    fn inline_swarm_gallery_active(&self) -> bool {
+        !self.swarm_members.is_empty()
+    }
+    fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+        self.swarm_members.clone()
+    }
+    fn swarm_members_for_transcript(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+        self.transcript_swarm_members
+            .clone()
+            .unwrap_or_else(|| self.swarm_members.clone())
+    }
+    fn swarm_panel_selected(&self) -> usize {
+        self.swarm_panel_selected
+    }
+    fn swarm_panel_focused(&self) -> bool {
+        self.swarm_panel_focused
+    }
+    fn swarm_panel_full_page(&self) -> bool {
+        self.swarm_panel_full_page
     }
     fn remote_startup_phase_active(&self) -> bool {
         self.remote_startup_phase_active
@@ -310,6 +356,9 @@ impl crate::tui::TuiState for TestState {
     fn context_limit(&self) -> Option<usize> {
         None
     }
+    fn info_widget_overlays_enabled(&self) -> bool {
+        !self.suppress_info_widgets
+    }
     fn client_update_available(&self) -> bool {
         false
     }
@@ -317,7 +366,7 @@ impl crate::tui::TuiState for TestState {
         None
     }
     fn info_widget_data(&self) -> info_widget::InfoWidgetData {
-        Default::default()
+        self.info_widget_data.clone()
     }
     fn render_streaming_markdown(&self, _width: usize) -> Vec<Line<'static>> {
         markdown::render_markdown_with_width(&self.streaming_text, Some(_width))
@@ -343,6 +392,9 @@ impl crate::tui::TuiState for TestState {
     }
     fn diagram_pane_ratio(&self) -> u8 {
         50
+    }
+    fn diagram_pane_ratio_user_adjusted(&self) -> bool {
+        false
     }
     fn diagram_pane_animating(&self) -> bool {
         false
@@ -374,7 +426,10 @@ impl crate::tui::TuiState for TestState {
         &EMPTY
     }
     fn pin_images(&self) -> bool {
-        false
+        self.pin_images
+    }
+    fn inline_images_visible(&self) -> bool {
+        self.inline_images_visible
     }
     fn diff_line_wrap(&self) -> bool {
         true
@@ -413,7 +468,7 @@ impl crate::tui::TuiState for TestState {
         None
     }
     fn working_dir(&self) -> Option<String> {
-        None
+        self.working_dir.clone()
     }
     fn now_millis(&self) -> u64 {
         0
@@ -437,7 +492,7 @@ impl crate::tui::TuiState for TestState {
         self.onboarding_preview
     }
     fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> {
-        None
+        self.cache_ttl_status.clone()
     }
     fn chat_native_scrollbar(&self) -> bool {
         self.chat_native_scrollbar
@@ -465,5 +520,7 @@ mod onboarding;
 mod prepared_messages_tests;
 #[path = "rendering.rs"]
 mod rendering;
+#[path = "swarm_buffer.rs"]
+mod swarm_buffer;
 #[path = "tools.rs"]
 mod tools;

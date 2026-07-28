@@ -41,6 +41,7 @@ async fn session_control_handle_does_not_wait_for_busy_agent_lock() {
     tokio::time::timeout(Duration::from_millis(100), async {
         assert!(control.queue_soft_interrupt(
             "please stop".to_string(),
+            Vec::new(),
             true,
             SoftInterruptSource::User,
         ));
@@ -99,6 +100,53 @@ async fn refreshed_session_control_handle_does_not_wait_for_busy_agent_lock() {
     .expect("refreshing a session control handle must not wait for the busy agent mutex");
 
     assert!(stop_signal.is_set());
+}
+
+#[tokio::test]
+async fn busy_session_background_tool_signal_fires_via_registry_fallback() {
+    // Regression: pressing Alt+B/Ctrl+B while a turn owns the agent mutex (e.g.
+    // running `await_members`) used to silently no-op because the lock-free
+    // `cancel_only` control handle dropped the background-tool signal
+    // (BACKGROUND_TOOL_SIGNAL_FIRE result=no_signal_handle). Building a full
+    // SessionControlHandle now registers the signal in a process-global registry
+    // so the cancel-only fallback can still fire it without the agent lock.
+    let provider: Arc<dyn Provider> = Arc::new(PanicOnForkProvider {
+        forked: Arc::new(AtomicBool::new(false)),
+    });
+    let registry = Registry::new(Arc::clone(&provider)).await;
+    let session_id = "session_busy_background_signal_registry";
+    let mut session = crate::session::Session::create_with_id(session_id.to_string(), None, None);
+    session.model = Some("panic-on-fork".to_string());
+    let agent = Arc::new(Mutex::new(Agent::new_with_session(
+        provider, registry, session, None,
+    )));
+
+    let background_signal = {
+        let agent_guard = agent.lock().await;
+        agent_guard.background_tool_signal()
+    };
+
+    // Build a full control handle once (registers the background signal), then
+    // simulate the busy-turn reconnect path which yields a cancel-only handle.
+    let stop_signal = InterruptSignal::new();
+    let soft_interrupt_queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _full = SessionControlHandle::new(
+        session_id,
+        Arc::clone(&soft_interrupt_queue),
+        background_signal.clone(),
+        stop_signal.clone(),
+    );
+
+    let cancel_only =
+        SessionControlHandle::cancel_only(session_id, soft_interrupt_queue, stop_signal);
+
+    // The cancel-only handle has no directly-held background signal, yet it must
+    // still fire the registered one.
+    assert!(cancel_only.request_background_current_tool());
+    assert!(background_signal.is_set());
+
+    // Cleanup so the global registry does not leak across tests.
+    crate::server::state::remove_background_tool_signal(session_id);
 }
 
 #[tokio::test]
@@ -200,6 +248,79 @@ async fn cancel_without_local_task_still_signals_session_control() {
     ));
 }
 
+/// Regression for issue #428: the detached-turn cancel path schedules a
+/// deferred reset of the shared stop signal. That reset must be epoch-guarded:
+/// if a newer cancel fires during the reset window (rapid repeated Esc), the
+/// stale timer must not clear it, otherwise the running turn never observes
+/// the interrupt and keeps generating.
+#[tokio::test]
+async fn deferred_cancel_reset_does_not_erase_newer_cancel() {
+    let soft_interrupt_queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stop_signal = InterruptSignal::new();
+    let control = SessionControlHandle::cancel_only(
+        "session_detached_cancel_race",
+        Arc::clone(&soft_interrupt_queue),
+        stop_signal.clone(),
+    );
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+    let event_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+    let event_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (swarm_event_tx, _) = broadcast::channel(8);
+
+    let cancel_via_no_task_path = async |request_id: u64| {
+        let mut client_is_processing = true;
+        let mut message_id = Some(request_id);
+        let mut session_id = Some("session_detached_cancel_race".to_string());
+        let mut task = None;
+        cancel_processing_message(
+            &mut ProcessingState {
+                client_is_processing: &mut client_is_processing,
+                message_id: &mut message_id,
+                session_id: &mut session_id,
+                task: &mut task,
+            },
+            &control,
+            &client_event_tx,
+            &SwarmStatusRefs {
+                members: &swarm_members,
+                swarms_by_id: &swarms_by_id,
+                event_history: &event_history,
+                event_counter: &event_counter,
+                event_tx: &swarm_event_tx,
+            },
+            Some(request_id),
+            None,
+        )
+        .await;
+    };
+
+    // First Esc: fires the signal and schedules a 500ms deferred reset.
+    cancel_via_no_task_path(1).await;
+    assert!(stop_signal.is_set());
+
+    // 400ms later the user presses Esc again (turn still hasn't stopped).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    cancel_via_no_task_path(2).await;
+    assert!(stop_signal.is_set());
+
+    // The first press's timer expires now. It must NOT clear the second
+    // press's still-unobserved cancel.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        stop_signal.is_set(),
+        "stale deferred reset erased a newer cancel (issue #428)"
+    );
+
+    // The second press's own timer may still clear it afterwards.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !stop_signal.is_set(),
+        "the newest cancel's deferred reset should eventually clear the flag"
+    );
+}
+
 impl IsolatedRuntimeDir {
     fn new() -> Self {
         let temp = tempfile::TempDir::new().expect("runtime dir");
@@ -258,8 +379,152 @@ impl Drop for IsolatedRuntimeDir {
     }
 }
 
+/// Regression for issue #428: a turn actively streaming in this session but
+/// NOT owned by the cancelling connection (no local task handle: post-reload
+/// reattach, server-initiated wake turns, headless recovery) must abort
+/// promptly even when the control handle's stop signal is a *different
+/// instance* from the streaming agent's own `graceful_shutdown` signal.
+///
+/// Before the fix, `cancel_processing_message` hit the NO_LOCAL_TASK branch,
+/// fired the stale handle-local signal (which nothing was listening to),
+/// emitted `Interrupted` immediately, and the provider stream kept generating
+/// for minutes ("Interrupting..." disappears, model keeps going, eventually
+/// "Interrupted [x66]").
+#[test]
+fn cancel_aborts_detached_streaming_turn_with_stale_stop_signal() -> anyhow::Result<()> {
+    let _lock = crate::storage::lock_test_env();
+    let _env = IsolatedReloadRecoveryEnv::new();
+    let session_id = "session_detached_streaming_cancel_428";
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let provider: Arc<dyn Provider> = Arc::new(NeverEndingStreamProvider);
+        let registry = Registry::new(Arc::clone(&provider)).await;
+        let mut session =
+            crate::session::Session::create_with_id(session_id.to_string(), None, None);
+        session.model = Some("never-ending-stream".to_string());
+        let agent = Arc::new(Mutex::new(Agent::new_with_session(
+            provider, registry, session, None,
+        )));
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+
+        // Start the turn the way server-initiated paths do: no entry in any
+        // connection's processing-task map.
+        let turn_agent = Arc::clone(&agent);
+        let turn = tokio::spawn(async move {
+            process_message_streaming_mpsc(turn_agent, "stream forever", Vec::new(), None, event_tx)
+                .await
+        });
+
+        // Wait until the provider stream is actively producing output.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await {
+                Ok(Some(ServerEvent::TextDelta { .. })) => break,
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("event channel closed before streaming started"),
+                Err(_) => panic!("turn never started streaming"),
+            }
+        }
+
+        // Esc arrives on a connection that does not own the task. Its control
+        // handle holds a stop signal instance that is NOT the streaming
+        // agent's graceful_shutdown signal (stale/lost registration).
+        let stale_stop_signal = InterruptSignal::new();
+        let control = SessionControlHandle::cancel_only(
+            session_id,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            stale_stop_signal.clone(),
+        );
+        let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+        let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+        let event_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+        let event_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (swarm_event_tx, _) = broadcast::channel(8);
+        let mut client_is_processing = false;
+        let mut message_id = None;
+        let mut cancel_session_id = None;
+        let mut task = None;
+
+        cancel_processing_message(
+            &mut ProcessingState {
+                client_is_processing: &mut client_is_processing,
+                message_id: &mut message_id,
+                session_id: &mut cancel_session_id,
+                task: &mut task,
+            },
+            &control,
+            &client_event_tx,
+            &SwarmStatusRefs {
+                members: &swarm_members,
+                swarms_by_id: &swarms_by_id,
+                event_history: &event_history,
+                event_counter: &event_counter,
+                event_tx: &swarm_event_tx,
+            },
+            Some(1),
+            None,
+        )
+        .await;
+
+        // The streaming turn must observe the cancel and stop promptly, not
+        // minutes later when the provider happens to finish (issue #428).
+        let result = tokio::time::timeout(Duration::from_secs(2), turn)
+            .await
+            .expect("streaming turn must abort promptly after cancel (issue #428)")
+            .expect("turn task join");
+        result.expect("cancelled turn should checkpoint cleanly");
+
+        // The turn is over, so its cancel registration must be gone and the
+        // agent's own signal must be reset so the *next* turn is not aborted
+        // by the consumed cancel.
+        assert!(
+            crate::turn_cancel_registry::active_turn_signals(session_id).is_empty(),
+            "finished turn must unregister its cancel signal"
+        );
+        let agent_signal = {
+            let agent_guard = agent.lock().await;
+            agent_guard.graceful_shutdown_signal()
+        };
+        assert!(
+            !agent_signal.is_set(),
+            "consumed cancel must not leak into the next turn"
+        );
+    });
+    Ok(())
+}
+
 struct PanicOnForkProvider {
     forked: Arc<AtomicBool>,
+}
+
+/// Streams text deltas forever (one every 20ms) until dropped. Stands in for
+/// a live provider stream that only stops when the turn observes a cancel.
+struct NeverEndingStreamProvider;
+
+#[async_trait]
+impl Provider for NeverEndingStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        Ok(Box::pin(stream::unfold(0u64, |n| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((Ok(StreamEvent::TextDelta(format!("token{} ", n))), n + 1))
+        })))
+    }
+
+    fn name(&self) -> &str {
+        "never-ending-stream"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -281,6 +546,45 @@ impl Provider for CompleteImmediatelyProvider {
 
     fn name(&self) -> &str {
         "complete-immediately"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self)
+    }
+}
+
+#[derive(Clone, Default)]
+struct FanoutStreamProvider;
+
+#[async_trait]
+impl Provider for FanoutStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        Ok(Box::pin(stream::unfold(0_u8, |step| async move {
+            match step {
+                0 => Some((Ok(StreamEvent::TextDelta("before attach".to_string())), 1)),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Some((Ok(StreamEvent::TextDelta("after attach".to_string())), 2))
+                }
+                2 => Some((
+                    Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }),
+                    3,
+                )),
+                _ => None,
+            }
+        })))
+    }
+
+    fn name(&self) -> &str {
+        "fanout-stream"
     }
 
     fn fork(&self) -> Arc<dyn Provider> {
@@ -313,6 +617,55 @@ impl Provider for PanicOnForkProvider {
 #[test]
 fn ping_request_is_lightweight_control_request() {
     assert!((Request::Ping { id: 1 }).is_lightweight_control_request());
+}
+
+fn subscribe_request(working_dir: Option<&str>) -> Request {
+    Request::Subscribe {
+        id: 1,
+        working_dir: working_dir.map(str::to_string),
+        selfdev: None,
+        target_session_id: None,
+        client_instance_id: None,
+        client_has_local_history: false,
+        allow_session_takeover: false,
+        terminal_env: Vec::new(),
+    }
+}
+
+#[test]
+fn initial_subscribe_requires_an_absolute_client_working_dir() {
+    for invalid in [None, Some(""), Some("relative/project")] {
+        let error = initial_subscribe_working_dir(&subscribe_request(invalid))
+            .expect_err("invalid client cwd must be rejected before session creation");
+        assert!(error.contains("working_dir") || error.contains("working directory"));
+    }
+
+    let absolute = std::env::temp_dir().join("jcode-client-project");
+    assert_eq!(
+        initial_subscribe_working_dir(&subscribe_request(absolute.to_str()))
+            .expect("absolute client cwd"),
+        absolute.to_string_lossy()
+    );
+
+    let error = initial_subscribe_working_dir(&Request::GetState { id: 2 })
+        .expect_err("stateful requests must not create an unbound session");
+    assert!(error.contains("must Subscribe"));
+}
+
+#[tokio::test]
+async fn new_client_agent_stamps_client_cwd_into_initial_context() {
+    let provider: Arc<dyn Provider> = Arc::new(CompleteImmediatelyProvider);
+    let registry = Registry::new(Arc::clone(&provider)).await;
+    let client_cwd = std::env::temp_dir().join("jcode-authoritative-client-project");
+    let client_cwd = client_cwd.to_string_lossy();
+    let agent = Agent::new_with_initial_working_dir(provider, registry, Some(&client_cwd));
+
+    assert_eq!(agent.working_dir(), Some(client_cwd.as_ref()));
+    let context = agent.messages()[0].content_preview();
+    assert!(
+        context.contains(&format!("Working directory: {client_cwd}")),
+        "initial context must be created from the client cwd: {context}"
+    );
 }
 
 #[test]
@@ -422,6 +775,136 @@ fn reload_starting_rejects_new_turn_without_spawning_processing_task() {
             "rejecting during reload should not fork or invoke provider work"
         );
     });
+}
+
+#[tokio::test]
+async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attachments() {
+    let _guard = crate::storage::lock_test_env();
+    let _runtime = IsolatedRuntimeDir::new();
+    let session_id = "session_live_attachment_fanout";
+
+    let provider: Arc<dyn Provider> = Arc::new(FanoutStreamProvider);
+    let registry = Registry::new(Arc::clone(&provider)).await;
+    let mut session = crate::session::Session::create_with_id(session_id.to_string(), None, None);
+    session.model = Some("fanout-stream".to_string());
+    let agent = Arc::new(Mutex::new(Agent::new_with_session(
+        provider, registry, session, None,
+    )));
+
+    let (origin_tx, mut origin_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let (attached_tx, mut attached_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(
+        session_id.to_string(),
+        SwarmMember {
+            session_id: session_id.to_string(),
+            event_tx: origin_tx.clone(),
+            event_txs: HashMap::from([("origin".to_string(), origin_tx.clone())]),
+            working_dir: None,
+            swarm_id: None,
+            swarm_enabled: false,
+            status: "ready".to_string(),
+            detail: None,
+            task_label: None,
+            friendly_name: None,
+            report_back_to_session_id: None,
+            latest_completion_report: None,
+            role: "agent".to_string(),
+            joined_at: Instant::now(),
+            last_status_change: Instant::now(),
+            is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
+        },
+    )])));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+    let event_history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+    let event_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (swarm_event_tx, _) = broadcast::channel(8);
+    let (processing_done_tx, mut processing_done_rx) = mpsc::unbounded_channel();
+    let mut client_is_processing = false;
+    let mut processing_message_id = None;
+    let mut processing_session_id = None;
+    let mut processing_task = None;
+
+    start_processing_message(
+        ProcessingMessage {
+            id: 479,
+            content: "stream to every attachment".to_string(),
+            images: Vec::new(),
+            system_reminder: None,
+        },
+        session_id,
+        &mut ProcessingState {
+            client_is_processing: &mut client_is_processing,
+            message_id: &mut processing_message_id,
+            session_id: &mut processing_session_id,
+            task: &mut processing_task,
+        },
+        &agent,
+        &origin_tx,
+        &processing_done_tx,
+        &SwarmStatusRefs {
+            members: &swarm_members,
+            swarms_by_id: &swarms_by_id,
+            event_history: &event_history,
+            event_counter: &event_counter,
+            event_tx: &swarm_event_tx,
+        },
+    )
+    .await;
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), origin_rx.recv())
+            .await
+            .expect("origin should receive the initial stream event promptly")
+            .expect("origin event channel should remain open");
+        if matches!(event, ServerEvent::TextDelta { ref text } if text == "before attach") {
+            break;
+        }
+    }
+
+    crate::server::register_session_event_sender(
+        &swarm_members,
+        session_id,
+        "attached",
+        attached_tx,
+    )
+    .await;
+
+    for rx in [&mut origin_rx, &mut attached_rx] {
+        let mut saw_post_attach_delta = false;
+        let mut saw_message_end = false;
+        let mut saw_done = false;
+        while !saw_post_attach_delta || !saw_message_end || !saw_done {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("attachment should receive streamed event promptly")
+                .expect("attachment event channel should remain open");
+            saw_post_attach_delta |= matches!(
+                event,
+                ServerEvent::TextDelta { ref text } if text == "after attach"
+            );
+            if matches!(event, ServerEvent::MessageEnd { .. }) {
+                assert!(!saw_done, "MessageEnd must precede the terminal Done event");
+                saw_message_end = true;
+            }
+            saw_done |= matches!(event, ServerEvent::Done { id: 479 });
+        }
+    }
+
+    let (done_id, result, _) =
+        tokio::time::timeout(Duration::from_secs(2), processing_done_rx.recv())
+            .await
+            .expect("processing should complete promptly")
+            .expect("processing completion channel should remain open");
+    assert_eq!(done_id, 479);
+    result.expect("turn should complete successfully");
+
+    if let Some(handle) = processing_task.take() {
+        handle.await.expect("processing task join");
+    }
 }
 
 #[test]
@@ -645,8 +1128,7 @@ async fn lightweight_comm_request_skips_full_session_initialization() {
     let shared_context = Arc::new(RwLock::new(HashMap::new()));
     let swarm_plans = Arc::new(RwLock::new(HashMap::new()));
     let swarm_coordinators = Arc::new(RwLock::new(HashMap::new()));
-    let file_touches = Arc::new(RwLock::new(HashMap::new()));
-    let files_touched_by_session = Arc::new(RwLock::new(HashMap::new()));
+    let file_touch = FileTouchService::new();
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::new()));
     let channel_subscriptions_by_session = Arc::new(RwLock::new(HashMap::new()));
     let client_debug_state = Arc::new(RwLock::new(ClientDebugState::default()));
@@ -674,8 +1156,7 @@ async fn lightweight_comm_request_skips_full_session_initialization() {
         shared_context,
         swarm_plans,
         swarm_coordinators,
-        file_touches,
-        files_touched_by_session,
+        file_touch,
         channel_subscriptions,
         channel_subscriptions_by_session,
         client_debug_state,

@@ -1,39 +1,10 @@
+pub use jcode_provider_env::{
+    load_api_key_from_env_or_config, load_env_value_from_config_file,
+    load_env_value_from_env_or_config, register_api_key_fallback_resolver,
+    save_env_value_to_env_file,
+};
 pub use jcode_provider_metadata::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, RwLock};
-
-/// Fallback resolvers consulted by [`load_api_key_from_env_or_config`] after the
-/// environment and config-file lookups fail. Higher-level crates (notably
-/// `auth`, which scans trusted external CLI credential stores) register a
-/// resolver at startup so `provider_catalog` does not need to depend on `auth`.
-type ApiKeyFallbackResolver = fn(&str) -> Option<String>;
-
-static API_KEY_FALLBACK_RESOLVERS: LazyLock<RwLock<Vec<ApiKeyFallbackResolver>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
-
-/// Register a fallback API-key resolver consulted when env/config lookups miss.
-///
-/// This inverts the historical `provider_catalog -> auth` dependency: `auth`
-/// (the higher layer) now registers its external-credential scan here, keeping
-/// `provider_catalog` free of upward references.
-pub fn register_api_key_fallback_resolver(resolver: ApiKeyFallbackResolver) {
-    API_KEY_FALLBACK_RESOLVERS
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(resolver);
-}
-
-fn resolve_api_key_fallback(env_key: &str) -> Option<String> {
-    let resolvers = API_KEY_FALLBACK_RESOLVERS
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for resolver in resolvers.iter() {
-        if let Some(key) = resolver(env_key) {
-            return Some(key);
-        }
-    }
-    None
-}
 
 pub const OPENAI_COMPAT_LOCAL_ENABLED_ENV: &str = "JCODE_OPENAI_COMPAT_LOCAL_ENABLED";
 pub const MINIMAX_CHINA_API_BASE: &str = "https://api.minimaxi.com/v1";
@@ -162,10 +133,80 @@ fn newest_released_model_for_resolved_openai_compatible_profile(
         .filter_map(|(index, model)| {
             let id = model.id.trim().to_string();
             let created = model.created?;
-            (!id.is_empty()).then_some((created, std::cmp::Reverse(index), id))
+            // Never auto-select an obviously non-chat model (TTS/speech/embeddings/
+            // rerankers/image/etc.) as a profile's default. Catalogs like Groq,
+            // NVIDIA NIM, and Chutes expose their entire model list, and the
+            // newest-released entry is frequently a non-chat model (e.g. Groq's
+            // `canopylabs/orpheus-*` TTS), which must not become the chat default.
+            if id.is_empty() || !crate::provider::is_listable_model_name(&id) {
+                return None;
+            }
+            let tier = openai_compatible_model_quality_tier(&id);
+            Some((tier, created, std::cmp::Reverse(index), id))
         })
-        .max_by_key(|(created, reverse_index, _)| (*created, *reverse_index))
-        .map(|(_, _, id)| id)
+        // Pick the strongest tier first, then the newest within that tier, then
+        // catalog order. Ranking by quality *before* recency stops a brand-new
+        // cheap/small model (e.g. a freshly released `*-flash`/`*-mini`) from
+        // becoming the default of a heterogeneous proxy catalog (OpenCode Zen,
+        // Groq, ...) when a stronger sibling is available.
+        .max_by_key(|(tier, created, reverse_index, _)| (*tier, *created, *reverse_index))
+        .map(|(_, _, _, id)| id)
+}
+
+/// Cheap/small/fast tier markers. A model id whose tokens include one of these
+/// is a cheaper or smaller variant that must not become a profile's default
+/// while a stronger sibling exists. Matched on whole tokens (split on
+/// non-alphanumeric) so brand names like `minimax` are not mistaken for
+/// `mini`/`max`.
+const OPENAI_COMPAT_CHEAP_TIER_MARKERS: &[&str] = &[
+    "mini",
+    "nano",
+    "lite",
+    "small",
+    "tiny",
+    "flash",
+    "instant",
+    "air",
+    "micro",
+    "lightning",
+    "haiku",
+    "scout",
+    "edge",
+    "lowcost",
+];
+
+/// Flagship/strong tier markers. A model id whose tokens include one of these
+/// advertises itself as a provider's top-tier or specialized-strong model.
+const OPENAI_COMPAT_FLAGSHIP_TIER_MARKERS: &[&str] = &[
+    "opus", "max", "ultra", "pro", "plus", "large", "coder", "code", "reasoner", "405b", "480b",
+    "235b", "671b", "256b",
+];
+
+/// Coarse cross-vendor quality tier for an openai-compatible catalog model id
+/// (higher is stronger): `2` = flagship-marked, `0` = cheap/small-marked, `1`
+/// otherwise (a bare frontier id like `gpt-5.5` or `minimax-m2.7`).
+///
+/// This relies on the near-universal naming convention that cheaper variants
+/// carry a size/speed marker (`mini`, `flash`, `air`, ...) and flagship variants
+/// carry a top-tier marker (`max`, `pro`, `opus`, `coder`, ...). It is a coarse
+/// heuristic only used to break the "newest model" tie sensibly; the user can
+/// always override the selected model.
+fn openai_compatible_model_quality_tier(model_id: &str) -> u8 {
+    let lower = model_id.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = |markers: &[&str]| markers.iter().any(|marker| tokens.contains(marker));
+    // Flagship markers win when both are present (e.g. `qwen3-coder-30b`): a
+    // strong-specialization signal outweighs a size token.
+    if has(OPENAI_COMPAT_FLAGSHIP_TIER_MARKERS) {
+        return 2;
+    }
+    if has(OPENAI_COMPAT_CHEAP_TIER_MARKERS) {
+        return 0;
+    }
+    1
 }
 
 fn apply_profile_key_based_endpoint_overrides(
@@ -443,6 +484,11 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
             push("gpt-oss-120b");
             push("zai-glm-4.7");
         }
+        // Celeris serves exactly one model per base URL today, and `/models`
+        // requires auth, so keep the documented id available pre-refresh.
+        "celeris" => {
+            push("celeris-1");
+        }
         "xiaomi-mimo" => {
             push("mimo-v2.5");
             push("mimo-v2.5-pro");
@@ -472,6 +518,12 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
             push("glm-4.7");
             push("kimi-k2.5");
             push("MiniMax-M2.5");
+        }
+        "gemini-api" => {
+            push("gemini-2.5-flash");
+            push("gemini-2.5-pro");
+            push("gemini-2.0-flash");
+            push("gemini-2.0-flash-lite");
         }
         _ => {}
     }
@@ -503,7 +555,12 @@ pub fn openai_compatible_profile_context_limit(profile_id: &str, model: &str) ->
         // direct profile runs through the OpenRouter/OpenAI-compatible provider
         // implementation, whose live catalog can be unavailable during startup.
         "deepseek" if model.starts_with("deepseek-v4-") => Some(1_000_000),
-        _ => None,
+        // Fall back to the shared open-weight family classifier. Many bundled
+        // OpenAI-compatible gateways (Z.AI/GLM, Moonshot/Kimi, MiniMax, Qwen,
+        // etc.) serve `/v1/models` entries without a `context_length`, so this
+        // static table is the only reliable source before a live catalog (or an
+        // explicit user `context_window` override) is available.
+        _ => jcode_provider_core::models::open_weight_family_context_limit(&model),
     }
 }
 
@@ -792,6 +849,15 @@ fn parse_bool_like(value: &str) -> bool {
 }
 
 pub fn openai_compatible_profile_is_configured(profile: OpenAiCompatibleProfile) -> bool {
+    // When a named config profile (`[providers.<name>]`, selected via
+    // `--provider-profile`) is active, its credentials live under the runtime
+    // env vars set by `apply_named_provider_profile_env`, not the built-in
+    // `openai-compatible.env`. Honor those first so auth-test does not report a
+    // false `not_configured` for a correctly-configured named profile (#402).
+    if let Some(configured) = active_named_provider_profile_is_configured() {
+        return configured;
+    }
+
     let resolved = resolve_openai_compatible_profile(profile);
     if load_api_key_from_env_or_config(&resolved.api_key_env, &resolved.env_file).is_some() {
         return true;
@@ -808,6 +874,50 @@ pub fn openai_compatible_profile_is_configured(profile: OpenAiCompatibleProfile)
     load_env_value_from_env_or_config(OPENAI_COMPAT_LOCAL_ENABLED_ENV, &resolved.env_file)
         .map(|value| parse_bool_like(&value))
         .unwrap_or(false)
+}
+
+/// Resolve the active named provider profile's credential env var + env file,
+/// as set by [`apply_named_provider_profile_env`], if one is active.
+///
+/// Returns `(api_key_env, env_file)` describing where to look for the key.
+pub fn active_named_provider_profile_credential_source() -> Option<(String, String)> {
+    // Presence of this var marks an active named profile (set by
+    // `apply_named_provider_profile_env`).
+    let _profile_name = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())?;
+
+    let key_env = std::env::var("JCODE_OPENROUTER_API_KEY_NAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string());
+    let env_file = std::env::var("JCODE_OPENROUTER_ENV_FILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "openrouter.env".to_string());
+    Some((key_env, env_file))
+}
+
+/// Whether the active named provider profile has credentials available.
+///
+/// Returns `None` when no named profile is active (so callers fall back to the
+/// built-in profile checks), `Some(true)` when the profile is no-auth or has a
+/// key, and `Some(false)` when a key is required but missing.
+fn active_named_provider_profile_is_configured() -> Option<bool> {
+    let (key_env, env_file) = active_named_provider_profile_credential_source()?;
+
+    // A no-auth profile (localhost or explicit allow-no-auth) is configured.
+    if std::env::var("JCODE_OPENROUTER_ALLOW_NO_AUTH")
+        .map(|v| parse_bool_like(&v))
+        .unwrap_or(false)
+    {
+        return Some(true);
+    }
+
+    Some(load_api_key_from_env_or_config(&key_env, &env_file).is_some())
 }
 
 pub fn configured_api_key_source(
@@ -847,134 +957,6 @@ pub fn configured_api_key_source(
     }
 
     Some((env_key, file_name))
-}
-
-pub fn load_api_key_from_env_or_config(env_key: &str, file_name: &str) -> Option<String> {
-    if !is_safe_env_key_name(env_key) {
-        crate::logging::warn(&format!(
-            "Ignoring invalid API key variable name '{}' while loading credentials",
-            env_key
-        ));
-        return None;
-    }
-    if !is_safe_env_file_name(file_name) {
-        crate::logging::warn(&format!(
-            "Ignoring invalid env file name '{}' while loading credentials",
-            file_name
-        ));
-        return None;
-    }
-
-    if let Ok(key) = std::env::var(env_key) {
-        let key = key.trim();
-        if !key.is_empty() {
-            return Some(key.to_string());
-        }
-    }
-
-    let config_path = crate::storage::app_config_dir().ok()?.join(file_name);
-    crate::storage::harden_secret_file_permissions(&config_path);
-    let content = std::fs::read_to_string(config_path).ok()?;
-    let prefix = format!("{}=", env_key);
-
-    for line in content.lines() {
-        if let Some(key) = line.strip_prefix(&prefix) {
-            let key = key.trim().trim_matches('"').trim_matches('\'');
-            if !key.is_empty() {
-                return Some(key.to_string());
-            }
-        }
-    }
-
-    if env_key == "ZHIPU_API_KEY" {
-        if let Ok(key) = std::env::var("ZAI_API_KEY") {
-            let key = key.trim();
-            if !key.is_empty() {
-                return Some(key.to_string());
-            }
-        }
-
-        let legacy_prefix = "ZAI_API_KEY=";
-        for line in content.lines() {
-            if let Some(key) = line.strip_prefix(legacy_prefix) {
-                let key = key.trim().trim_matches('"').trim_matches('\'');
-                if !key.is_empty() {
-                    return Some(key.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(key) = resolve_api_key_fallback(env_key) {
-        return Some(key);
-    }
-
-    None
-}
-
-pub fn load_env_value_from_env_or_config(env_key: &str, file_name: &str) -> Option<String> {
-    if !is_safe_env_key_name(env_key) {
-        crate::logging::warn(&format!(
-            "Ignoring invalid variable name '{}' while loading config value",
-            env_key
-        ));
-        return None;
-    }
-    if !is_safe_env_file_name(file_name) {
-        crate::logging::warn(&format!(
-            "Ignoring invalid env file name '{}' while loading config value",
-            file_name
-        ));
-        return None;
-    }
-
-    if let Ok(value) = std::env::var(env_key) {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-
-    let config_path = crate::storage::app_config_dir().ok()?.join(file_name);
-    crate::storage::harden_secret_file_permissions(&config_path);
-    let content = std::fs::read_to_string(config_path).ok()?;
-    let prefix = format!("{}=", env_key);
-
-    for line in content.lines() {
-        if let Some(value) = line.strip_prefix(&prefix) {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-pub fn save_env_value_to_env_file(
-    env_key: &str,
-    file_name: &str,
-    value: Option<&str>,
-) -> anyhow::Result<()> {
-    if !is_safe_env_key_name(env_key) {
-        anyhow::bail!("Invalid variable name: {}", env_key);
-    }
-    if !is_safe_env_file_name(file_name) {
-        anyhow::bail!("Invalid env file name: {}", file_name);
-    }
-
-    let config_dir = crate::storage::app_config_dir()?;
-    let file_path = config_dir.join(file_name);
-    crate::storage::upsert_env_file_value(&file_path, env_key, value)?;
-
-    if let Some(value) = value {
-        crate::env::set_var(env_key, value);
-    } else {
-        crate::env::remove_var(env_key);
-    }
-
-    Ok(())
 }
 
 fn env_override(name: &str) -> Option<String> {

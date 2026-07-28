@@ -45,9 +45,8 @@ pub(super) async fn run_replay(
 
         tokio::select! {
             _ = redraw_interval.tick() => {
-                if let Some(chunk) = app.stream_buffer.flush() {
-                    app.append_streaming_text(&chunk);
-                }
+                let ops = app.stream_buffer.flush();
+                app.apply_stream_ops(ops);
             }
             event = event_stream.next() => {
                 if let Some(Ok(event)) = event {
@@ -123,7 +122,11 @@ pub(super) async fn run_swarm_replay(
     let mut should_quit = false;
 
     loop {
-        terminal.draw(|frame| draw_swarm_replay_frame(frame, &mut panes, sim_time_ms))?;
+        terminal.draw(|frame| {
+            draw_swarm_replay_frame(frame, &mut panes, sim_time_ms);
+            jcode_tui_style::adapt_buffer_for_theme(frame.buffer_mut());
+            crate::tui::ui::adapt_buffer_for_emoji_preference(frame.buffer_mut());
+        })?;
 
         if should_quit {
             break;
@@ -410,12 +413,12 @@ pub(super) fn apply_replay_event(
             app.is_processing = true;
             app.processing_started = Some(Instant::now());
             app.status = ProcessingStatus::Thinking(Instant::now());
-            app.streaming_tps_start = None;
-            app.streaming_tps_elapsed = Duration::ZERO;
-            app.streaming_tps_collect_output = false;
-            app.streaming_total_output_tokens = 0;
-            app.streaming_tps_observed_output_tokens = 0;
-            app.streaming_tps_observed_elapsed = Duration::ZERO;
+            app.streaming.streaming_tps_start = None;
+            app.streaming.streaming_tps_elapsed = Duration::ZERO;
+            app.streaming.streaming_tps_collect_output = false;
+            app.streaming.streaming_total_output_tokens = 0;
+            app.streaming.streaming_tps_observed_output_tokens = 0;
+            app.streaming.streaming_tps_observed_elapsed = Duration::ZERO;
             app.replay_processing_started_ms = replay_processing_started_ms;
         }
         ReplayEvent::MemoryInjection {

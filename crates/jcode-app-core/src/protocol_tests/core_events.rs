@@ -223,6 +223,7 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
         connection_type: Some("websocket".to_string()),
         status_detail: None,
         upstream_provider: None,
+        resolved_credential: None,
         reasoning_effort: None,
         service_tier: None,
         subagent_model: None,

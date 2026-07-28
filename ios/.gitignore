@@ -1,6 +1,8 @@
 .build/
-.swiftpm/
-Package.resolved
-*.xcodeproj
-*.xcworkspace
+.build-ios/
+JCodeMobile.xcodeproj/
 DerivedData/
+.DS_Store
+
+# Python harness caches
+TestHarness/__pycache__/

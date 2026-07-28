@@ -1,4 +1,5 @@
 const LINUX_PROCESS_TITLE_LIMIT: usize = 15;
+#[cfg(target_os = "linux")]
 const KILLALL_PROCESS_NAME: &str = "jcode";
 
 pub fn compact_process_title(prefix: &str, name: Option<&str>) -> String {
@@ -52,11 +53,47 @@ pub fn terminal_session_label(session_name: &str, display_title: Option<&str>) -
     format!("{} ({})", truncate_chars(&title, 48), session_name)
 }
 
+/// Resolve the human-authored title used by terminal windows and `/resume`.
+/// Explicit renames win over todo/goal-derived titles, which win over the
+/// generated session title.
+pub fn terminal_display_title_for_id(session_id: &str) -> Option<String> {
+    crate::session::Session::load_startup_stub(session_id)
+        .ok()
+        .and_then(|session| {
+            session
+                .custom_title
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| crate::todo::load_session_title(session_id))
+                .or(session.title)
+        })
+}
+
+/// Build the deliberately minimal terminal window title. The emoji already
+/// identifies the session/connection, so do not repeat `jcode` or the memorable
+/// animal name in window chrome.
+pub fn terminal_window_title(
+    icon: &str,
+    display_title: Option<&str>,
+    fallback_label: Option<&str>,
+    is_selfdev: bool,
+) -> String {
+    let display_title = display_title
+        .and_then(normalized_display_title)
+        .map(|title| truncate_chars(&title, 48));
+    let suffix = if is_selfdev { " [self-dev]" } else { "" };
+    let title = match display_title {
+        Some(title) => format!("{icon} {title}{suffix}"),
+        None => match fallback_label.and_then(normalized_display_title) {
+            Some(label) => format!("{icon} {label}{suffix}"),
+            None => format!("{icon}{suffix}"),
+        },
+    };
+    crate::output_style::terminal_text(&title).into_owned()
+}
+
 pub fn terminal_session_label_for_id(session_id: &str) -> String {
     let session_name = session_name(session_id);
-    let display_title = crate::session::Session::load_startup_stub(session_id)
-        .ok()
-        .and_then(|session| session.display_title().map(ToOwned::to_owned));
+    let display_title = terminal_display_title_for_id(session_id);
     match display_title.as_deref() {
         Some(title) => terminal_session_label(&session_name, Some(title)),
         None => session_name,
@@ -126,6 +163,32 @@ mod tests {
     }
 
     #[test]
+    fn terminal_window_title_omits_product_and_animal_names() {
+        assert_eq!(
+            terminal_window_title(
+                "🐙",
+                Some("resume window title"),
+                Some("jcode Octopus"),
+                false
+            ),
+            "🐙 resume window title"
+        );
+        assert_eq!(
+            terminal_window_title("🐙", None, Some("jcode Octopus"), false),
+            "🐙 jcode Octopus"
+        );
+        assert_eq!(
+            terminal_window_title(
+                "🐙",
+                Some("resume window title"),
+                Some("jcode Octopus"),
+                true
+            ),
+            "🐙 resume window title [self-dev]"
+        );
+    }
+
+    #[test]
     fn terminal_session_label_for_id_reads_custom_title_from_session() {
         let _guard = lock_test_env();
         let previous_home = std::env::var_os("JCODE_HOME");
@@ -143,6 +206,49 @@ mod tests {
         assert_eq!(
             terminal_session_label_for_id("session_fox_123"),
             "Release planning (fox)"
+        );
+
+        if let Some(previous_home) = previous_home {
+            crate::env::set_var("JCODE_HOME", previous_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    #[test]
+    fn terminal_session_label_for_id_prefers_todo_title_over_generated_title() {
+        let _guard = lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let temp = tempfile::tempdir().expect("temp dir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        let session_id = "session_fox_456";
+        let mut session = crate::session::Session::create_with_id(
+            session_id.to_string(),
+            None,
+            Some("Generated title".to_string()),
+        );
+        session.save().expect("save session");
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                content: "Synchronize terminal window names".to_string(),
+                status: "in_progress".to_string(),
+                priority: "high".to_string(),
+                id: "window-title".to_string(),
+                group: Some("resume title sync".to_string()),
+                confidence: Some(90),
+                completion_confidence: None,
+                confidence_history: Vec::new(),
+                blocked_by: Vec::new(),
+                assigned_to: None,
+            }],
+        )
+        .expect("save todos");
+
+        assert_eq!(
+            terminal_session_label_for_id(session_id),
+            "resume title sync (fox)"
         );
 
         if let Some(previous_home) = previous_home {

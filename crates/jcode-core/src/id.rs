@@ -1,4 +1,7 @@
 use chrono::Utc;
+use std::collections::HashSet;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub fn new_id(prefix: &str) -> String {
     let ts = Utc::now().timestamp_millis();
@@ -10,38 +13,41 @@ pub fn new_id(prefix: &str) -> String {
 ///
 /// Servers now use location nouns while sessions use client/entity nouns,
 /// producing names like "harbor fox" or "observatory otter".
+///
+/// Icon constraints match `SESSION_NAMES`: single codepoints with default
+/// emoji presentation (no VS16), see the comment there.
 const SERVER_MODIFIERS: &[(&str, &str)] = &[
     // Natural places
     ("cove", "🌊"),
     ("grove", "🌳"),
     ("meadow", "🌾"),
     ("marsh", "🌿"),
-    ("lake", "🏞️"),
-    ("river", "🏞️"),
+    ("lake", "🛶"),
+    ("river", "🚣"),
     ("creek", "💧"),
     ("brook", "💧"),
-    ("cliff", "🏔️"),
-    ("peak", "⛰️"),
-    ("summit", "🏔️"),
+    ("cliff", "🧗"),
+    ("peak", "🗻"),
+    ("summit", "🚠"),
     ("forest", "🌲"),
     ("garden", "🌷"),
-    ("island", "🏝️"),
-    ("desert", "🏜️"),
-    ("beach", "🏖️"),
+    ("island", "🌴"),
+    ("desert", "🌵"),
+    ("beach", "🏄"),
     // Built places
     ("harbor", "⚓"),
     ("camp", "⛺"),
     ("forge", "🔥"),
-    ("citadel", "🏛️"),
+    ("citadel", "🏯"),
     ("station", "🚉"),
     ("observatory", "🔭"),
-    ("workshop", "🛠️"),
+    ("workshop", "🔨"),
     ("lighthouse", "🗼"),
-    ("temple", "🏛️"),
+    ("temple", "⛪"),
     ("castle", "🏰"),
     ("bridge", "🌉"),
     ("fountain", "⛲"),
-    ("stadium", "🏟️"),
+    ("stadium", "🎪"),
     ("factory", "🏭"),
     ("pagoda", "🛕"),
     ("hut", "🛖"),
@@ -49,42 +55,38 @@ const SERVER_MODIFIERS: &[(&str, &str)] = &[
 
 /// Session/client names with their icons.
 const SESSION_NAMES: &[(&str, &str)] = &[
-    // Animals and client entities
+    // Animals, nature companions, and client entities. Every emoji here is a single, widely-supported
+    // codepoint (Unicode <= 12.0, no ZWJ sequences) with *default emoji
+    // presentation* (no VS16 / U+FE0F needed). Text-default codepoints that rely
+    // on VS16 render as monochrome outlines or tofu in macOS window titles
+    // (Ghostty/Terminal tab and titlebar fonts ignore the selector), so they are
+    // banned by `session_icons_render_as_single_safe_glyphs`.
     ("ant", "🐜"),
     ("bat", "🦇"),
-    ("bee", "🐝"),
     ("bird", "🐦"),
     ("bug", "🐛"),
     ("cat", "🐱"),
     ("chicken", "🐔"),
     ("chick", "🐥"),
-    ("chipmunk", "🐿️"),
-    ("cockroach", "🪳"),
+    ("chipmunk", "🌰"),
     ("cow", "🐄"),
     ("crocodile", "🐊"),
     ("cricket", "🦗"),
-    ("dodo", "🦤"),
     ("dog", "🐕"),
-    ("dove", "🕊️"),
+    ("dove", "🤍"),
     ("eagle", "🦅"),
-    ("falcon", "🦅"),
     ("fish", "🐟"),
-    ("fly", "🪰"),
     ("fox", "🦊"),
     ("giraffe", "🦒"),
     ("hamster", "🐹"),
-    ("hawk", "🦅"),
     ("ladybug", "🐞"),
     ("lobster", "🦞"),
-    ("mammoth", "🦣"),
     ("mosquito", "🦟"),
     ("owl", "🦉"),
     ("ox", "🐂"),
     ("pig", "🐷"),
-    ("polar-bear", "🐻‍❄️"),
     ("rat", "🐀"),
     ("ram", "🐏"),
-    ("raven", "🐦‍⬛"),
     ("rooster", "🐓"),
     ("shrimp", "🦐"),
     ("sauropod", "🦕"),
@@ -94,19 +96,15 @@ const SESSION_NAMES: &[(&str, &str)] = &[
     ("badger", "🦡"),
     ("bear", "🐻"),
     ("crab", "🦀"),
-    ("crow", "🐦‍⬛"),
     ("deer", "🦌"),
     ("duck", "🦆"),
     ("frog", "🐸"),
     ("goat", "🐐"),
     ("lion", "🦁"),
-    ("moth", "🦋"),
     ("wolf", "🐺"),
-    ("goose", "🪿"),
     ("horse", "🐴"),
     ("koala", "🐨"),
     ("llama", "🦙"),
-    ("moose", "🫎"),
     ("mouse", "🐭"),
     ("otter", "🦦"),
     ("panda", "🐼"),
@@ -117,14 +115,13 @@ const SESSION_NAMES: &[(&str, &str)] = &[
     ("sloth", "🦥"),
     ("snail", "🐌"),
     ("snake", "🐍"),
-    ("spider", "🕷️"),
+    ("spider", "🧶"),
     ("squid", "🦑"),
     ("swan", "🦢"),
     ("t-rex", "🦖"),
     ("tiger", "🐯"),
     ("turkey", "🦃"),
     ("whale", "🐋"),
-    ("worm", "🪱"),
     ("turtle", "🐢"),
     ("rabbit", "🐰"),
     ("parrot", "🦜"),
@@ -133,28 +130,72 @@ const SESSION_NAMES: &[(&str, &str)] = &[
     ("monkey", "🐒"),
     ("gorilla", "🦍"),
     ("orangutan", "🦧"),
-    ("donkey", "🫏"),
     ("camel", "🐫"),
     ("elephant", "🐘"),
     ("rhino", "🦏"),
     ("hippo", "🦛"),
-    ("bison", "🦬"),
     ("boar", "🐗"),
     ("unicorn", "🦄"),
     ("kangaroo", "🦘"),
     ("hedgehog", "🦔"),
-    ("beaver", "🦫"),
     ("skunk", "🦨"),
     ("raccoon", "🦝"),
-    ("seal", "🦭"),
     ("flamingo", "🦩"),
     ("dolphin", "🐬"),
     ("octopus", "🐙"),
-    ("jellyfish", "🪼"),
     ("scorpion", "🦂"),
-    ("beetle", "🪲"),
     ("zebra", "🦓"),
+    ("stallion", "🐎"),
+    ("dromedary", "🐪"),
+    ("hog", "🐖"),
+    ("kitten", "🐈"),
+    ("poodle", "🐩"),
+    ("hare", "🐇"),
+    ("vole", "🐁"),
+    ("dragon", "🐉"),
+    ("humpback", "🐳"),
+    ("guppy", "🐠"),
+    ("nautilus", "🐚"),
+    ("hatchling", "🐣"),
+    ("wyvern", "🐲"),
+    ("calf", "🐮"),
+    ("macaque", "🐵"),
+    ("tigress", "🐅"),
+    // Additional terminal-safe identities. These deliberately stay on Unicode
+    // 12 or older so they work in terminal tabs and window titles without a
+    // bundled emoji font. `bee` is intentionally absent: 🐝 is reserved for the
+    // global swarm marker rather than an individual client.
+    ("puppy", "🐶"),
+    ("duckling", "🐤"),
+    ("mizaru", "🙈"),
+    ("kikazaru", "🙉"),
+    ("iwazaru", "🙊"),
+    ("retriever", "🦮"),
+    ("pawprint", "🐾"),
+    ("piglet", "🐽"),
+    ("bonehound", "🦴"),
+    ("sabertooth", "🦷"),
+    ("microbe", "🦠"),
+    ("mushroom", "🍄"),
+    ("cactus", "🌵"),
+    ("clover", "🍀"),
+    ("sunflower", "🌻"),
+    ("hibiscus", "🌺"),
+    ("blossom", "🌸"),
+    ("daisy", "🌼"),
+    ("tulip", "🌷"),
+    ("rose", "🌹"),
+    ("maple", "🍁"),
+    ("seedling", "🌱"),
+    ("evergreen", "🌲"),
+    ("palmtree", "🌴"),
+    ("herb", "🌿"),
 ];
+
+fn session_name_cursor() -> &'static AtomicUsize {
+    static CURSOR: OnceLock<AtomicUsize> = OnceLock::new();
+    CURSOR.get_or_init(|| AtomicUsize::new((rand::random::<u64>() as usize) % SESSION_NAMES.len()))
+}
 
 /// Get an emoji icon for a session/client name word.
 pub fn session_icon(name: &str) -> &'static str {
@@ -209,12 +250,31 @@ pub fn extract_server_name(server_id: &str) -> Option<&str> {
 /// - full_id is the storage identifier like "session_fox_1234567890_deadbeefcafebabe"
 /// - short_name is the memorable part like "fox"
 pub fn new_memorable_session_id() -> (String, String) {
+    new_memorable_session_id_avoiding(&HashSet::new())
+}
+
+/// Generate a memorable session identity that avoids names already held by
+/// active sessions. A process-wide atomic cursor gives concurrent creators
+/// distinct candidates, while `used_names` preserves uniqueness across server
+/// reloads by excluding identities discovered from active-session markers.
+///
+/// When every portable identity is occupied, allocation gracefully wraps and
+/// permits reuse rather than preventing session creation.
+pub fn new_memorable_session_id_avoiding(used_names: &HashSet<String>) -> (String, String) {
     let ts = Utc::now().timestamp_millis();
     let rand: u64 = rand::random();
 
-    // Use the random value to pick a word
-    let idx = (rand as usize) % SESSION_NAMES.len();
-    let (word, _) = SESSION_NAMES[idx];
+    let cursor = session_name_cursor();
+    let word = (0..SESSION_NAMES.len())
+        .find_map(|_| {
+            let idx = cursor.fetch_add(1, Ordering::Relaxed) % SESSION_NAMES.len();
+            let (word, _) = SESSION_NAMES[idx];
+            (!used_names.contains(word)).then_some(word)
+        })
+        .unwrap_or_else(|| {
+            let idx = cursor.fetch_add(1, Ordering::Relaxed) % SESSION_NAMES.len();
+            SESSION_NAMES[idx].0
+        });
 
     let short_name = word.to_string();
     let full_id = format!("session_{}_{ts}_{rand:016x}", word);
@@ -302,6 +362,105 @@ mod tests {
             let icon = session_icon(name);
             assert_eq!(icon, *expected_icon, "Icon mismatch for '{}'", name);
             assert_ne!(icon, "💫", "Name '{}' should have a specific icon", name);
+        }
+    }
+
+    #[test]
+    fn session_identity_pool_is_expanded_and_reserves_bee_for_swarm() {
+        assert_eq!(SESSION_NAMES.len(), 125);
+        assert!(
+            SESSION_NAMES
+                .iter()
+                .all(|(name, icon)| *name != "bee" && *icon != "🐝"),
+            "the bee identity must remain reserved for the global swarm marker"
+        );
+        assert_eq!(session_icon("bee"), "💫");
+    }
+
+    #[test]
+    fn avoiding_allocator_uses_every_available_identity_before_reuse() {
+        let mut used = HashSet::new();
+        for _ in 0..SESSION_NAMES.len() {
+            let (_, name) = new_memorable_session_id_avoiding(&used);
+            assert!(used.insert(name), "allocator reused an available identity");
+        }
+        assert_eq!(used.len(), SESSION_NAMES.len());
+
+        // Exhaustion must degrade to reuse rather than blocking session creation.
+        let (id, reused) = new_memorable_session_id_avoiding(&used);
+        assert!(id.starts_with(&format!("session_{reused}_")));
+        assert!(used.contains(&reused));
+    }
+
+    /// Returns true for emoji that commonly fail to render as a single glyph on
+    /// older terminal fonts or in window titles: ZWJ sequences (split into
+    /// pieces), codepoints added in Unicode 13.0 or later (rendered as tofu
+    /// boxes on fonts that predate them), and VS16 variation sequences
+    /// (text-default codepoints + U+FE0F, which macOS window/tab title fonts
+    /// render as monochrome outlines or tofu because the title renderer
+    /// ignores the emoji-presentation selector - the Ghostty-on-macOS bug).
+    /// We avoid a broad block range here because the Supplemental Symbols
+    /// block mixes safe Unicode 11/12 emoji (otter, sloth) with risky Unicode
+    /// 13+ ones (mammoth, beaver), so we list the unsafe codepoints
+    /// explicitly.
+    fn is_fragile_emoji(emoji: &str) -> bool {
+        // Unicode 13.0+ additions in the Supplemental Symbols block (U+1F900..U+1F9FF).
+        const UNSAFE_SUPPLEMENTAL: &[u32] = &[
+            0x1F9A3, // 🦣 mammoth (13.0)
+            0x1F9A4, // 🦤 dodo (13.0)
+            0x1F9AB, // 🦫 beaver (13.0)
+            0x1F9AC, // 🦬 bison (13.0)
+            0x1F9AD, // 🦭 seal (13.0)
+        ];
+        emoji.chars().any(|c| {
+            let cp = c as u32;
+            c == '\u{200D}'
+                // VS16: emoji needing it are text-default and misrender in titles.
+                || c == '\u{FE0F}'
+                // Symbols and Pictographs Extended-A (entirely Unicode 13+).
+                || (0x1FA70..=0x1FAFF).contains(&cp)
+                || UNSAFE_SUPPLEMENTAL.contains(&cp)
+        })
+    }
+
+    #[test]
+    fn session_icons_render_as_single_safe_glyphs() {
+        for (name, emoji) in SESSION_NAMES {
+            assert!(
+                !is_fragile_emoji(emoji),
+                "session name '{}' uses fragile emoji '{}' (ZWJ or Unicode 13+); \
+                 pick a single widely-supported codepoint instead",
+                name,
+                emoji
+            );
+        }
+    }
+
+    #[test]
+    fn session_names_and_icons_are_unique() {
+        let mut names = std::collections::HashSet::new();
+        let mut icons = std::collections::HashSet::new();
+        for (name, emoji) in SESSION_NAMES {
+            assert!(names.insert(*name), "duplicate session name '{}'", name);
+            assert!(
+                icons.insert(*emoji),
+                "duplicate session icon '{}' (reused by '{}')",
+                emoji,
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn server_icons_render_as_single_safe_glyphs() {
+        for (name, emoji) in SERVER_MODIFIERS {
+            assert!(
+                !is_fragile_emoji(emoji),
+                "server name '{}' uses fragile emoji '{}' (ZWJ or Unicode 13+); \
+                 pick a single widely-supported codepoint instead",
+                name,
+                emoji
+            );
         }
     }
 

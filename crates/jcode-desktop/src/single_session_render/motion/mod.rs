@@ -6,6 +6,8 @@
 
 mod scrollbar;
 mod streaming_cue;
+mod streaming_reveal;
 
 pub(crate) use scrollbar::*;
 pub(crate) use streaming_cue::*;
+pub(crate) use streaming_reveal::*;

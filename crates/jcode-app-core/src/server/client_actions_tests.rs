@@ -1,6 +1,8 @@
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
+
 use super::{
     NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
-    handle_set_feature,
+    handle_resume_all_sessions, handle_set_feature,
 };
 use crate::agent::Agent;
 use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
@@ -17,6 +19,22 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::{Duration, timeout};
+
+#[allow(clippy::type_complexity)]
+fn empty_swarm_status_state() -> (
+    Arc<RwLock<HashMap<String, std::collections::HashSet<String>>>>,
+    Arc<RwLock<std::collections::VecDeque<crate::server::SwarmEvent>>>,
+    Arc<std::sync::atomic::AtomicU64>,
+    tokio::sync::broadcast::Sender<crate::server::SwarmEvent>,
+) {
+    let (swarm_event_tx, _) = tokio::sync::broadcast::channel(16);
+    (
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(std::collections::VecDeque::new())),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        swarm_event_tx,
+    )
+}
 
 struct MockProvider;
 
@@ -120,10 +138,25 @@ fn clone_split_session_uses_persisted_session_state() {
     let child = crate::session::Session::load(&child_id).expect("load child");
 
     assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
-    assert_eq!(child.messages.len(), parent.messages.len());
+    assert_eq!(
+        child.messages.len(),
+        parent.messages.len() + 1,
+        "fork should inherit the transcript plus one fork notice"
+    );
     assert_eq!(
         child.messages[0].content_preview(),
         parent.messages[0].content_preview()
+    );
+    let fork_notice = child.messages.last().expect("fork notice message");
+    assert_eq!(
+        fork_notice.display_role,
+        Some(crate::session::StoredDisplayRole::System),
+        "fork notice must be hidden from the visible transcript"
+    );
+    let fork_notice_text = fork_notice.content_preview();
+    assert!(
+        fork_notice_text.contains("forked") && fork_notice_text.contains(parent.id.as_str()),
+        "fork notice should mention the parent session: {fork_notice_text}"
     );
     assert_eq!(child.compaction, parent.compaction);
     assert_eq!(child.working_dir, parent.working_dir);
@@ -157,6 +190,7 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
             swarm_enabled: false,
             status: "ready".to_string(),
             detail: None,
+            task_label: None,
             friendly_name: Some("duck".to_string()),
             report_back_to_session_id: None,
             latest_completion_report: None,
@@ -164,6 +198,10 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
             joined_at: now,
             last_status_change: now,
             is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
         },
     )])));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
@@ -259,6 +297,7 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
             swarm_enabled: false,
             status: "ready".to_string(),
             detail: None,
+            task_label: None,
             friendly_name: Some("stale".to_string()),
             report_back_to_session_id: None,
             latest_completion_report: None,
@@ -266,6 +305,10 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
             joined_at: now,
             last_status_change: now,
             is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
         },
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
@@ -340,6 +383,7 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
             last_seen: Instant::now(),
             is_processing: false,
             current_tool_name: None,
+            terminal_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         },
     )])));
@@ -355,6 +399,7 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
             swarm_enabled: false,
             status: "ready".to_string(),
             detail: None,
+            task_label: None,
             friendly_name: Some("otter".to_string()),
             report_back_to_session_id: None,
             latest_completion_report: None,
@@ -362,10 +407,15 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
             joined_at: Instant::now(),
             last_status_change: Instant::now(),
             is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
         },
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
+    let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
     handle_notify_session(
         77,
         session_id.clone(),
@@ -375,6 +425,10 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
             soft_interrupt_queues: &soft_interrupt_queues,
             client_connections: &client_connections,
             swarm_members: &swarm_members,
+            swarms_by_id: &swarms_by_id,
+            event_history: &event_history,
+            event_counter: &event_counter,
+            swarm_event_tx: &swarm_event_tx,
             client_event_tx: &client_event_tx,
         },
     )
@@ -446,6 +500,7 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
             last_seen: Instant::now(),
             is_processing: false,
             current_tool_name: None,
+            terminal_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         },
     )])));
@@ -461,6 +516,7 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
             swarm_enabled: false,
             status: "running".to_string(),
             detail: None,
+            task_label: None,
             friendly_name: Some("otter".to_string()),
             report_back_to_session_id: None,
             latest_completion_report: None,
@@ -468,12 +524,17 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
             joined_at: Instant::now(),
             last_status_change: Instant::now(),
             is_headless: false,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
         },
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
     let _busy_guard = agent.lock().await;
 
+    let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
     handle_notify_session(
         88,
         session_id.clone(),
@@ -483,6 +544,10 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
             soft_interrupt_queues: &soft_interrupt_queues,
             client_connections: &client_connections,
             swarm_members: &swarm_members,
+            swarms_by_id: &swarms_by_id,
+            event_history: &event_history,
+            event_counter: &event_counter,
+            swarm_event_tx: &swarm_event_tx,
             client_event_tx: &client_event_tx,
         },
     )
@@ -521,4 +586,218 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
             .iter()
             .any(|event| matches!(event, ServerEvent::Done { id } if *id == 88))
     );
+}
+
+/// Build a live SwarmMember with a real client attachment so the resume-all
+/// sweep treats it as live. Returns the member and the receiver for events
+/// fanned out to that attachment.
+fn live_member(session_id: &str) -> (SwarmMember, mpsc::UnboundedReceiver<ServerEvent>) {
+    let (attach_tx, attach_rx) = mpsc::unbounded_channel();
+    let member = SwarmMember {
+        session_id: session_id.to_string(),
+        event_tx: mpsc::unbounded_channel().0,
+        event_txs: HashMap::from([("client-1".to_string(), attach_tx)]),
+        working_dir: None,
+        swarm_id: None,
+        swarm_enabled: false,
+        status: "ready".to_string(),
+        detail: None,
+        task_label: None,
+        friendly_name: Some("otter".to_string()),
+        report_back_to_session_id: None,
+        latest_completion_report: None,
+        role: "agent".to_string(),
+        joined_at: Instant::now(),
+        last_status_change: Instant::now(),
+        is_headless: false,
+        output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        runtime: crate::protocol::SwarmMemberRuntime::default(),
+    };
+    (member, attach_rx)
+}
+
+#[tokio::test]
+async fn resume_all_continues_interrupted_idle_live_session() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let provider = Arc::new(StreamingMockProvider::default());
+    provider.queue_response(vec![
+        StreamEvent::TextDelta("Continuing where I left off.".to_string()),
+        StreamEvent::MessageEnd { stop_reason: None },
+    ]);
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+    let registry = Registry::new(provider_dyn.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider_dyn, registry)));
+    let session_id = {
+        let mut guard = agent.lock().await;
+        // Leave the session with a pending user turn the assistant never answered
+        // (simulating a turn that errored / was interrupted mid-generation).
+        guard.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "please keep going on the refactor".to_string(),
+                cache_control: None,
+            }],
+        );
+        guard.session_id().to_string()
+    };
+
+    let sessions = Arc::new(RwLock::new(HashMap::<String, Arc<Mutex<Agent>>>::from([(
+        session_id.clone(),
+        agent.clone(),
+    )])));
+    let (member, mut attach_rx) = live_member(&session_id);
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    handle_resume_all_sessions(
+        91,
+        &sessions,
+        &swarm_members,
+        &swarms_by_id,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &client_event_tx,
+    )
+    .await;
+
+    // The session should resume and stream the continuation.
+    let streamed = timeout(Duration::from_secs(2), async {
+        loop {
+            match attach_rx.recv().await {
+                Some(ServerEvent::TextDelta { text })
+                    if text.contains("Continuing where I left off.") =>
+                {
+                    return text;
+                }
+                Some(_) => continue,
+                None => panic!("live attachment closed before continuation streamed"),
+            }
+        }
+    })
+    .await
+    .expect("interrupted session should resume promptly");
+    assert!(streamed.contains("Continuing where I left off."));
+
+    // The requesting client receives a summary describing one resumed session.
+    let result = timeout(Duration::from_secs(2), async {
+        loop {
+            match client_event_rx.recv().await {
+                Some(event @ ServerEvent::ResumeAllResult { .. }) => return event,
+                Some(_) => continue,
+                None => panic!("client channel closed before resume-all result"),
+            }
+        }
+    })
+    .await
+    .expect("resume-all result should be emitted");
+    match result {
+        ServerEvent::ResumeAllResult {
+            id,
+            resumed,
+            skipped,
+            ..
+        } => {
+            assert_eq!(id, 91);
+            assert_eq!(resumed, 1);
+            assert_eq!(skipped, 0);
+        }
+        other => panic!("expected ResumeAllResult, got {other:?}"),
+    }
+
+    if let Some(home) = prev_home {
+        crate::env::set_var("JCODE_HOME", home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[tokio::test]
+async fn resume_all_skips_session_with_completed_turn() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Arc::new(Mutex::new(Agent::new(provider, registry)));
+    let session_id = {
+        let mut guard = agent.lock().await;
+        // A completed turn: last visible message is from the assistant.
+        guard.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "do the thing".to_string(),
+                cache_control: None,
+            }],
+        );
+        guard.add_message(
+            Role::Assistant,
+            vec![ContentBlock::Text {
+                text: "done".to_string(),
+                cache_control: None,
+            }],
+        );
+        guard.session_id().to_string()
+    };
+
+    let sessions = Arc::new(RwLock::new(HashMap::<String, Arc<Mutex<Agent>>>::from([(
+        session_id.clone(),
+        agent.clone(),
+    )])));
+    let (member, _attach_rx) = live_member(&session_id);
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    handle_resume_all_sessions(
+        92,
+        &sessions,
+        &swarm_members,
+        &swarms_by_id,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &client_event_tx,
+    )
+    .await;
+
+    let result = timeout(Duration::from_secs(2), async {
+        loop {
+            match client_event_rx.recv().await {
+                Some(event @ ServerEvent::ResumeAllResult { .. }) => return event,
+                Some(_) => continue,
+                None => panic!("client channel closed before resume-all result"),
+            }
+        }
+    })
+    .await
+    .expect("resume-all result should be emitted");
+    match result {
+        ServerEvent::ResumeAllResult {
+            id,
+            resumed,
+            skipped,
+            ..
+        } => {
+            assert_eq!(id, 92);
+            assert_eq!(resumed, 0);
+            assert_eq!(skipped, 1);
+        }
+        other => panic!("expected ResumeAllResult, got {other:?}"),
+    }
+
+    if let Some(home) = prev_home {
+        crate::env::set_var("JCODE_HOME", home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
 }

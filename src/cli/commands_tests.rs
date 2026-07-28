@@ -131,6 +131,7 @@ fn configured_auth_test_targets_only_include_configured_supported_providers() {
         anthropic: ProviderAuth {
             state: AuthState::Available,
             has_oauth: true,
+            oauth_state: AuthState::Available,
             has_api_key: false,
         },
         openai: AuthState::NotConfigured,
@@ -265,26 +266,66 @@ fn test_todo(
 }
 
 #[test]
-fn run_auto_poke_followup_sends_confidence_summary_when_todos_are_done() {
+fn run_auto_poke_followup_targets_below_threshold_todos() {
     let todos = vec![
         test_todo("a", "completed", "high", Some(90), Some(90)),
         test_todo("b", "completed", "low", Some(80), Some(80)),
     ];
 
-    let followup = build_run_auto_poke_follow_up_from_todos(&todos, false);
+    let followup = build_run_auto_poke_follow_up_from_todos(&todos, false, None);
 
     match followup {
         Some(RunAutoPokeFollowUp::ConfidenceSummary {
             total_todos,
             message,
+            ..
         }) => {
             assert_eq!(total_todos, 2);
-            assert!(message.contains("All todos are done. Todo confidence summary:"));
-            assert!(message.contains("- Weighted completion confidence: 88%."));
-            assert!(message.contains("- 1 completed todo is below the 90% confidence threshold."));
+            assert_eq!(message, crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE);
+            assert!(!message.chars().any(|ch| ch.is_ascii_digit()));
+            assert!(message.contains("completion confidence"));
+            assert!(!message.to_ascii_lowercase().contains("threshold"));
         }
         _ => panic!("expected confidence-summary follow-up"),
     }
+}
+
+#[test]
+fn run_auto_poke_followup_challenges_abrupt_confidence_once() {
+    let mut todo = test_todo("a", "completed", "high", Some(0), Some(100));
+    todo.confidence_history = vec![0, 100];
+
+    let todos = [todo];
+    match build_run_auto_poke_follow_up_from_todos(&todos, false, None) {
+        Some(RunAutoPokeFollowUp::ConfidenceSummary {
+            message,
+            confidence_spike_challenge,
+            ..
+        }) => {
+            assert!(confidence_spike_challenge);
+            assert_eq!(
+                message,
+                crate::todo::TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE
+            );
+        }
+        _ => panic!("expected confidence-spike challenge"),
+    }
+    assert!(build_run_auto_poke_follow_up_from_todos(&todos, true, None).is_none());
+}
+
+#[test]
+fn run_auto_poke_followup_silent_when_confident_and_earned() {
+    // All above threshold and no spikes: the old behavior sent an "all good"
+    // summary anyway; now we spend no tokens and end the run.
+    let todos = vec![
+        {
+            let mut todo = test_todo("a", "completed", "high", Some(100), Some(100));
+            todo.confidence_history = vec![70, 80, 90, 100];
+            todo
+        },
+        test_todo("b", "completed", "low", Some(98), Some(98)),
+    ];
+    assert!(build_run_auto_poke_follow_up_from_todos(&todos, false, None).is_none());
 }
 
 #[test]
@@ -294,7 +335,7 @@ fn run_auto_poke_followup_prioritizes_incomplete_todos() {
         test_todo("b", "in_progress", "medium", Some(80), None),
     ];
 
-    let followup = build_run_auto_poke_follow_up_from_todos(&todos, false);
+    let followup = build_run_auto_poke_follow_up_from_todos(&todos, false, None);
 
     match followup {
         Some(RunAutoPokeFollowUp::Incomplete { count, message }) => {
@@ -308,11 +349,170 @@ fn run_auto_poke_followup_prioritizes_incomplete_todos() {
     }
 }
 
+/// Headless `jcode run` is what the benchmarks and scripted use go through, so
+/// the deferred quality review must reach that path too, not only the TUI.
 #[test]
-fn run_auto_poke_followup_sends_confidence_summary_once() {
-    let todos = vec![test_todo("a", "completed", "high", Some(95), Some(95))];
+fn run_auto_poke_delivers_the_deferred_gate_digest_before_confidence() {
+    let todos = vec![test_todo("a", "completed", "high", Some(80), Some(80))];
+    // Without a digest, the confidence gate is what fires.
+    assert!(matches!(
+        build_run_auto_poke_follow_up_from_todos(&todos, false, None),
+        Some(RunAutoPokeFollowUp::ConfidenceSummary { .. })
+    ));
+    // With one, the weak points are reviewed first, since that work can change
+    // the very assessments the confidence gate judges.
+    match build_run_auto_poke_follow_up_from_todos(
+        &todos,
+        false,
+        Some("review these points".to_string()),
+    ) {
+        Some(RunAutoPokeFollowUp::GateDigest { message }) => {
+            assert_eq!(message, "review these points");
+        }
+        _ => panic!("expected the gate digest to take precedence"),
+    }
+}
 
-    assert!(build_run_auto_poke_follow_up_from_todos(&todos, true).is_none());
+/// Open todos mean the agent is still working, so the review must wait for the
+/// turn to actually end rather than interrupting mid-flight.
+#[test]
+fn run_auto_poke_prefers_incomplete_todos_over_the_gate_digest() {
+    let todos = vec![test_todo("a", "in_progress", "high", Some(80), None)];
+    assert!(matches!(
+        build_run_auto_poke_follow_up_from_todos(
+            &todos,
+            false,
+            Some("review these points".to_string())
+        ),
+        Some(RunAutoPokeFollowUp::Incomplete { .. })
+    ));
+}
+
+/// Regression: the digest is consumed from the log before the follow-up is
+/// chosen, so a turn with open todos must not destroy it. Auto-poke iterates
+/// many times with open todos on a long run, and each pass used to silently
+/// discard the observations, meaning the reminder never survived to delivery.
+#[test]
+fn open_todos_do_not_consume_the_pending_gate_digest() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", dir.path());
+    let session = "run-gate-digest-open-todos";
+
+    crate::todo::append_gate_observations(
+        session,
+        &[crate::todo::GateObservation {
+            kind: crate::todo::GateObservationKind::IntentUnderstanding,
+            group: None,
+            score: Some(70),
+        }],
+    )
+    .expect("append");
+
+    let open = vec![test_todo("a", "in_progress", "high", Some(80), None)];
+    assert!(matches!(
+        build_run_auto_poke_follow_up_from_todos(
+            &open,
+            false,
+            take_run_gate_digest_if_turn_ended(session, false, &open),
+        ),
+        Some(RunAutoPokeFollowUp::Incomplete { .. })
+    ));
+    assert!(
+        !crate::todo::load_gate_observations(session)
+            .expect("reload")
+            .is_empty(),
+        "observations must survive a poke iteration that still has open work"
+    );
+
+    // Once the work closes, the reminder is still there to deliver.
+    let done = vec![test_todo("a", "completed", "high", Some(80), Some(100))];
+    match build_run_auto_poke_follow_up_from_todos(
+        &done,
+        false,
+        take_run_gate_digest_if_turn_ended(session, false, &done),
+    ) {
+        Some(RunAutoPokeFollowUp::GateDigest { message }) => {
+            assert!(message.starts_with(crate::todo::TODO_GATE_DIGEST_PREFIX));
+        }
+        other => panic!("expected the preserved digest to be delivered, got {other:?}"),
+    }
+    assert!(
+        crate::todo::load_gate_observations(session)
+            .expect("reload")
+            .is_empty(),
+        "delivering the digest should consume the log"
+    );
+
+    match previous_home {
+        Some(value) => crate::env::set_var("JCODE_HOME", value),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
+/// The log must be consumed even when everything resolved, or stale
+/// observations would leak into the next turn and re-raise settled points./// The log must be consumed even when everything resolved, or stale
+/// observations would leak into the next turn and re-raise settled points.
+#[test]
+fn take_run_gate_digest_consumes_the_log_and_respects_delivery() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", dir.path());
+    let session = "run-gate-digest";
+
+    crate::todo::append_gate_observations(
+        session,
+        &[crate::todo::GateObservation {
+            kind: crate::todo::GateObservationKind::IntentUnderstanding,
+            group: None,
+            score: Some(70),
+        }],
+    )
+    .expect("append");
+
+    // Already delivered this turn: no second reminder, and the log is left for
+    // the delivering path to have handled.
+    assert!(take_run_gate_digest(session, true).is_none());
+
+    let digest = take_run_gate_digest(session, false).expect("unresolved point should surface");
+    assert!(digest.starts_with(crate::todo::TODO_GATE_DIGEST_PREFIX));
+    // Consumed, so the next turn starts clean.
+    assert!(
+        crate::todo::load_gate_observations(session)
+            .expect("reload")
+            .is_empty()
+    );
+    assert!(take_run_gate_digest(session, false).is_none());
+
+    match previous_home {
+        Some(value) => crate::env::set_var("JCODE_HOME", value),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
+#[test]
+fn run_auto_poke_followup_rechecks_completion_confidence_until_it_passes() {
+    let needs_validation = vec![test_todo("a", "completed", "high", Some(80), Some(80))];
+    assert!(matches!(
+        build_run_auto_poke_follow_up_from_todos(&needs_validation, false, None),
+        Some(RunAutoPokeFollowUp::ConfidenceSummary { .. })
+    ));
+    assert!(matches!(
+        build_run_auto_poke_follow_up_from_todos(&needs_validation, false, None),
+        Some(RunAutoPokeFollowUp::ConfidenceSummary { .. })
+    ));
+
+    let validated = vec![test_todo("a", "completed", "high", Some(80), Some(100))];
+    assert!(matches!(
+        build_run_auto_poke_follow_up_from_todos(&validated, false, None),
+        Some(RunAutoPokeFollowUp::ConfidenceSummary {
+            confidence_spike_challenge: true,
+            ..
+        })
+    ));
+    assert!(build_run_auto_poke_follow_up_from_todos(&validated, true, None).is_none());
 }
 
 #[test]
@@ -322,6 +522,7 @@ fn cli_provider_choice_filter_uses_typed_api_methods() {
         test_route("claude-opus-4-6", "Anthropic", "claude-api"),
         test_route("gpt-5.5", "OpenAI", "openai-oauth"),
         test_route("gpt-5.5", "OpenAI", "openai-api-key"),
+        test_route("gpt-5.6-pro[web]", "OpenAI", "chatgpt-web"),
         test_route("deepseek/deepseek-v4-pro", "auto", "openrouter"),
         test_route("grok-code-fast-1", "Copilot", "copilot"),
     ];
@@ -330,11 +531,17 @@ fn cli_provider_choice_filter_uses_typed_api_methods() {
         &super::super::provider_init::ProviderChoice::Openai,
         &routes,
     );
-    assert_eq!(openai.len(), 1);
-    assert_eq!(
-        openai[0].api_method_kind(),
+    assert_eq!(openai.len(), 2);
+    assert!(openai.iter().any(|route| matches!(
+        route.api_method_kind(),
         crate::provider::ModelRouteApiMethod::OpenAIOAuth
-    );
+    )));
+    assert!(openai.iter().any(|route| {
+        matches!(
+            route.api_method_kind(),
+            crate::provider::ModelRouteApiMethod::Other(ref value) if value == "chatgpt-web"
+        )
+    }));
 
     let claude = filter_cli_model_routes_for_choice(
         &super::super::provider_init::ProviderChoice::Claude,
@@ -561,8 +768,10 @@ fn cloud_sessions_sync_respects_min_interval_throttle() {
     std::fs::write(sessions_dir.join("session_gamma.json"), b"{\"id\":\"g\"}").unwrap();
 
     // Seed sync state with a very recent last_sync_at so throttle should trigger.
-    let mut state = CloudSessionsSyncState::default();
-    state.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
+    let state = CloudSessionsSyncState {
+        last_sync_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..Default::default()
+    };
     save_cloud_sessions_sync_state(&state).expect("seed state");
 
     // Should be skipped (not error) because last sync was just now.

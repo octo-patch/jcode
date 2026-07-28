@@ -1,17 +1,88 @@
 use super::{
-    ClientConnectionInfo, ClientDebugState, DebugJob, FileAccess, ServerIdentity,
+    ClientConnectionInfo, ClientDebugState, DebugJob, FileAccess, FileTouchService, ServerIdentity,
     SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember, VersionedPlan,
 };
 use crate::agent::Agent;
 use anyhow::Result;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
+
+const MEMORY_INCIDENT_WINDOW_MS: u128 = 15 * 60 * 1_000;
+const MEMORY_WARNING_PSS_BYTES: u64 = 1024 * 1024 * 1024;
+const MEMORY_CRITICAL_PSS_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MEMORY_WARNING_GROWTH_BYTES: u64 = 256 * 1024 * 1024;
+const MEMORY_CRITICAL_GROWTH_BYTES: u64 = 1024 * 1024 * 1024;
+const MEMORY_WARNING_LIVE_SESSIONS: usize = 128;
+const MEMORY_CRITICAL_LIVE_SESSIONS: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryIncidentDecision {
+    severity: &'static str,
+    primary_cause: &'static str,
+    confidence: &'static str,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct LiveSwarmPopulation {
+    swarm_id: String,
+    live_sessions: usize,
+    headless_live_sessions: usize,
+    status_counts: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryIncidentMetrics {
+    pss_bytes: u64,
+    pss_growth_bytes: u64,
+    allocator_live_bytes: u64,
+    allocator_retained_resident_bytes: u64,
+    live_sessions: usize,
+    headless_live_sessions: usize,
+    connected_clients: usize,
+}
+
+fn count_live_spawned_swarm_agents<'a>(
+    live_session_ids: &HashSet<String>,
+    spawned_session_ids: impl IntoIterator<Item = &'a String>,
+) -> usize {
+    spawned_session_ids
+        .into_iter()
+        .filter(|session_id| live_session_ids.contains(*session_id))
+        .count()
+}
+
+async fn connected_session_snapshot(
+    sessions: &SessionAgents,
+    client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+) -> (
+    Vec<(String, Arc<Mutex<Agent>>)>,
+    HashMap<String, SwarmMember>,
+) {
+    // Never hold more than one shared-state lock at a time. Resume transitions
+    // use client_connections -> sessions atomically, so a debug snapshot that
+    // retained sessions while awaiting client_connections could deadlock them.
+    let connected_sessions: HashSet<String> = {
+        let connections = client_connections.read().await;
+        connections.values().map(|c| c.session_id.clone()).collect()
+    };
+    let connected_agents = {
+        let sessions_guard = sessions.read().await;
+        sessions_guard
+            .iter()
+            .filter(|(session_id, _)| connected_sessions.contains(*session_id))
+            .map(|(session_id, agent)| (session_id.clone(), Arc::clone(agent)))
+            .collect()
+    };
+    let members = swarm_members.read().await.clone();
+    (connected_agents, members)
+}
 
 #[expect(
     clippy::too_many_arguments,
@@ -29,8 +100,7 @@ pub(super) async fn maybe_handle_server_state_command(
     shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    file_touches: &Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: &Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: &FileTouchService,
     channel_subscriptions: &ChannelSubscriptions,
     channel_subscriptions_by_session: &ChannelSubscriptions,
     debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
@@ -39,16 +109,10 @@ pub(super) async fn maybe_handle_server_state_command(
     soft_interrupt_queues: &SessionInterruptQueues,
 ) -> Result<Option<String>> {
     if cmd == "sessions" {
-        let sessions_guard = sessions.read().await;
-        let members = swarm_members.read().await;
-        let connections = client_connections.read().await;
-        let connected_sessions: HashSet<String> =
-            connections.values().map(|c| c.session_id.clone()).collect();
+        let (connected_agents, members) =
+            connected_session_snapshot(sessions, client_connections, swarm_members).await;
         let mut out: Vec<serde_json::Value> = Vec::new();
-        for (sid, agent_arc) in sessions_guard.iter() {
-            if !connected_sessions.contains(sid) {
-                continue;
-            }
+        for (sid, agent_arc) in &connected_agents {
             let member_info = members.get(sid);
             let member_status = member_info.map(|m| m.status.as_str());
             let (provider, model, is_processing, working_dir_str, token_usage): (
@@ -112,6 +176,20 @@ pub(super) async fn maybe_handle_server_state_command(
         ));
     }
 
+    if cmd == "memory-incident" || cmd == "server:memory-incident" {
+        let payload = build_server_memory_incident_payload(
+            sessions,
+            client_connections,
+            swarm_members,
+            server_identity,
+            server_start_time,
+        )
+        .await;
+        return Ok(Some(
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()),
+        ));
+    }
+
     if cmd == "memory" || cmd == "server:memory" {
         let payload = build_server_memory_payload(
             sessions,
@@ -124,8 +202,7 @@ pub(super) async fn maybe_handle_server_state_command(
             shared_context,
             swarm_plans,
             swarm_coordinators,
-            file_touches,
-            files_touched_by_session,
+            file_touch,
             channel_subscriptions,
             channel_subscriptions_by_session,
             debug_jobs,
@@ -143,6 +220,16 @@ pub(super) async fn maybe_handle_server_state_command(
         return Ok(Some(
             serde_json::to_string_pretty(&crate::process_memory::history(256))
                 .unwrap_or_else(|_| "[]".to_string()),
+        ));
+    }
+
+    if cmd == "memory-judge" || cmd == "memory:judge" || cmd == "server:memory-judge" {
+        // Attribution of no-LLM memory-mode conversions: how often a surfacing
+        // turn ran the LLM judge vs converted (intended opt-out/cadence vs the
+        // degradations we drive to zero). See `memory_judge_metrics`.
+        return Ok(Some(
+            serde_json::to_string_pretty(&jcode_base::memory_judge_metrics::snapshot())
+                .unwrap_or_else(|_| "{}".to_string()),
         ));
     }
 
@@ -184,7 +271,18 @@ pub(super) async fn maybe_handle_server_state_command(
 
     if cmd == "info" || cmd == "server:info" {
         let uptime_secs = server_start_time.elapsed().as_secs();
-        let session_count = sessions.read().await.len();
+        let live_session_ids: HashSet<String> = sessions.read().await.keys().cloned().collect();
+        let session_count = live_session_ids.len();
+        let spawned_swarm_agent_count = {
+            let members = swarm_members.read().await;
+            count_live_spawned_swarm_agents(
+                &live_session_ids,
+                members
+                    .values()
+                    .filter(|member| member.report_back_to_session_id.is_some())
+                    .map(|member| &member.session_id),
+            )
+        };
         let member_count = swarm_members.read().await.len();
         let has_update = super::server_has_newer_binary();
         return Ok(Some(
@@ -196,6 +294,7 @@ pub(super) async fn maybe_handle_server_state_command(
                 "git_hash": server_identity.git_hash,
                 "uptime_secs": uptime_secs,
                 "session_count": session_count,
+                "spawned_swarm_agent_count": spawned_swarm_agent_count,
                 "swarm_member_count": member_count,
                 "has_update": has_update,
                 "debug_control_enabled": super::debug_control_allowed(),
@@ -247,6 +346,410 @@ pub(super) async fn maybe_handle_server_state_command(
     Ok(None)
 }
 
+fn classify_memory_incident(metrics: MemoryIncidentMetrics) -> MemoryIncidentDecision {
+    let detached_or_headless = metrics
+        .live_sessions
+        .saturating_sub(metrics.connected_clients);
+    let session_population_dominates = metrics.live_sessions >= MEMORY_WARNING_LIVE_SESSIONS
+        && (metrics.headless_live_sessions >= MEMORY_WARNING_LIVE_SESSIONS / 2
+            || detached_or_headless >= MEMORY_WARNING_LIVE_SESSIONS);
+    let retained_share_is_high = metrics.allocator_retained_resident_bytes >= 256 * 1024 * 1024
+        && metrics.allocator_retained_resident_bytes.saturating_mul(4) >= metrics.pss_bytes;
+
+    let (primary_cause, confidence) = if session_population_dominates {
+        ("runaway_live_session_population", "high")
+    } else if retained_share_is_high {
+        ("allocator_retention", "high")
+    } else if metrics.allocator_live_bytes >= MEMORY_WARNING_PSS_BYTES {
+        ("unattributed_live_heap", "medium")
+    } else if metrics.pss_bytes >= MEMORY_WARNING_PSS_BYTES {
+        ("non_heap_or_mapping_growth", "medium")
+    } else {
+        ("within_normal_operating_range", "high")
+    };
+
+    let critical = metrics.pss_bytes >= MEMORY_CRITICAL_PSS_BYTES
+        || metrics.pss_growth_bytes >= MEMORY_CRITICAL_GROWTH_BYTES
+        || metrics.live_sessions >= MEMORY_CRITICAL_LIVE_SESSIONS;
+    let warning = metrics.pss_bytes >= MEMORY_WARNING_PSS_BYTES
+        || metrics.pss_growth_bytes >= MEMORY_WARNING_GROWTH_BYTES
+        || metrics.live_sessions >= MEMORY_WARNING_LIVE_SESSIONS;
+    let severity = if critical {
+        "critical"
+    } else if warning {
+        "warning"
+    } else {
+        "healthy"
+    };
+
+    MemoryIncidentDecision {
+        severity,
+        primary_cause,
+        confidence,
+    }
+}
+
+async fn build_server_memory_incident_payload(
+    sessions: &SessionAgents,
+    client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    server_identity: &ServerIdentity,
+    server_start_time: Instant,
+) -> serde_json::Value {
+    // This command intentionally avoids locking any Agent. It must remain usable
+    // when thousands of sessions are resident and the full server:memory walk is
+    // slow or contended.
+    let process = crate::process_memory::snapshot_with_source("server:memory-incident");
+    let diagnostics = crate::runtime_memory_log::build_process_diagnostics(&process);
+    let history = crate::process_memory::history(512);
+    let latest_timestamp_ms = history
+        .last()
+        .map(|entry| entry.timestamp_ms)
+        .unwrap_or_default();
+    let window_start_ms = latest_timestamp_ms.saturating_sub(MEMORY_INCIDENT_WINDOW_MS);
+    let baseline = history
+        .iter()
+        .find(|entry| entry.timestamp_ms >= window_start_ms)
+        .or_else(|| history.first());
+    let current_pss_bytes = process
+        .os
+        .as_ref()
+        .and_then(|os| os.pss_bytes)
+        .or(process.rss_bytes)
+        .unwrap_or(0);
+    let baseline_pss_bytes = baseline
+        .and_then(|entry| {
+            entry
+                .snapshot
+                .os
+                .as_ref()
+                .and_then(|os| os.pss_bytes)
+                .or(entry.snapshot.rss_bytes)
+        })
+        .unwrap_or(current_pss_bytes);
+    let pss_growth_bytes = current_pss_bytes.saturating_sub(baseline_pss_bytes);
+    let allocator_live_bytes = process
+        .allocator
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.allocated_bytes)
+        .unwrap_or(0);
+    let allocator_retained_resident_bytes = diagnostics
+        .allocator_retained_resident_estimate_bytes
+        .unwrap_or(0);
+
+    let live_session_ids: HashSet<String> = sessions.read().await.keys().cloned().collect();
+    let connected_clients = client_connections.read().await.len();
+    let members = swarm_members.read().await;
+    let total_member_count = members.len();
+    let total_headless_members = members.values().filter(|member| member.is_headless).count();
+    let total_status_counts =
+        summarize_status_counts(members.values().map(|member| member.status.as_str()));
+    let mut live_status_counts = HashMap::new();
+    let mut headless_live_sessions = 0usize;
+    let mut untracked_live_sessions = 0usize;
+    let mut populations: HashMap<String, LiveSwarmPopulation> = HashMap::new();
+
+    for session_id in &live_session_ids {
+        let Some(member) = members.get(session_id) else {
+            untracked_live_sessions += 1;
+            continue;
+        };
+        *live_status_counts.entry(member.status.clone()).or_insert(0) += 1;
+        if member.is_headless {
+            headless_live_sessions += 1;
+        }
+        let swarm_id = member
+            .swarm_id
+            .clone()
+            .unwrap_or_else(|| "<no-swarm>".to_string());
+        let population =
+            populations
+                .entry(swarm_id.clone())
+                .or_insert_with(|| LiveSwarmPopulation {
+                    swarm_id,
+                    ..LiveSwarmPopulation::default()
+                });
+        population.live_sessions += 1;
+        if member.is_headless {
+            population.headless_live_sessions += 1;
+        }
+        *population
+            .status_counts
+            .entry(member.status.clone())
+            .or_insert(0) += 1;
+    }
+    drop(members);
+
+    let mut top_live_swarms: Vec<LiveSwarmPopulation> = populations.into_values().collect();
+    top_live_swarms.sort_by(|left, right| {
+        right
+            .live_sessions
+            .cmp(&left.live_sessions)
+            .then_with(|| left.swarm_id.cmp(&right.swarm_id))
+    });
+    top_live_swarms.truncate(12);
+
+    let metrics = MemoryIncidentMetrics {
+        pss_bytes: current_pss_bytes,
+        pss_growth_bytes,
+        allocator_live_bytes,
+        allocator_retained_resident_bytes,
+        live_sessions: live_session_ids.len(),
+        headless_live_sessions,
+        connected_clients,
+    };
+    let decision = classify_memory_incident(metrics);
+    let detached_live_sessions = live_session_ids.len().saturating_sub(connected_clients);
+    let allocated_per_live_session_bytes = (!live_session_ids.is_empty())
+        .then(|| allocator_live_bytes / live_session_ids.len() as u64);
+
+    let (summary, actions) = match decision.primary_cause {
+        "runaway_live_session_population" => (
+            format!(
+                "{} live Agent runtimes are resident for {} attached clients; live session population is the dominant operational cause.",
+                live_session_ids.len(), connected_clients
+            ),
+            vec![
+                serde_json::json!({
+                    "priority": 1,
+                    "action": "Pause or cap the producer that is creating headless sessions before doing allocator work.",
+                    "why": "The heap is live, so allocator purge cannot release the Agent runtimes.",
+                    "commands": ["jcode debug 'swarm:list'", "jcode debug 'server:memory-incident'"]
+                }),
+                serde_json::json!({
+                    "priority": 2,
+                    "action": "Inspect top_live_swarms and stop or clean up workers that the owning coordinator no longer needs.",
+                    "why": "Target the largest live swarm first; do not destroy active work blindly.",
+                    "commands": ["Use `swarm list` and `swarm cleanup` from the owning coordinator", "Use `destroy_session:<id>` only for a confirmed disposable headless session"]
+                }),
+                serde_json::json!({
+                    "priority": 3,
+                    "action": "Re-run this report after cleanup and verify both live_sessions and allocator_live_bytes fall.",
+                    "why": "A falling live heap confirms session retention was causal.",
+                    "commands": ["jcode debug 'server:memory-incident'", "python scripts/analyze_runtime_memory_log.py --days 1"]
+                }),
+                serde_json::json!({
+                    "priority": 4,
+                    "action": "Only purge the allocator if retained_resident_bytes remains high after live sessions are reduced.",
+                    "why": "Purge is a second-stage response for freed-but-held pages, not live Agents.",
+                    "commands": ["jcode debug 'allocator:purge'"]
+                }),
+            ],
+        ),
+        "allocator_retention" => (
+            "Freed-but-held allocator pages are a material share of resident memory.".to_string(),
+            vec![
+                serde_json::json!({
+                    "priority": 1,
+                    "action": "Capture this report, purge the allocator, and compare PSS immediately.",
+                    "why": "A large drop proves allocator retention rather than live application state.",
+                    "commands": ["jcode debug 'allocator:purge'", "jcode debug 'server:memory-incident'"]
+                }),
+                serde_json::json!({
+                    "priority": 2,
+                    "action": "If retention repeatedly regrows, inspect allocation churn and allocator decay settings.",
+                    "commands": ["jcode debug 'allocator'", "jcode debug 'allocator:decay:1000'"]
+                }),
+            ],
+        ),
+        "unattributed_live_heap" => (
+            "Allocator live bytes are high without a large session-population or retention signal.".to_string(),
+            vec![
+                serde_json::json!({
+                    "priority": 1,
+                    "action": "Capture full attribution and identify which tracked subsystem is missing from the live heap.",
+                    "commands": ["jcode debug 'server:memory'", "python scripts/analyze_runtime_memory_log.py --days 1"]
+                }),
+                serde_json::json!({
+                    "priority": 2,
+                    "action": "Escalate to a jemalloc-prof build and heap dump if attribution remains below 50% of live heap.",
+                    "commands": ["jcode debug 'allocator:profile:on'", "jcode debug 'allocator:profile:dump /tmp/jcode-server.heap'"]
+                }),
+            ],
+        ),
+        "non_heap_or_mapping_growth" => (
+            "PSS is high but allocator live bytes do not explain it; inspect mappings, thread stacks, and shared memory.".to_string(),
+            vec![serde_json::json!({
+                "priority": 1,
+                "action": "Inspect OS mappings and thread growth before changing application retention.",
+                "commands": ["cat /proc/<server-pid>/smaps_rollup", "pmap -x <server-pid> | sort -k3 -nr | head"]
+            })],
+        ),
+        _ => (
+            "No memory incident threshold is currently exceeded.".to_string(),
+            vec![serde_json::json!({
+                "priority": 1,
+                "action": "Continue normal monitoring; compare this report if memory begins to grow.",
+                "commands": ["jcode debug 'server:memory-incident'"]
+            })],
+        ),
+    };
+
+    serde_json::json!({
+        "schema_version": 1,
+        "server": {
+            "id": server_identity.id,
+            "name": server_identity.name,
+            "version": server_identity.version,
+            "git_hash": server_identity.git_hash,
+            "uptime_secs": server_start_time.elapsed().as_secs(),
+        },
+        "assessment": {
+            "severity": decision.severity,
+            "primary_cause": decision.primary_cause,
+            "confidence": decision.confidence,
+            "summary": summary,
+        },
+        "process": {
+            "rss_bytes": process.rss_bytes,
+            "pss_bytes": current_pss_bytes,
+            "pss_anon_bytes": process.os.as_ref().and_then(|os| os.pss_anon_bytes),
+            "pss_file_bytes": process.os.as_ref().and_then(|os| os.pss_file_bytes),
+            "allocator_live_bytes": allocator_live_bytes,
+            "allocator_retained_bytes": process.allocator.stats.as_ref().and_then(|stats| stats.retained_bytes),
+            "allocator_retained_resident_bytes": allocator_retained_resident_bytes,
+            "thread_count": process.thread_count,
+        },
+        "trend_15m": {
+            "baseline_timestamp_ms": baseline.map(|entry| entry.timestamp_ms),
+            "baseline_pss_bytes": baseline_pss_bytes,
+            "current_timestamp_ms": latest_timestamp_ms,
+            "current_pss_bytes": current_pss_bytes,
+            "pss_growth_bytes": pss_growth_bytes,
+            "sample_count": history.iter().filter(|entry| entry.timestamp_ms >= window_start_ms).count(),
+        },
+        "population": {
+            "live_sessions": live_session_ids.len(),
+            "headless_live_sessions": headless_live_sessions,
+            "detached_live_sessions": detached_live_sessions,
+            "untracked_live_sessions": untracked_live_sessions,
+            "connected_clients": connected_clients,
+            "allocated_per_live_session_bytes": allocated_per_live_session_bytes,
+            "live_status_counts": live_status_counts,
+            "top_live_swarms": top_live_swarms,
+            "total_swarm_members": total_member_count,
+            "total_headless_members": total_headless_members,
+            "total_member_status_counts": total_status_counts,
+        },
+        "thresholds": {
+            "warning_pss_bytes": MEMORY_WARNING_PSS_BYTES,
+            "critical_pss_bytes": MEMORY_CRITICAL_PSS_BYTES,
+            "warning_pss_growth_bytes": MEMORY_WARNING_GROWTH_BYTES,
+            "critical_pss_growth_bytes": MEMORY_CRITICAL_GROWTH_BYTES,
+            "warning_live_sessions": MEMORY_WARNING_LIVE_SESSIONS,
+            "critical_live_sessions": MEMORY_CRITICAL_LIVE_SESSIONS,
+        },
+        "next_actions": actions,
+        "safety": "Preserve active work. Stop the producer first, then clean only sessions confirmed disposable by their owning coordinator.",
+        "runbook": "docs/MEMORY_INCIDENT_RUNBOOK.md",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn connected_session_snapshot_releases_connections_before_waiting_for_sessions() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let client_connections = Arc::new(RwLock::new(HashMap::new()));
+        let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+
+        let sessions_gate = sessions.write().await;
+        let snapshot = connected_session_snapshot(&sessions, &client_connections, &swarm_members);
+        tokio::pin!(snapshot);
+        tokio::select! {
+            _ = &mut snapshot => panic!("snapshot unexpectedly completed"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let connections_guard =
+            tokio::time::timeout(Duration::from_millis(100), client_connections.write())
+                .await
+                .expect("debug snapshot retained connections while waiting for sessions");
+        drop(connections_guard);
+
+        drop(sessions_gate);
+        let (connected_agents, members) =
+            tokio::time::timeout(Duration::from_secs(1), &mut snapshot)
+                .await
+                .expect("debug snapshot deadlocked");
+        assert!(connected_agents.is_empty());
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn spawned_swarm_agent_count_only_includes_live_owned_sessions() {
+        let live_session_ids = HashSet::from([
+            "root".to_string(),
+            "worker-running".to_string(),
+            "worker-ready".to_string(),
+        ]);
+        let spawned_session_ids = [
+            "worker-running".to_string(),
+            "worker-ready".to_string(),
+            "worker-stale".to_string(),
+        ];
+
+        assert_eq!(
+            count_live_spawned_swarm_agents(&live_session_ids, spawned_session_ids.iter()),
+            2
+        );
+    }
+
+    #[test]
+    fn memory_incident_classifies_runaway_live_sessions_before_allocator_retention() {
+        let decision = classify_memory_incident(MemoryIncidentMetrics {
+            pss_bytes: 4 * 1024 * 1024 * 1024,
+            pss_growth_bytes: 3 * 1024 * 1024 * 1024,
+            allocator_live_bytes: 3_800 * 1024 * 1024,
+            allocator_retained_resident_bytes: 300 * 1024 * 1024,
+            live_sessions: 1_145,
+            headless_live_sessions: 1_140,
+            connected_clients: 5,
+        });
+
+        assert_eq!(decision.severity, "critical");
+        assert_eq!(decision.primary_cause, "runaway_live_session_population");
+        assert_eq!(decision.confidence, "high");
+    }
+
+    #[test]
+    fn memory_incident_classifies_allocator_retention_when_live_heap_is_small() {
+        let decision = classify_memory_incident(MemoryIncidentMetrics {
+            pss_bytes: 1_500 * 1024 * 1024,
+            pss_growth_bytes: 400 * 1024 * 1024,
+            allocator_live_bytes: 500 * 1024 * 1024,
+            allocator_retained_resident_bytes: 600 * 1024 * 1024,
+            live_sessions: 8,
+            headless_live_sessions: 3,
+            connected_clients: 5,
+        });
+
+        assert_eq!(decision.severity, "warning");
+        assert_eq!(decision.primary_cause, "allocator_retention");
+        assert_eq!(decision.confidence, "high");
+    }
+
+    #[test]
+    fn memory_incident_reports_healthy_baseline() {
+        let decision = classify_memory_incident(MemoryIncidentMetrics {
+            pss_bytes: 220 * 1024 * 1024,
+            pss_growth_bytes: 12 * 1024 * 1024,
+            allocator_live_bytes: 150 * 1024 * 1024,
+            allocator_retained_resident_bytes: 20 * 1024 * 1024,
+            live_sessions: 5,
+            headless_live_sessions: 1,
+            connected_clients: 4,
+        });
+
+        assert_eq!(decision.severity, "healthy");
+        assert_eq!(decision.primary_cause, "within_normal_operating_range");
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "server memory payload aggregates many live server structures into one debug snapshot"
@@ -262,8 +765,7 @@ async fn build_server_memory_payload(
     shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    file_touches: &Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: &Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: &FileTouchService,
     channel_subscriptions: &ChannelSubscriptions,
     channel_subscriptions_by_session: &ChannelSubscriptions,
     debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
@@ -274,6 +776,8 @@ async fn build_server_memory_payload(
     let process = crate::process_memory::snapshot_with_source("server:memory");
     let background_tasks = crate::background::global().list().await;
     let embedder_stats = crate::embedding::stats();
+    let (search_index_count, search_index_entries, search_index_bytes) =
+        crate::tool::session_search_index::cache_memory_stats();
     let embedding_model_available = crate::embedding::is_model_available();
 
     let sessions_guard = sessions.read().await;
@@ -460,7 +964,7 @@ async fn build_server_memory_payload(
         .sum();
     drop(coordinators);
 
-    let touches = file_touches.read().await;
+    let touches = file_touch.snapshot().await;
     let file_touch_path_count = touches.len();
     let file_touch_entry_count: usize = touches.values().map(|entries| entries.len()).sum();
     let file_touch_estimate_bytes: usize = touches
@@ -475,7 +979,7 @@ async fn build_server_memory_payload(
         .sum();
     drop(touches);
 
-    let touched_by_session = files_touched_by_session.read().await;
+    let touched_by_session = file_touch.reverse_snapshot().await;
     let touched_session_count = touched_by_session.len();
     let touched_session_estimate_bytes: usize = touched_by_session
         .iter()
@@ -656,6 +1160,11 @@ async fn build_server_memory_payload(
             "loaded_secs": embedder_stats.loaded_secs,
             "cache_hits": embedder_stats.cache_hits,
             "cache_size": embedder_stats.cache_size,
+        },
+        "session_search_index": {
+            "index_count": search_index_count,
+            "entry_count": search_index_entries,
+            "approx_resident_bytes": search_index_bytes,
         }
     })
 }

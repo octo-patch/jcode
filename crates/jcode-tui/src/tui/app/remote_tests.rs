@@ -38,6 +38,12 @@ impl Provider for MockProvider {
 }
 
 fn create_test_app() -> crate::tui::app::App {
+    ensure_test_jcode_home_if_unset();
+    // `has_notification()` (via `unfocused_redraw_warranted`) consults a
+    // process-wide ambient-info cache that another test may have populated
+    // from its own JCODE_HOME (scheduled reminders read as a notification).
+    // Reset it so these tests observe only their own state.
+    crate::tui::app::helpers::clear_ambient_info_cache_for_tests();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
@@ -45,6 +51,28 @@ fn create_test_app() -> crate::tui::app::App {
     app.queue_mode = false;
     app.diff_mode = crate::config::DiffDisplayMode::Inline;
     app
+}
+
+/// Point JCODE_HOME at a per-process temp dir when the environment does not
+/// already pin one, so tests never read the developer's real `~/.jcode`
+/// state (e.g. a populated ambient queue turns `has_notification()` on and
+/// breaks the unfocused-redraw assertions). Mirrors the helper of the same
+/// name used by the main app test suite.
+fn ensure_test_jcode_home_if_unset() {
+    use std::sync::OnceLock;
+
+    static TEST_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+    if std::env::var_os("JCODE_HOME").is_some() {
+        return;
+    }
+
+    let path = TEST_HOME.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!("jcode-test-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&path);
+        path
+    });
+    crate::env::set_var("JCODE_HOME", path);
 }
 
 #[test]
@@ -55,6 +83,91 @@ fn reload_handoff_active_when_server_flag_is_set() {
     };
 
     assert!(reconnect::reload_handoff_active(&state));
+}
+
+#[test]
+fn client_focus_defaults_to_true() {
+    let app = create_test_app();
+    assert!(
+        app.client_focused(),
+        "a freshly created client should start focused so terminals that never \
+         report focus events still animate/redraw normally"
+    );
+}
+
+#[test]
+fn idle_donut_pauses_while_unfocused() {
+    let mut app = create_test_app();
+
+    // Whether the donut runs while focused depends on the machine's perf tier
+    // and `display.idle_animation` config, so we do not assert the focused case
+    // absolutely. We only assert the invariant that matters for the swarm CPU
+    // regression: it must never run while the terminal is unfocused.
+    let redraw = app.set_client_focused(false);
+    assert!(
+        !redraw,
+        "losing focus should not request an immediate redraw"
+    );
+    assert!(!app.client_focused());
+    assert!(
+        !crate::tui::idle_donut_active(&app),
+        "idle animation must pause while the terminal is unfocused"
+    );
+
+    // Regaining focus requests a full repaint so the window is not stuck on the
+    // last paused frame.
+    let redraw = app.set_client_focused(true);
+    assert!(redraw, "regaining focus should request a redraw");
+    assert!(app.client_focused());
+}
+
+#[test]
+fn unfocused_redraw_warranted_tracks_live_activity() {
+    let mut app = create_test_app();
+    // `unfocused_redraw_warranted` is only consulted while unfocused, and the
+    // decorative donut is force-disabled when unfocused, so evaluate it in that
+    // state to mirror the run loop.
+    app.set_client_focused(false);
+
+    // Idle empty session: no live output to paint while unfocused.
+    assert!(
+        !app.unfocused_redraw_warranted(),
+        "an idle unfocused session has nothing changing worth a full-rate redraw"
+    );
+
+    // A streaming/processing session keeps painting even while unfocused so a
+    // visible-but-unfocused window in a tiling WM still shows live progress.
+    app.is_processing = true;
+    assert!(
+        app.unfocused_redraw_warranted(),
+        "a processing session should keep redrawing while unfocused"
+    );
+}
+
+#[test]
+fn client_interaction_restores_focus_so_scroll_redraws_at_full_rate() {
+    // Regression for the intermittent "can't scroll" bug. If a FocusGained is
+    // dropped (flaky under tiling WMs / multiplexers) the window can get stuck
+    // as "unfocused idle", which the run loop throttles to ~1 Hz. Any terminal
+    // input (key/mouse/scroll) is only delivered to the focused window, so it
+    // must restore the focused state and full-rate redraws immediately.
+    let mut app = create_test_app();
+
+    // Simulate a stuck-unfocused window (FocusLost seen, FocusGained dropped).
+    app.set_client_focused(false);
+    assert!(!app.client_focused());
+    assert!(
+        !app.unfocused_redraw_warranted(),
+        "an idle unfocused session is throttled to ~1 Hz redraws"
+    );
+
+    // A mouse-wheel / key event arrives: the terminal only routes input to the
+    // focused window, so interacting proves focus and must restore it.
+    app.note_client_interaction();
+    assert!(
+        app.client_focused(),
+        "interaction must restore focus so scrolling repaints at full rate"
+    );
 }
 
 #[test]
@@ -261,7 +374,24 @@ fn auth_changed_event_for_cerebras_login_carries_runtime_and_catalog_identity() 
 
 #[test]
 fn reload_handoff_inactive_without_flag_or_marker() {
-    assert!(!reconnect::reload_handoff_active(&RemoteRunState::default()));
+    // `reload_handoff_active` falls back to the on-disk reload marker in the
+    // runtime dir. Point the runtime dir at an empty tempdir so a real
+    // `jcode.reload` left by a live self-dev reload on this machine cannot
+    // leak into the assertion.
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("create temp dir");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+    crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+
+    let inactive = !reconnect::reload_handoff_active(&RemoteRunState::default());
+
+    if let Some(prev_runtime) = prev_runtime {
+        crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_DIR");
+    }
+
+    assert!(inactive);
 }
 
 #[test]
@@ -274,6 +404,112 @@ fn reload_wait_status_message_uses_waiting_language() {
 
     assert!(message.contains("waiting for handoff"));
     assert!(!message.contains("retrying"));
+}
+
+#[test]
+fn submit_prepared_remote_input_defers_until_history_loads() {
+    // Regression for the intermittent "first prompt vanishes / weird render"
+    // bug: when a manual submit lands before the bootstrap History payload is
+    // applied, the History handler's `session_changed` branch calls
+    // `clear_display_messages()` and wipes the just-echoed user message. The
+    // submit path must hold the prompt until history loads instead of echoing
+    // and sending it into that race.
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = crate::tui::app::AppRuntimeMode::RemoteClient;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    // History has NOT loaded yet (fresh connect window).
+    assert!(!remote.has_loaded_history());
+
+    let prepared = crate::tui::app::input::PreparedInput {
+        raw_input: "hi".to_string(),
+        expanded: "hi".to_string(),
+        images: vec![],
+    };
+    rt.block_on(crate::tui::app::remote::submit_prepared_remote_input(
+        &mut app,
+        &mut remote,
+        prepared,
+    ))
+    .expect("submit should not error while history is loading");
+
+    // The prompt must be held, not echoed or sent.
+    assert!(
+        !app.is_processing,
+        "submit must not begin a remote send before history loads"
+    );
+    assert!(
+        app.display_messages().iter().all(|m| m.role != "user"),
+        "user message must not be echoed before history loads (would be clobbered)"
+    );
+    let held = app
+        .pending_prompt_before_history
+        .as_ref()
+        .expect("prompt should be held until history loads");
+    assert_eq!(held.raw_input, "hi");
+
+    // Once history loads, the post-connect dispatcher fires the held prompt.
+    remote.mark_history_loaded();
+    rt.block_on(process_remote_followups(&mut app, &mut remote));
+
+    assert!(
+        app.pending_prompt_before_history.is_none(),
+        "held prompt should be consumed once history is loaded"
+    );
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|m| m.role == "user" && m.content == "hi"),
+        "the held prompt should be echoed as a user message after history loads"
+    );
+    assert!(
+        app.is_processing,
+        "the held prompt should be sent once history is loaded"
+    );
+}
+
+#[test]
+fn remote_skill_invocation_with_prompt_sends_remote_turn() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = crate::tui::app::AppRuntimeMode::RemoteClient;
+    let temp = tempfile::tempdir().expect("create skill dir");
+    let skill_dir = temp.path().join(".jcode/skills/remote-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: remote-skill\ndescription: Remote prompt regression skill\n---\nUse it.\n",
+    )
+    .expect("write skill");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    rt.block_on(crate::tui::app::remote::submit_remote_slash_input(
+        &mut app,
+        &mut remote,
+        crate::tui::app::input::PreparedInput {
+            raw_input: "/remote-skill explain the change".to_string(),
+            expanded: "/remote-skill explain the change".to_string(),
+            images: vec![],
+        },
+    ))
+    .expect("remote skill prompt should send");
+
+    assert_eq!(app.active_skill.as_deref(), Some("remote-skill"));
+    assert!(app.is_processing, "remote skill prompt should start a turn");
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|message| message.role == "user"
+                && message.content == "/remote-skill explain the change"),
+        "remote skill prompt should be visible as the submitted user turn"
+    );
 }
 
 #[test]
@@ -376,6 +612,37 @@ fn process_remote_followups_auto_reloads_server_by_default() {
 }
 
 #[test]
+fn process_remote_followups_reloads_server_even_before_history_loads() {
+    // Regression guard: when the server/client binaries differ, the History
+    // handler defers session state and sets `pending_server_reload = true`
+    // WITHOUT marking history as loaded. The reload must still fire; otherwise
+    // history stays unloaded forever and every typed prompt stalls on
+    // "Loading session..." until the user restarts.
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    // Intentionally do NOT mark history loaded, mirroring the deferred path.
+    assert!(!remote.has_loaded_history());
+
+    app.pending_server_reload = true;
+    app.auto_server_reload = true;
+
+    rt.block_on(process_remote_followups(&mut app, &mut remote));
+
+    assert!(
+        !app.pending_server_reload,
+        "pending server reload should be consumed even while history is unloaded"
+    );
+    let last = app
+        .display_messages()
+        .last()
+        .expect("missing reload message");
+    assert_eq!(last.title.as_deref(), Some("Reload"));
+    assert!(last.content.contains("Reloading server with newer binary"));
+}
+
+#[test]
 fn process_remote_followups_respects_disabled_auto_server_reload() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -412,11 +679,11 @@ fn process_remote_followups_pauses_auto_reload_after_repeated_attempts() {
         app.pending_server_reload = true;
         rt.block_on(process_remote_followups(&mut app, &mut remote));
         assert!(!app.pending_server_reload);
-        if let Some(last) = app.display_messages().last() {
-            if last.content.contains("auto-reload paused") {
-                paused = true;
-                break;
-            }
+        if let Some(last) = app.display_messages().last()
+            && last.content.contains("auto-reload paused")
+        {
+            paused = true;
+            break;
         }
     }
 
@@ -540,4 +807,308 @@ fn handle_server_event_applies_remote_memory_activity_snapshot() {
     assert!(activity.state_since.elapsed().as_millis() >= 100);
 
     crate::memory::clear_activity();
+}
+
+/// Reproduces the "stuck on loading session…" bug and verifies the watchdog
+/// recovers it: a remote connection that never receives the bootstrap History
+/// event (so `has_loaded_history()` stays false) must re-request `GetHistory`
+/// once it has waited past the recovery delay, instead of staying stuck forever.
+#[test]
+fn remote_history_watchdog_rerequests_history_when_stuck() {
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncBufReadExt;
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("session_stuck".to_string());
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut line = String::new();
+    let (redraw, attempts) = rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        // The bug condition: history never loaded after (re)connect.
+        assert!(!remote.has_loaded_history());
+        let peer = remote
+            .take_dummy_peer()
+            .expect("dummy remote should retain peer stream");
+        let (reader, _writer) = peer.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // First tick simply starts tracking the wait; no re-request yet.
+        let first = super::recover_stuck_remote_history(&mut app, &mut remote).await;
+        assert!(!first, "first observation should only arm the watchdog");
+        assert!(app.remote_history_wait_started.is_some());
+        assert_eq!(app.remote_history_recovery_attempts, 0);
+
+        // Simulate the connection having been stuck past the recovery delay.
+        app.remote_history_wait_started = Instant::now().checked_sub(Duration::from_secs(60));
+
+        let redraw = super::recover_stuck_remote_history(&mut app, &mut remote).await;
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("history re-request should be readable by peer");
+        (redraw, app.remote_history_recovery_attempts)
+    });
+
+    assert!(redraw, "re-requesting history should trigger a redraw");
+    assert_eq!(
+        attempts, 1,
+        "watchdog should have re-requested history once"
+    );
+    assert!(matches!(
+        serde_json::from_str::<crate::protocol::Request>(&line)
+            .expect("history re-request should deserialize"),
+        crate::protocol::Request::GetHistory { .. }
+    ));
+}
+
+/// A partial inbound frame proves that the original History response is in
+/// flight. The watchdog must not queue another full response behind it.
+#[test]
+fn remote_history_watchdog_does_not_rerequest_while_frame_is_arriving() {
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("session_large".to_string());
+    app.remote_history_wait_started = Instant::now().checked_sub(Duration::from_secs(60));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        let peer = remote
+            .take_dummy_peer()
+            .expect("dummy remote should retain peer stream");
+        let (reader, mut writer) = peer.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Deliberately omit the newline so next_event retains this partial
+        // History-sized frame when its future is cancelled by the tick.
+        writer
+            .write_all(b"{\"type\":\"history\",\"messages\":[")
+            .await
+            .expect("partial frame should reach remote");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), remote.next_event())
+                .await
+                .is_err(),
+            "partial frame must remain incomplete"
+        );
+        assert!(remote.has_buffered_inbound_frame());
+
+        let redraw = super::recover_stuck_remote_history(&mut app, &mut remote).await;
+        assert!(!redraw, "in-flight history should not trigger recovery");
+        assert_eq!(app.remote_history_recovery_attempts, 0);
+
+        let mut line = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reader.read_line(&mut line))
+                .await
+                .is_err(),
+            "watchdog must not write a duplicate GetHistory request"
+        );
+    });
+}
+
+/// Once history loads, the watchdog must clear its budget and do nothing.
+#[test]
+fn remote_history_watchdog_clears_budget_once_history_loads() {
+    use std::time::{Duration, Instant};
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_history_wait_started = Instant::now().checked_sub(Duration::from_secs(60));
+    app.remote_history_recovery_attempts = 2;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let redraw = rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        remote.mark_history_loaded();
+        super::recover_stuck_remote_history(&mut app, &mut remote).await
+    });
+
+    assert!(!redraw);
+    assert!(app.remote_history_wait_started.is_none());
+    assert_eq!(app.remote_history_recovery_attempts, 0);
+    assert!(app.remote_history_recovery_last_attempt.is_none());
+}
+
+/// After exhausting re-requests the watchdog surfaces an actionable `/restart`
+/// hint exactly once instead of silently leaving the user stuck.
+#[test]
+fn remote_history_watchdog_advises_restart_after_giving_up() {
+    use std::time::{Duration, Instant};
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_history_wait_started = Instant::now().checked_sub(Duration::from_secs(60));
+    app.remote_history_recovery_attempts = super::REMOTE_HISTORY_RECOVERY_MAX_ATTEMPTS;
+    app.remote_history_recovery_last_attempt = Some(Instant::now());
+
+    let before = app.display_messages().len();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let redraw = rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        super::recover_stuck_remote_history(&mut app, &mut remote).await
+    });
+
+    assert!(redraw);
+    let messages = app.display_messages();
+    assert_eq!(messages.len(), before + 1, "should add exactly one hint");
+    assert!(
+        messages.last().unwrap().content.contains("/restart"),
+        "hint should advise /restart: {}",
+        messages.last().unwrap().content
+    );
+    // last_attempt cleared so the hint is not repeated every tick.
+    assert!(app.remote_history_recovery_last_attempt.is_none());
+
+    // A subsequent tick must not add another hint.
+    let rt2 = tokio::runtime::Runtime::new().unwrap();
+    let redraw2 = rt2.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        super::recover_stuck_remote_history(&mut app, &mut remote).await
+    });
+    assert!(!redraw2);
+    assert_eq!(app.display_messages().len(), before + 1);
+}
+
+/// Regression for issue #427: picking an effort-variant model row (e.g.
+/// "gpt-5.5 (high)") in remote mode must forward the chosen effort to the
+/// server after the model-switch request. Previously the effort was applied
+/// only to the local stand-in provider, so the server kept its configured
+/// default (low by default) and silently ran the new model at low effort.
+#[test]
+fn forward_pending_reasoning_effort_sends_effort_request_to_server() {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.pending_reasoning_effort = Some("high".to_string());
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let line = rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        let peer = remote
+            .take_dummy_peer()
+            .expect("dummy remote should retain peer stream");
+        let (reader, _writer) = peer.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        super::forward_pending_reasoning_effort(&mut app, &mut remote).await;
+
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("effort request should be readable by peer");
+        line
+    });
+
+    match serde_json::from_str::<crate::protocol::Request>(&line)
+        .expect("effort request should deserialize")
+    {
+        crate::protocol::Request::SetReasoningEffort { effort, .. } => {
+            assert_eq!(effort, "high", "the picker-selected effort must be sent");
+        }
+        other => panic!("expected SetReasoningEffort request, got {:?}", other),
+    }
+
+    assert!(
+        app.pending_reasoning_effort.is_none(),
+        "staged effort must be consumed after dispatch"
+    );
+    assert_eq!(
+        app.remote_reasoning_effort.as_deref(),
+        Some("high"),
+        "requested effort should be tracked optimistically for the UI"
+    );
+}
+
+/// The dispatcher must be a no-op when no effort variant was staged (plain
+/// model rows without an effort suffix).
+#[test]
+fn forward_pending_reasoning_effort_is_noop_without_staged_effort() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    assert!(app.pending_reasoning_effort.is_none());
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        super::forward_pending_reasoning_effort(&mut app, &mut remote).await;
+    });
+
+    assert!(app.remote_reasoning_effort.is_none());
+    assert!(app.pending_reasoning_effort.is_none());
+}
+
+#[test]
+fn remote_dropped_file_path_is_sent_as_a_prompt_not_a_slash_command() {
+    // Regression: a terminal file drop like `/tmp/shot.png` starts with `/`, so
+    // remote submit routed it to `submit_remote_slash_input`, which fell back to
+    // `App::submit_input`. That only sets `pending_turn`, which no remote run
+    // loop consumes, so the client hung in "Sending" forever.
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let file = temp.path().join("shot.png");
+    std::fs::write(&file, b"x").expect("write file");
+    let dropped = file.to_string_lossy().to_string();
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = crate::tui::app::AppRuntimeMode::RemoteClient;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    rt.block_on(crate::tui::app::remote::submit_remote_slash_input(
+        &mut app,
+        &mut remote,
+        crate::tui::app::input::PreparedInput {
+            raw_input: dropped.clone(),
+            expanded: dropped.clone(),
+            images: vec![],
+        },
+    ))
+    .expect("dropped path should send as a normal remote turn");
+
+    assert!(
+        app.active_skill.is_none(),
+        "a file path must never activate a skill"
+    );
+    assert!(
+        app.is_processing,
+        "a dropped path must start a remote turn instead of stranding pending_turn"
+    );
+    assert!(
+        !app.pending_turn,
+        "remote submissions must never park on the local-only pending_turn flag"
+    );
+}
+
+#[test]
+fn remote_submit_input_never_strands_a_local_pending_turn() {
+    // Safety net: any path that reaches `App::submit_input` while attached to a
+    // remote session must queue for the remote tick loop rather than set
+    // `pending_turn`, which only the local run loop consumes.
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = crate::tui::app::AppRuntimeMode::RemoteClient;
+    app.input = "plain prompt".to_string();
+    app.cursor_pos = app.input.len();
+
+    app.submit_input();
+
+    assert!(
+        !app.pending_turn,
+        "remote submit_input must not set the local-only pending_turn flag"
+    );
+    assert_eq!(
+        app.queued_messages,
+        vec!["plain prompt".to_string()],
+        "the prompt should be queued for the remote tick loop"
+    );
 }

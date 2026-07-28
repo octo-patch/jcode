@@ -229,11 +229,12 @@ fn small_window_inline_activity_and_composer_lanes_do_not_overlap() {
     );
     app.draft = "first line\nsecond line\nthird line".to_string();
     app.draft_cursor = app.draft.len();
-    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
-        "streaming response while the resume picker is open".to_string(),
-    ));
+    // Activity pill (and its lane) only shows while waiting for the first
+    // streamed token, so simulate in-flight work without streamed text.
+    app.is_processing = true;
 
     assert!(app.has_activity_indicator());
+    assert!(app.streaming_activity_pill_visible());
     assert_eq!(
         app.render_inline_widget_kind(),
         Some(InlineWidgetKind::SessionSwitcher)
@@ -344,6 +345,185 @@ fn body_wrap_line_count_matches_wrapped_output_without_allocating_lines() {
         push_wrapped_body_line_ref(&mut wrapped, &line, 10);
         assert_eq!(wrapped_body_line_count(&line, 10), wrapped.len());
     }
+}
+
+#[test]
+fn wrapped_tool_lines_keep_hanging_indent_inside_card_inset() {
+    // "  ● bash · running · <long command>" wraps; continuation rows must
+    // inherit the 4-column hang so they stay inside the tool card inset
+    // instead of colliding with the timeline rail at column zero.
+    let text = "  ● bash · running · cargo check -p jcode-desktop --all-targets --all-features";
+    let line = SingleSessionStyledLine::new(text, SingleSessionLineStyle::Tool);
+    let mut wrapped = Vec::new();
+    push_wrapped_body_line_ref(&mut wrapped, &line, 34);
+    assert!(wrapped.len() > 1, "fixture must wrap: {wrapped:?}");
+    for continuation in &wrapped[1..] {
+        assert!(
+            continuation.text.starts_with("    "),
+            "continuation rows keep the hanging indent: {:?}",
+            continuation.text
+        );
+    }
+    // Count stays in lockstep with the produced rows.
+    assert_eq!(wrapped_body_line_count(&line, 34), wrapped.len());
+
+    // Plain prose (no leading whitespace) is unaffected.
+    let prose = SingleSessionStyledLine::new(
+        "plain prose line that wraps across rows",
+        SingleSessionLineStyle::Assistant,
+    );
+    let mut prose_wrapped = Vec::new();
+    push_wrapped_body_line_ref(&mut prose_wrapped, &prose, 20);
+    assert!(prose_wrapped.len() > 1);
+    for row in &prose_wrapped {
+        assert!(
+            !row.text.starts_with(' '),
+            "prose keeps flush left: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn wrapped_detail_lines_hang_and_spans_shift_with_indent() {
+    // Detail rows ("    waiting for tool output…") carry 4 leading spaces.
+    let text = "    detail row with quite a lot of text that wraps onward";
+    let line = SingleSessionStyledLine::new(text, SingleSessionLineStyle::Tool);
+    let mut wrapped = Vec::new();
+    push_wrapped_body_line_ref(&mut wrapped, &line, 24);
+    assert!(wrapped.len() > 1);
+    for continuation in &wrapped[1..] {
+        assert!(continuation.text.starts_with("    "));
+    }
+
+    // Inline spans on wrapped continuations shift by the hang prefix.
+    let span_text = "  • bullet with `inline code that flows across the wrap boundary`";
+    let code_start = span_text.find('`').unwrap();
+    let spanned = SingleSessionStyledLine::with_inline_spans(
+        span_text.to_string(),
+        SingleSessionLineStyle::Assistant,
+        vec![SingleSessionInlineSpan {
+            start: code_start,
+            end: span_text.len(),
+            kind: SingleSessionInlineSpanKind::Code,
+        }],
+    );
+    let mut spanned_wrapped = Vec::new();
+    push_wrapped_body_line_ref(&mut spanned_wrapped, &spanned, 28);
+    assert!(spanned_wrapped.len() > 1);
+    for row in &spanned_wrapped {
+        for span in &row.inline_spans {
+            assert!(span.end <= row.text.len());
+            assert!(
+                row.text.is_char_boundary(span.start) && row.text.is_char_boundary(span.end),
+                "span offsets stay on char boundaries after hang shift: {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nbsp_never_becomes_a_wrap_split_point() {
+    // "Ctrl+V\u{a0}paste" must move to the next row as one unit.
+    let text = "prefix words then Ctrl+V\u{a0}paste";
+    let split = word_wrap_split_index(text, 24);
+    let (first, _) = text.split_at(split);
+    assert!(
+        !first.trim_end().ends_with("Ctrl+V"),
+        "wrap must not separate the shortcut from its label: split at {split} -> {first:?}"
+    );
+}
+
+#[test]
+fn transcript_scrollbar_suppressed_while_inline_widget_open() {
+    let mut app = SingleSessionApp::new(Some(test_session_card("scroll", "scroll session")));
+    for turn in 0..40 {
+        app.messages
+            .push(SingleSessionMessage::user(format!("prompt {turn}")));
+        app.messages.push(SingleSessionMessage::assistant(
+            "a response long enough to add several wrapped lines to the transcript body",
+        ));
+    }
+    assert!(!single_session_scrollbar_suppressed(&app));
+
+    app.handle_key(KeyInput::HotkeyHelp);
+    assert!(app.render_inline_widget_line_count() > 0);
+    assert!(single_session_scrollbar_suppressed(&app));
+
+    let size = PhysicalSize::new(900, 700);
+    let mut vertices = Vec::new();
+    push_single_session_scrollbar(&mut vertices, &app, size, 0, 0.0, None);
+    assert!(
+        vertices.is_empty(),
+        "no scrollbar primitives while the help widget is open"
+    );
+}
+
+#[test]
+fn streaming_activity_dots_animate_smoothly_across_sub_tick_times() {
+    let mut app = SingleSessionApp::new(None);
+    app.is_processing = true;
+    let size = PhysicalSize::new(900, 700);
+
+    let vertices_at = |seconds: f32| {
+        let mut vertices = Vec::new();
+        push_streaming_activity_cue(&mut vertices, &app, size, 0, seconds, None, None);
+        vertices
+    };
+
+    // Sub-tick (16ms) steps must change the dot geometry: the wave is
+    // continuous, not quantized to the 180ms spinner tick.
+    let base = vertices_at(0.20);
+    let sixteen_ms_later = vertices_at(0.216);
+    assert!(!base.is_empty());
+    let frames_differ = base.len() != sixteen_ms_later.len()
+        || base
+            .iter()
+            .zip(sixteen_ms_later.iter())
+            .any(|(a, b)| a.position != b.position || a.color != b.color);
+    assert!(frames_differ, "dot wave should move between 16ms frames");
+
+    // And the wave must be periodic: one full period returns the same frame.
+    let one_period_later = vertices_at(0.20 + STREAMING_ACTIVITY_DOT_WAVE_PERIOD_SECONDS);
+    for (a, b) in base.iter().zip(one_period_later.iter()) {
+        for (pa, pb) in a.position.iter().zip(b.position.iter()) {
+            assert!(
+                (pa - pb).abs() < 0.01,
+                "wave should repeat after one period"
+            );
+        }
+    }
+}
+
+#[test]
+fn markdown_table_card_hugs_table_width() {
+    let full_width = 1200.0;
+    let app = SingleSessionApp::new(None);
+    let lines = vec![
+        SingleSessionStyledLine::new("column │ value", SingleSessionLineStyle::AssistantTable),
+        SingleSessionStyledLine::new("──────┼──────", SingleSessionLineStyle::AssistantTable),
+        SingleSessionStyledLine::new("status │ done", SingleSessionLineStyle::AssistantTable),
+    ];
+    let run = SingleSessionTranscriptCardRun {
+        line: 0,
+        line_count: 3,
+        style: SingleSessionLineStyle::AssistantTable,
+    };
+    let width = transcript_card_run_width(&app, &lines, &run, full_width);
+    assert!(
+        width < full_width * 0.5,
+        "narrow table should not band the full column: {width}"
+    );
+
+    // Non-table runs keep the full width.
+    let code_run = SingleSessionTranscriptCardRun {
+        line: 0,
+        line_count: 3,
+        style: SingleSessionLineStyle::Code,
+    };
+    assert_eq!(
+        transcript_card_run_width(&app, &lines, &code_run, full_width),
+        full_width
+    );
 }
 
 #[test]
@@ -477,9 +657,11 @@ fn inline_widget_command_palettes_draw_structured_cards_not_text_boxes() {
         vertex_count_for_color(&model_vertices, INLINE_COMMAND_ROW_BACKGROUND_COLOR) > 0,
         "unselected model row should be a rendered rounded card"
     );
+    // Left accent rails were intentionally removed from the model picker
+    // (commit b8672145); selection is conveyed by the filled row card alone.
     assert!(
-        vertex_count_for_color(&model_vertices, MODEL_PICKER_ROW_ACCENT_COLOR) > 0,
-        "selected model row should use a rendered accent rail instead of selector text"
+        vertex_count_for_color(&model_vertices, MODEL_PICKER_ROW_ACCENT_COLOR) == 0,
+        "model rows should not render the removed accent rail"
     );
 
     let session_lines = vec![
@@ -1312,6 +1494,107 @@ fn transcript_card_motion_animates_card_exit() {
     assert!(settled.exiting().is_empty());
 }
 
+/// The scroll fast-path replaced a per-frame full-viewport reshape with a
+/// per-line cache. This guards the correctness assumption behind that change:
+/// shaping a line on its own must produce the same inline-code glyph bounds as
+/// shaping it inside a multi-line viewport buffer (true because the transcript
+/// body buffer uses `Wrap::None`, so logical lines are shaped independently).
+#[test]
+fn inline_code_span_bounds_match_full_viewport_shaping() {
+    let size = PhysicalSize::new(1200, 760);
+    let text_scale = 1.0;
+
+    let lines = vec![
+        SingleSessionStyledLine::new(
+            "plain assistant prose with no code at all",
+            SingleSessionLineStyle::Assistant,
+        ),
+        SingleSessionStyledLine::with_inline_spans(
+            "run cargo build then cargo test now".to_string(),
+            SingleSessionLineStyle::Assistant,
+            vec![
+                SingleSessionInlineSpan {
+                    start: 4,
+                    end: 15,
+                    kind: SingleSessionInlineSpanKind::Code,
+                },
+                SingleSessionInlineSpan {
+                    start: 21,
+                    end: 31,
+                    kind: SingleSessionInlineSpanKind::Code,
+                },
+            ],
+        ),
+        SingleSessionStyledLine::new("more prose in between", SingleSessionLineStyle::Assistant),
+        SingleSessionStyledLine::with_inline_spans(
+            "a single `inline` span here".to_string(),
+            SingleSessionLineStyle::Assistant,
+            vec![SingleSessionInlineSpan {
+                start: 9,
+                end: 17,
+                kind: SingleSessionInlineSpanKind::Code,
+            }],
+        ),
+    ];
+
+    // Reference: shape the whole slice in one buffer (the old behavior) and read
+    // each code span's bounds straight off the per-line layout run.
+    let reference: Vec<Vec<Option<(f32, f32)>>> = with_measurement_font_system(|font_system| {
+        let buffer =
+            single_session_body_text_buffer_from_lines(font_system, &lines, size, text_scale);
+        let layout_runs = buffer.layout_runs().collect::<Vec<_>>();
+        lines
+            .iter()
+            .enumerate()
+            .map(|(line_index, line)| {
+                let layout_run = layout_runs.get(line_index);
+                line.inline_spans
+                    .iter()
+                    .filter(|span| span.kind == SingleSessionInlineSpanKind::Code)
+                    .map(|span| {
+                        layout_run.and_then(|run| {
+                            run.highlight(
+                                glyphon::Cursor::new(run.line_i, span.start),
+                                glyphon::Cursor::new(run.line_i, span.end),
+                            )
+                            .and_then(|(left, width)| (width > 0.0).then_some((left, left + width)))
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    });
+
+    for (line, expected) in lines.iter().zip(reference.iter()) {
+        let cached = inline_code_span_bounds_for_line(line, size, text_scale);
+        // Cache hit must return identical data on a second call.
+        let cached_again = inline_code_span_bounds_for_line(line, size, text_scale);
+        assert_eq!(cached, cached_again, "cache must be deterministic");
+        assert_eq!(
+            cached.len(),
+            expected.len(),
+            "span count mismatch for line {:?}",
+            line.text
+        );
+        for (got, want) in cached.iter().zip(expected.iter()) {
+            match (got, want) {
+                (Some((gl, gr)), Some((wl, wr))) => {
+                    assert!(
+                        (gl - wl).abs() < 0.01 && (gr - wr).abs() < 0.01,
+                        "bounds mismatch for {:?}: got {got:?} want {want:?}",
+                        line.text
+                    );
+                }
+                (None, None) => {}
+                _ => panic!(
+                    "presence mismatch for {:?}: got {got:?} want {want:?}",
+                    line.text
+                ),
+            }
+        }
+    }
+}
+
 #[test]
 fn inline_markdown_pill_motion_animates_entry_shift_and_exit() {
     let mut registry = InlineMarkdownPillMotionRegistry::default();
@@ -1428,14 +1711,14 @@ fn tool_card_motion_animates_new_card_entry() {
         SingleSessionToolLineKind::Header,
     );
 
-    let frame = registry.frame(std::slice::from_ref(&first), now, 0);
+    let frame = registry.frame(std::slice::from_ref(&first), now, 0.0);
     let first_visual = frame.visual_for("call-a").expect("first visual");
     assert_eq!(first_visual.opacity, 1.0);
     assert_eq!(first_visual.y_offset_pixels, 0.0);
     assert_eq!(first_visual.scale, 1.0);
 
     let lines = vec![first.clone(), second.clone()];
-    let entry = registry.frame(&lines, now + Duration::from_millis(10), 0);
+    let entry = registry.frame(&lines, now + Duration::from_millis(10), 0.0);
     let entry_visual = entry.visual_for("call-b").expect("entry visual");
     assert_eq!(entry_visual.opacity, 0.0);
     assert!(entry_visual.y_offset_pixels > 0.0);
@@ -1445,7 +1728,7 @@ fn tool_card_motion_animates_new_card_entry() {
     let middle = registry.frame(
         &lines,
         now + Duration::from_millis(10) + TOOL_CARD_ENTRY_DURATION / 2,
-        1,
+        0.18,
     );
     let middle_visual = middle.visual_for("call-b").expect("middle visual");
     assert!(middle_visual.opacity > 0.0 && middle_visual.opacity < 1.0);
@@ -1454,7 +1737,7 @@ fn tool_card_motion_animates_new_card_entry() {
     let final_frame = registry.frame(
         &lines,
         now + Duration::from_millis(10) + TOOL_CARD_ENTRY_DURATION * 2,
-        2,
+        0.36,
     );
     let final_visual = final_frame.visual_for("call-b").expect("final visual");
     assert_eq!(final_visual.opacity, 1.0);
@@ -1479,11 +1762,11 @@ fn tool_card_motion_animates_state_resolution() {
         SingleSessionToolLineKind::Header,
     );
 
-    registry.frame(std::slice::from_ref(&running), now, 0);
+    registry.frame(std::slice::from_ref(&running), now, 0.0);
     let start = registry.frame(
         std::slice::from_ref(&done),
         now + Duration::from_millis(5),
-        0,
+        0.0,
     );
     let start_visual = start.visual_for("call-a").expect("start visual");
     assert!(start.is_active());
@@ -1500,7 +1783,7 @@ fn tool_card_motion_animates_state_resolution() {
             + TOOL_CARD_STATE_TRANSITION_DURATION
             + TOOL_CARD_RESOLUTION_FLASH_DURATION
             + Duration::from_millis(1),
-        2,
+        0.36,
     );
     let final_visual = final_frame.visual_for("call-a").expect("final visual");
     assert!(!final_frame.is_active());
@@ -1529,9 +1812,9 @@ fn tool_card_motion_animates_output_drawer_reveal() {
         SingleSessionToolLineKind::Detail,
     );
 
-    registry.frame(std::slice::from_ref(&header), now, 0);
+    registry.frame(std::slice::from_ref(&header), now, 0.0);
     let expanded = vec![header.clone(), detail.clone()];
-    let start = registry.frame(&expanded, now + Duration::from_millis(7), 0);
+    let start = registry.frame(&expanded, now + Duration::from_millis(7), 0.0);
     let start_visual = start.visual_for("call-a").expect("start visual");
     assert_eq!(start_visual.output_reveal, 0.0);
     assert!(start.is_active());
@@ -1539,7 +1822,7 @@ fn tool_card_motion_animates_output_drawer_reveal() {
     let middle = registry.frame(
         &expanded,
         now + Duration::from_millis(7) + TOOL_CARD_OUTPUT_REVEAL_DURATION / 2,
-        1,
+        0.18,
     );
     let middle_visual = middle.visual_for("call-a").expect("middle visual");
     assert!(middle_visual.output_reveal > 0.0 && middle_visual.output_reveal < 1.0);
@@ -1547,7 +1830,7 @@ fn tool_card_motion_animates_output_drawer_reveal() {
     let final_frame = registry.frame(
         &expanded,
         now + Duration::from_millis(7) + TOOL_CARD_OUTPUT_REVEAL_DURATION * 2,
-        2,
+        0.36,
     );
     let final_visual = final_frame.visual_for("call-a").expect("final visual");
     assert_eq!(final_visual.output_reveal, 1.0);
@@ -1577,11 +1860,11 @@ fn tool_card_motion_animates_group_summary_replacement() {
         SingleSessionToolLineKind::GroupSummary,
     );
 
-    registry.frame(&[first, second], now, 0);
+    registry.frame(&[first, second], now, 0.0);
     let replaced = registry.frame(
         std::slice::from_ref(&group),
         now + Duration::from_millis(8),
-        1,
+        0.18,
     );
     assert!(replaced.is_active());
     assert_eq!(replaced.exiting().len(), 2);
@@ -1602,7 +1885,7 @@ fn tool_card_motion_animates_group_summary_replacement() {
     let settled = registry.frame(
         std::slice::from_ref(&group),
         now + Duration::from_millis(8) + TOOL_CARD_ENTRY_DURATION * 2,
-        2,
+        0.36,
     );
     assert!(settled.exiting().is_empty());
     assert_eq!(
@@ -1644,13 +1927,13 @@ fn reduced_motion_snaps_tool_card_entry_state_and_grouping() {
         SingleSessionToolLineKind::GroupSummary,
     );
 
-    let initial = registry.frame(std::slice::from_ref(&first), now, 9);
+    let initial = registry.frame(std::slice::from_ref(&first), now, 1.62);
     let initial_visual = initial.visual_for("call-a").expect("initial visual");
     assert_eq!(initial_visual.opacity, 1.0);
     assert_eq!(initial_visual.active_phase, 0.0);
     assert!(!initial.is_active());
 
-    let added = registry.frame(&[done.clone(), second], now + Duration::from_millis(5), 10);
+    let added = registry.frame(&[done.clone(), second], now + Duration::from_millis(5), 1.8);
     let done_visual = added.visual_for("call-a").expect("done visual");
     let second_visual = added.visual_for("call-b").expect("second visual");
     assert_eq!(done_visual.flash_alpha, 0.0);
@@ -1662,7 +1945,7 @@ fn reduced_motion_snaps_tool_card_entry_state_and_grouping() {
     let grouped = registry.frame(
         std::slice::from_ref(&group),
         now + Duration::from_millis(10),
-        11,
+        1.98,
     );
     assert!(grouped.exiting().is_empty());
     assert_eq!(
@@ -1862,8 +2145,10 @@ fn session_switcher_text_buffer_shapes_loaded_session_rows() {
         .collect::<Vec<_>>()
         .join("\n");
 
+    // The rail ellipsis-truncates long rows to its column budget; the row
+    // label must still be shaped, while the full title lives in the preview.
     assert!(
-        rendered_inline_text.contains("visible resume row"),
+        rendered_inline_text.contains("active session"),
         "desktop text buffer should shape session rows, got:\n{rendered_inline_text}"
     );
 
@@ -1892,21 +2177,20 @@ fn session_switcher_text_buffer_shapes_loaded_session_rows() {
         .iter()
         .find(|area| std::ptr::eq(area.buffer, &buffers[7]))
         .expect("split preview text area");
-    let preview_start_line = inline_widget_split_preview_start(
-        app.render_inline_widget_kind(),
-        &app.render_inline_widget_styled_lines(),
-    )
-    .expect("session switcher preview start line");
-    let typography = single_session_typography_for_scale(app.text_scale());
-    let expected_preview_top = inline_area.top
-        + preview_start_line as f32
-            * inline_widget_line_height(app.render_inline_widget_kind(), &typography);
+    // The preview pane is anchored to the top of its column, not to the
+    // "Preview" header row offset inside the combined line list: a long
+    // session list would push the row offset below the visible card and
+    // leave the pane empty.
     assert!(
-        (preview_area.top - expected_preview_top).abs() <= 1.0,
-        "compact preview buffer should be positioned at its visual row offset: inline_top={}, preview_top={}, expected={}",
+        preview_area.top >= inline_area.top - 16.0,
+        "preview pane should start near the top of the card: inline_top={}, preview_top={}",
         inline_area.top,
-        preview_area.top,
-        expected_preview_top
+        preview_area.top
+    );
+    assert!(
+        (preview_area.bounds.bottom as f32) <= single_session_draft_top(size),
+        "preview pane should stay above the composer: bottom={}",
+        preview_area.bounds.bottom
     );
     assert!(
         (preview_area.top - preview_area.bounds.top as f32).abs() <= 1.0,

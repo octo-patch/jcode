@@ -14,6 +14,23 @@ pub struct ImageRegion {
     pub hash: u64,
     /// Total height of the image placeholder in lines.
     pub height: u16,
+    /// Estimated rendered width in cells, including the left border. `0` means
+    /// unknown; consumers should treat the rows as fully occupied.
+    pub width: u16,
+    /// How the image should be fit into its region when drawn.
+    pub render: ImageRegionRender,
+}
+
+/// Strategy for fitting an image into its placeholder region at draw time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ImageRegionRender {
+    /// Crop into the pre-estimated region height. Used for Mermaid diagrams,
+    /// whose placeholder height already matches their rendered aspect ratio.
+    #[default]
+    Crop,
+    /// Scale-to-fit (preserve aspect, fit width and height). Used for inline
+    /// raster images so resizes and font-metric mismatches never slice them.
+    Fit,
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +50,26 @@ pub struct EditToolRange {
     pub start_line: usize,
     pub end_line: usize,
     pub expandable: bool,
+}
+
+/// Per-message cumulative boundary, recorded in transcript order during body
+/// preparation. Enables prefix reuse: when a later body rebuild shares a hash
+/// prefix with a cached body, the cached body can be truncated at the longest
+/// matching message boundary and only the changed/new tail re-rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageBoundary {
+    /// `stable_cache_hash()` of the source `DisplayMessage`.
+    pub msg_hash: u64,
+    /// Cumulative `wrapped_lines` length after this message was rendered
+    /// (including any blank separator line that preceded it).
+    pub wrapped_len: usize,
+    /// Cumulative `raw_plain_lines` length after this message was rendered.
+    /// The body builder seeds a contiguous raw for every rendered line, so
+    /// `raw_plain_lines[..raw_len]` is exactly the raws for messages `0..=i` and
+    /// a prefix-reuse rebuild can truncate the raw array at this point too.
+    pub raw_len: usize,
+    /// Cumulative `user_prompt_texts` length after this message was rendered.
+    pub user_prompt_len: usize,
 }
 
 #[derive(Clone)]
@@ -55,6 +92,20 @@ pub struct PreparedMessages {
     /// Line ranges for edit tool messages.
     pub edit_tool_ranges: Vec<EditToolRange>,
     pub copy_targets: Vec<CopyTarget>,
+    /// Per-message cumulative boundaries in transcript order, used for prefix
+    /// reuse on rebuild. Empty when boundary tracking is not available (e.g.
+    /// synthetic/test prepared bodies); prefix reuse simply degrades to a full
+    /// rebuild in that case.
+    pub message_boundaries: Vec<MessageBoundary>,
+    /// Deferred-mermaid staleness stamp: `Some(epoch)` when `wrapped_lines`
+    /// bakes in at least one "rendering mermaid diagram..." placeholder for a
+    /// diagram still rendering in the background, where `epoch` is the
+    /// deferred-render epoch observed *before* the markdown was rendered.
+    /// Cache layers treat the prepared content as stale once the live epoch
+    /// advances past this value and re-render the pending tail so the
+    /// completed diagram replaces its placeholder. `None` when no pending
+    /// placeholder is present.
+    pub mermaid_pending_epoch: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -70,7 +121,12 @@ pub enum PreparedSectionKind {
     Body,
     Header,
     BatchProgress,
+    /// Retained / collapsing reasoning trace shown just above the live stream in
+    /// `current` reasoning-display mode.
+    Reasoning,
     Streaming,
+    /// Inline images rendered in the transcript flow (below the body).
+    InlineImages,
 }
 
 #[derive(Clone)]
@@ -90,6 +146,16 @@ pub struct PreparedChatFrame {
 impl PreparedChatFrame {
     pub fn from_single(prepared: Arc<PreparedMessages>) -> Self {
         Self::from_sections(vec![(PreparedSectionKind::Body, prepared)])
+    }
+
+    /// Earliest deferred-mermaid pending stamp across all sections, if any
+    /// section still bakes in a "rendering mermaid diagram..." placeholder.
+    /// See [`PreparedMessages::mermaid_pending_epoch`].
+    pub fn mermaid_pending_epoch(&self) -> Option<u64> {
+        self.sections
+            .iter()
+            .filter_map(|section| section.prepared.mermaid_pending_epoch)
+            .min()
     }
 
     pub fn from_sections(sections: Vec<(PreparedSectionKind, Arc<PreparedMessages>)>) -> Self {
@@ -138,6 +204,8 @@ impl PreparedChatFrame {
                 end_line: region.end_line + line_start,
                 hash: region.hash,
                 height: region.height,
+                width: region.width,
+                render: region.render,
             }));
             edit_tool_ranges.extend(prepared.edit_tool_ranges.iter().map(|range| EditToolRange {
                 edit_index: range.edit_index,
@@ -251,6 +319,23 @@ impl PreparedChatFrame {
             start_col: map.start_col,
             end_col: map.end_col,
         })
+    }
+
+    /// Transcript message index whose rendered lines contain `abs_line`, when
+    /// the line falls inside a Body section with message-boundary tracking.
+    /// Boundaries record the cumulative wrapped length after each message, so
+    /// the owning message is the first boundary strictly beyond the line.
+    pub fn message_index_at_line(&self, abs_line: usize) -> Option<usize> {
+        let (section, local) = self.line_section(abs_line)?;
+        if section.kind != PreparedSectionKind::Body {
+            return None;
+        }
+        let boundaries = &section.prepared.message_boundaries;
+        if boundaries.is_empty() {
+            return None;
+        }
+        let idx = boundaries.partition_point(|boundary| boundary.wrapped_len <= local);
+        (idx < boundaries.len()).then_some(idx)
     }
 
     pub fn materialize_line_slice(&self, start: usize, end: usize) -> Vec<Line<'static>> {

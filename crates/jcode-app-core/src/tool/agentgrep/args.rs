@@ -8,8 +8,11 @@ struct ResolvedSearchScope {
 fn resolved_search_scope(
     ctx: &ToolContext,
     path: Option<&str>,
+    file: Option<&str>,
     glob: Option<&str>,
 ) -> ResolvedSearchScope {
+    // `file` scopes grep/find to one exact file when `path` is absent.
+    let path = path.or(file);
     let Some(path) = path else {
         return ResolvedSearchScope {
             root: None,
@@ -44,7 +47,12 @@ pub(super) fn build_grep_args(params: &AgentGrepInput, ctx: &ToolContext) -> Res
         .query
         .clone()
         .ok_or_else(|| anyhow::anyhow!("agentgrep grep requires 'query'"))?;
-    let scope = resolved_search_scope(ctx, params.path.as_deref(), params.glob.as_deref());
+    let scope = resolved_search_scope(
+        ctx,
+        params.path.as_deref(),
+        params.file.as_deref(),
+        params.glob.as_deref(),
+    );
     Ok(GrepArgs {
         query,
         regex: params.regex.unwrap_or(false),
@@ -62,6 +70,7 @@ pub(super) fn build_find_args(params: &AgentGrepInput, ctx: &ToolContext) -> Res
     let query = params.query.as_deref().unwrap_or_default();
     if query.trim().is_empty()
         && params.path.as_deref().is_none_or(str::is_empty)
+        && params.file.as_deref().is_none_or(str::is_empty)
         && normalized_agentgrep_glob(params.glob.as_deref()).is_none()
         && params.file_type.as_deref().is_none_or(str::is_empty)
     {
@@ -69,7 +78,12 @@ pub(super) fn build_find_args(params: &AgentGrepInput, ctx: &ToolContext) -> Res
             "agentgrep find requires 'query' unless path, glob, or type narrows the search"
         ));
     }
-    let scope = resolved_search_scope(ctx, params.path.as_deref(), params.glob.as_deref());
+    let scope = resolved_search_scope(
+        ctx,
+        params.path.as_deref(),
+        params.file.as_deref(),
+        params.glob.as_deref(),
+    );
     Ok(FindArgs {
         query_parts: query.split_whitespace().map(ToOwned::to_owned).collect(),
         file_type: params.file_type.clone(),
@@ -89,6 +103,23 @@ pub(super) fn build_outline_args(
     ctx: &ToolContext,
     context_json_path: Option<&Path>,
 ) -> Result<OutlineArgs> {
+    // Agents sometimes point `path` at the file itself, either instead of or
+    // in addition to `file`. Treat a file-valued `path` as the outline target
+    // so the file argument is not joined onto it (for example,
+    // ".../todo.rs/.../todo.rs").
+    if let Some(path) = params.path.as_deref() {
+        let resolved = resolve_path_arg(ctx, path);
+        if resolved.is_file() {
+            return Ok(OutlineArgs {
+                file: resolved.display().to_string(),
+                json: false,
+                max_items: None,
+                path: None,
+                context_json: context_json_path.map(|path| path.display().to_string()),
+            });
+        }
+    }
+
     let file = outline_file_arg(params)?;
     Ok(OutlineArgs {
         file,
@@ -111,7 +142,12 @@ pub(super) fn build_smart_args_and_query(
             err
         )
     })?;
-    let scope = resolved_search_scope(ctx, params.path.as_deref(), params.glob.as_deref());
+    let scope = resolved_search_scope(
+        ctx,
+        params.path.as_deref(),
+        params.file.as_deref(),
+        params.glob.as_deref(),
+    );
 
     let args = SmartArgs {
         terms,
@@ -195,10 +231,10 @@ fn resolved_root_string(ctx: &ToolContext, path: Option<&str>) -> Option<String>
     path.map(|path| resolve_path_arg(ctx, path).display().to_string())
 }
 
-pub(super) fn resolve_search_root(ctx: &ToolContext, path: Option<&str>) -> PathBuf {
+pub(super) fn resolve_search_root(ctx: &ToolContext, path: Option<&str>) -> Result<PathBuf> {
     path.map(PathBuf::from)
         .or_else(|| ctx.working_dir.clone())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .ok_or_else(|| anyhow::anyhow!("agentgrep requires a session working directory"))
 }
 
 pub(super) fn summarize_agentgrep_request(

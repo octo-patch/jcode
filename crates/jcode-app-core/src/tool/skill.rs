@@ -17,11 +17,21 @@ impl SkillTool {
     pub fn new(registry: Arc<RwLock<SkillRegistry>>) -> Self {
         Self { registry }
     }
+
+    /// Effective skill set for this call: shared global registry plus the
+    /// session's project-local overlay resolved from the tool context working
+    /// dir (issue #457). The overlay is read fresh from disk so edits are
+    /// visible without daemon restarts and never enter the shared registry.
+    async fn effective_registry(&self, working_dir: Option<&std::path::Path>) -> SkillRegistry {
+        let global = self.registry.read().await;
+        SkillRegistry::effective_for_working_dir(&global, working_dir)
+    }
 }
 
 #[derive(Deserialize)]
 struct SkillInput {
-    /// Action to perform: load (default), list, reload, reload_all, read
+    /// Action to perform: load (default), list, reload, reload_all, read.
+    /// `list` shows both loaded skills and the jcode-endorsed catalog.
     #[serde(default = "default_action")]
     action: String,
     /// Skill name (required for load, reload, read)
@@ -73,11 +83,17 @@ impl Tool for SkillTool {
         let _args = params.args.as_deref();
 
         match params.action.as_str() {
-            "load" => self.load_skill(params.name).await,
-            "list" => self.list_skills().await,
+            "load" => {
+                self.load_skill(params.name, ctx.working_dir.as_deref())
+                    .await
+            }
+            "list" => self.list_skills(ctx.working_dir.as_deref()).await,
             "reload" => self.reload_skill(params.name).await,
             "reload_all" => self.reload_all_skills(ctx.working_dir.as_deref()).await,
-            "read" => self.read_skill(params.name).await,
+            "read" => {
+                self.read_skill(params.name, ctx.working_dir.as_deref())
+                    .await
+            }
             _ => Ok(ToolOutput::new(format!(
                 "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', or 'read'.",
                 params.action
@@ -94,13 +110,39 @@ impl Tool for SkillTool {
 }
 
 impl SkillTool {
-    async fn load_skill(&self, name: Option<String>) -> Result<ToolOutput> {
+    async fn load_skill(
+        &self,
+        name: Option<String>,
+        working_dir: Option<&std::path::Path>,
+    ) -> Result<ToolOutput> {
         let name = normalize_skill_name(name, "load")?;
 
-        let registry = self.registry.read().await;
-        let skill = registry
-            .get(&name)
-            .ok_or_else(|| anyhow::anyhow!("Skill '{}' not found", name))?;
+        let registry = self.effective_registry(working_dir).await;
+        let skill = registry.get(&name).ok_or_else(|| {
+            // Endorsed skills are advertised in `list` but are not bundled;
+            // a bare "not found" here reads like a bug (issue #445). Point at
+            // the actual install command instead.
+            if let Some(endorsed) = crate::skill::endorsed_skills()
+                .iter()
+                .find(|endorsed| endorsed.name == name)
+            {
+                match endorsed.install {
+                    Some(install) => anyhow::anyhow!(
+                        "Skill '{}' is endorsed but not installed. Install it with `{}`, then run skill_manage reload_all.",
+                        name,
+                        install
+                    ),
+                    None => anyhow::anyhow!(
+                        "Skill '{}' is endorsed but not installed (source: {}). Install it into ~/.jcode/skills/{}/SKILL.md, then run skill_manage reload_all.",
+                        name,
+                        endorsed.source,
+                        name
+                    ),
+                }
+            } else {
+                anyhow::anyhow!("Skill '{}' not found", name)
+            }
+        })?;
 
         let base_dir = skill
             .path
@@ -117,38 +159,43 @@ impl SkillTool {
         .with_title(format!("skill: {}", skill.name)))
     }
 
-    async fn list_skills(&self) -> Result<ToolOutput> {
-        let registry = self.registry.read().await;
-        let skills = registry.list();
+    async fn list_skills(&self, working_dir: Option<&std::path::Path>) -> Result<ToolOutput> {
+        let registry = self.effective_registry(working_dir).await;
+        let mut skills = registry.list();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
 
-        if skills.is_empty() {
-            return Ok(ToolOutput::new(
-                "No skills available.\n\n\
-                Skills are loaded from:\n\
-                - ~/.claude/skills/<skill-name>/SKILL.md\n\
-                - ./.claude/skills/<skill-name>/SKILL.md\n\n\
-                Create a SKILL.md file with YAML frontmatter:\n\
-                ---\n\
-                name: my-skill\n\
-                description: What this skill does\n\
-                allowed-tools: bash, read, write\n\
-                ---\n\n\
-                # Skill content here",
-            )
-            .with_title("Skills: None available"));
-        }
+        let installed: std::collections::HashSet<&str> =
+            skills.iter().map(|s| s.name.as_str()).collect();
 
-        let mut output = format!("Available skills: {}\n\n", skills.len());
-
-        for skill in skills {
-            output.push_str(&format!("## /{}\n", skill.name));
-            output.push_str(&format!("  {}\n", skill.description));
-            output.push_str(&format!("  Path: {}\n", skill.path.display()));
-            if let Some(ref tools) = skill.allowed_tools {
-                output.push_str(&format!("  Tools: {}\n", tools.join(", ")));
+        let mut output = if skills.is_empty() {
+            "No skills loaded.\n\n\
+            Skills are loaded from:\n\
+            - ~/.jcode/skills/<skill-name>/SKILL.md (global)\n\
+            - ./.jcode/skills/<skill-name>/SKILL.md (project-local)\n\
+            - ./.claude/skills/<skill-name>/SKILL.md (compatibility)\n\n\
+            Create a SKILL.md file with YAML frontmatter:\n\
+            ---\n\
+            name: my-skill\n\
+            description: What this skill does\n\
+            allowed-tools: bash, read, write\n\
+            ---\n\n\
+            # Skill content here\n"
+                .to_string()
+        } else {
+            let mut output = format!("Loaded skills: {}\n\n", skills.len());
+            for skill in &skills {
+                output.push_str(&format!("## /{}\n", skill.name));
+                output.push_str(&format!("  {}\n", skill.description));
+                output.push_str(&format!("  Path: {}\n", skill.path.display()));
+                if let Some(ref tools) = skill.allowed_tools {
+                    output.push_str(&format!("  Tools: {}\n", tools.join(", ")));
+                }
+                output.push('\n');
             }
-            output.push('\n');
-        }
+            output
+        };
+
+        append_endorsed_skills(&mut output, &installed);
 
         Ok(ToolOutput::new(output).with_title("Skills: List"))
     }
@@ -193,18 +240,33 @@ impl SkillTool {
     }
 
     async fn reload_all_skills(&self, working_dir: Option<&std::path::Path>) -> Result<ToolOutput> {
-        let mut registry = self.registry.write().await;
+        // Reload the shared GLOBAL registry only; the project-local overlay is
+        // session-scoped and re-read from disk on every access, so reloading
+        // it here would leak this session's project skills to other sessions
+        // (issue #457).
+        let reloaded = {
+            let mut registry = self.registry.write().await;
+            registry.reload_global()
+        };
 
-        match registry.reload_all_for_working_dir(working_dir) {
-            Ok(count) => {
-                let skills = registry.list();
-                let mut output = format!("Reloaded {} skills\n\n", count);
+        match reloaded {
+            Ok(global_count) => {
+                let effective = self.effective_registry(working_dir).await;
+                let skills = effective.list();
+                let mut output = format!(
+                    "Reloaded {} global skills ({} effective for this session)\n\n",
+                    global_count,
+                    skills.len()
+                );
 
                 for skill in skills {
                     output.push_str(&format!("- /{}: {}\n", skill.name, skill.description));
                 }
 
-                Ok(ToolOutput::new(output).with_title(format!("Skills: Reloaded {}", count)))
+                Ok(
+                    ToolOutput::new(output)
+                        .with_title(format!("Skills: Reloaded {}", global_count)),
+                )
             }
             Err(e) => {
                 crate::logging::warn(&format!(
@@ -217,10 +279,14 @@ impl SkillTool {
         }
     }
 
-    async fn read_skill(&self, name: Option<String>) -> Result<ToolOutput> {
+    async fn read_skill(
+        &self,
+        name: Option<String>,
+        working_dir: Option<&std::path::Path>,
+    ) -> Result<ToolOutput> {
         let name = normalize_skill_name(name, "read")?;
 
-        let registry = self.registry.read().await;
+        let registry = self.effective_registry(working_dir).await;
 
         if let Some(skill) = registry.get(&name) {
             let mut output = format!("# Skill: {}\n\n", skill.name);
@@ -241,6 +307,61 @@ impl SkillTool {
             .with_title("Skills: Not found"))
         }
     }
+}
+
+/// Append the curated jcode-endorsed skill catalog to `output`, grouped by
+/// category and marked with installed/not-installed status. `installed` is the
+/// set of skill names currently loaded in the registry.
+fn append_endorsed_skills(output: &mut String, installed: &std::collections::HashSet<&str>) {
+    let endorsed = crate::skill::endorsed_skills();
+    if endorsed.is_empty() {
+        return;
+    }
+
+    output.push_str("\nEndorsed skills (recommended by jcode)\n");
+
+    // Group by category, preserving first-seen order.
+    let mut category_order: Vec<&str> = Vec::new();
+    for skill in endorsed {
+        if !category_order.contains(&skill.category) {
+            category_order.push(skill.category);
+        }
+    }
+
+    for category in category_order {
+        let in_category: Vec<_> = endorsed.iter().filter(|e| e.category == category).collect();
+        let installed_count = in_category
+            .iter()
+            .filter(|e| installed.contains(e.name))
+            .count();
+        output.push_str(&format!(
+            "\n  {} ({}/{} installed)\n",
+            category,
+            installed_count,
+            in_category.len()
+        ));
+        for skill in in_category {
+            let is_installed = installed.contains(skill.name);
+            let status = if is_installed {
+                "installed"
+            } else {
+                "not installed"
+            };
+            output.push_str(&format!("  - /{} [{}]\n", skill.name, status));
+            output.push_str(&format!("      {}\n", skill.description));
+            output.push_str(&format!("      source: {}\n", skill.source));
+            if !is_installed && let Some(install) = skill.install {
+                output.push_str(&format!("      install: {}\n", install));
+            }
+        }
+    }
+
+    output.push_str(
+        "\nActivate a loaded skill by loading it with skill_manage (action=load) or typing its slash command.\n",
+    );
+    output.push_str(
+        "NVIDIA CUDA-X skills come from the official catalog at https://github.com/NVIDIA/skills.\n",
+    );
 }
 
 fn normalize_skill_name(name: Option<String>, action: &str) -> Result<String> {
@@ -318,7 +439,29 @@ mod tests {
         let input = json!({"action": "list"});
 
         let result = tool.execute(input, ctx).await.unwrap();
-        assert!(result.output.contains("No skills available"));
+        assert!(result.output.contains("No skills loaded"));
+        // Even with no skills loaded, the endorsed catalog should be listed.
+        assert!(result.output.contains("Endorsed skills"));
+    }
+
+    #[tokio::test]
+    async fn test_list_includes_endorsed_skills() {
+        let tool = create_test_tool();
+        let ctx = create_test_context();
+        let input = json!({"action": "list"});
+
+        let result = tool.execute(input, ctx).await.unwrap();
+        // Every endorsed skill should appear with an install-status marker.
+        for endorsed in crate::skill::endorsed_skills() {
+            assert!(
+                result.output.contains(&format!("/{}", endorsed.name)),
+                "expected endorsed skill /{} in:\n{}",
+                endorsed.name,
+                result.output
+            );
+        }
+        // No skills are loaded in this tool, so they should be "not installed".
+        assert!(result.output.contains("[not installed]"));
     }
 
     #[tokio::test]
@@ -413,6 +556,94 @@ mod tests {
             result.output.contains("skills"),
             "Expected 'skills' in output, got: {}",
             result.output
+        );
+    }
+
+    fn context_with_working_dir(dir: &std::path::Path) -> ToolContext {
+        ToolContext {
+            working_dir: Some(dir.to_path_buf()),
+            ..create_test_context()
+        }
+    }
+
+    fn write_project_skill(root: &std::path::Path, name: &str) {
+        let skill_dir = root.join(".agents").join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Project skill {name}\n---\n\nBody."),
+        )
+        .unwrap();
+    }
+
+    /// Issue #457: project-local skills must be session-scoped. Two contexts
+    /// with different working dirs share one registry but must each see only
+    /// their own project skills, immediately and without reload_all.
+    #[tokio::test]
+    async fn test_project_skills_are_scoped_to_tool_context_working_dir() {
+        let tool = create_test_tool();
+        let repo_a = tempfile::tempdir().unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+        write_project_skill(repo_a.path(), "repo-a-skill");
+        write_project_skill(repo_b.path(), "repo-b-skill");
+
+        // Immediately visible in each session without any reload.
+        let list_a = tool
+            .execute(
+                json!({"action": "list"}),
+                context_with_working_dir(repo_a.path()),
+            )
+            .await
+            .unwrap();
+        assert!(list_a.output.contains("repo-a-skill"));
+        assert!(
+            !list_a.output.contains("repo-b-skill"),
+            "session A must not see session B's project skills"
+        );
+
+        let list_b = tool
+            .execute(
+                json!({"action": "list"}),
+                context_with_working_dir(repo_b.path()),
+            )
+            .await
+            .unwrap();
+        assert!(list_b.output.contains("repo-b-skill"));
+        assert!(!list_b.output.contains("repo-a-skill"));
+
+        // reload_all in session A must not leak A's project skills into the
+        // shared registry that session B reads.
+        tool.execute(
+            json!({"action": "reload_all"}),
+            context_with_working_dir(repo_a.path()),
+        )
+        .await
+        .unwrap();
+        let shared = tool.registry.read().await;
+        assert!(
+            shared.get("repo-a-skill").is_none(),
+            "shared registry must stay free of project-local skills"
+        );
+        drop(shared);
+
+        // Skill file edits are visible without any reload/restart.
+        let skill_md = repo_a.path().join(".agents/skills/repo-a-skill/SKILL.md");
+        std::fs::write(
+            &skill_md,
+            "---\nname: repo-a-skill\ndescription: Updated description\n---\n\nNew body.",
+        )
+        .unwrap();
+        let read = tool
+            .execute(
+                json!({"action": "read", "name": "repo-a-skill"}),
+                context_with_working_dir(repo_a.path()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read.output.contains("Updated description"),
+            "skill edits must be visible without daemon restart, got: {}",
+            read.output
         );
     }
 }

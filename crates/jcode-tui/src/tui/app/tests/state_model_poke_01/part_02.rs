@@ -118,10 +118,12 @@ fn test_tool_side_panel_uses_shared_right_pane_keyboard_focus() {
     assert!(app.handle_diagram_ctrl_key(KeyCode::Char('l'), false));
     assert!(app.diff_pane_focus);
 
+    // Cycle the diff display mode via its configured chord (Alt+G by
+    // default; BackTab was remapped to model-favorite cycling).
     assert!(super::input::handle_navigation_shortcuts(
         &mut app,
-        KeyCode::BackTab,
-        KeyModifiers::empty()
+        KeyCode::Char('g'),
+        KeyModifiers::ALT
     ));
     assert!(
         app.diff_pane_focus,
@@ -181,8 +183,7 @@ fn test_pinned_content_uses_left_splitter_instead_of_rounded_box() {
                 "file_path": "src/demo.rs",
                 "content": "fn demo() {}\n"
             }),
-            intent: None,
-        }),
+            intent: None, thought_signature: None, }),
     }];
     app.bump_display_messages_version();
 
@@ -197,7 +198,10 @@ fn test_pinned_content_uses_left_splitter_instead_of_rounded_box() {
 
     assert_eq!(buf[(diff_area.x, diff_area.y)].symbol(), "│");
     assert_eq!(buf[(diff_area.x, diff_area.y + 1)].symbol(), "│");
-    assert!(text.contains("pinned"), "rendered text: {text}");
+    assert!(
+        text.contains("side Pinned +1 -0 1f"),
+        "rendered text: {text}"
+    );
 }
 
 #[test]
@@ -222,8 +226,7 @@ fn test_file_diff_uses_left_splitter_instead_of_rounded_box() {
                 "file_path": file_path.display().to_string(),
                 "content": "fn demo() {\n    println!(\"hi\");\n}\n"
             }),
-            intent: None,
-        }),
+            intent: None, thought_signature: None, }),
     }];
     app.bump_display_messages_version();
 

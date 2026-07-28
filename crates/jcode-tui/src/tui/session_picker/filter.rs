@@ -39,8 +39,11 @@ impl SessionPicker {
 
         let can_narrow_cached = !self.cached_search_query.is_empty()
             && normalized.starts_with(&self.cached_search_query);
+        // When narrowing, reuse the previous match set in place via mem::take
+        // instead of cloning it into `candidates` and then cloning the new
+        // matches back into the cache (two full-list clones per keystroke).
         let candidates = if can_narrow_cached {
-            self.cached_search_refs.clone()
+            std::mem::take(&mut self.cached_search_refs)
         } else {
             self.all_session_refs()
         };
@@ -70,7 +73,7 @@ impl SessionPicker {
             .filter(|session_ref| {
                 self.session_by_ref(*session_ref).is_some_and(|session| {
                     (show_test || !session.is_debug)
-                        && Self::session_matches_filter_mode(session, filter_mode)
+                        && self.session_matches_filter_mode(session, filter_mode)
                 })
             })
             .collect::<Vec<_>>();
@@ -86,6 +89,16 @@ impl SessionPicker {
                 .unwrap_or_default();
             b.cmp(&a)
         });
+        if filter_mode == SessionFilterMode::Active {
+            // Triage order for the active sessions manager: sessions that are
+            // ready for input (done streaming) float above ones still working,
+            // each group keeping the recency order from the sort above.
+            filtered.sort_by_key(|session_ref| {
+                self.session_by_ref(*session_ref)
+                    .map(|session| self.session_is_streaming(session))
+                    .unwrap_or(false)
+            });
+        }
         filtered
     }
 
@@ -101,7 +114,7 @@ impl SessionPicker {
         refs.iter()
             .filter_map(|session_ref| self.session_by_ref(*session_ref))
             .filter(|session| {
-                session.is_debug && Self::session_matches_filter_mode(session, filter_mode)
+                session.is_debug && self.session_matches_filter_mode(session, filter_mode)
             })
             .count()
     }
@@ -137,15 +150,32 @@ impl SessionPicker {
         )
     }
 
-    fn session_matches_filter_mode(session: &SessionInfo, filter_mode: SessionFilterMode) -> bool {
+    pub(super) fn session_is_cursor(session: &SessionInfo) -> bool {
+        jcode_tui_session_picker::session_is_cursor(session.source, session.provider_key.as_deref())
+    }
+
+    fn session_matches_filter_mode(
+        &self,
+        session: &SessionInfo,
+        filter_mode: SessionFilterMode,
+    ) -> bool {
         match filter_mode {
             SessionFilterMode::All => true,
             SessionFilterMode::CatchUp => session.needs_catchup,
             SessionFilterMode::Saved => session.saved,
+            SessionFilterMode::Active => self.session_is_live(session),
             SessionFilterMode::ClaudeCode => Self::session_is_claude_code(session),
             SessionFilterMode::Codex => Self::session_is_codex(session),
             SessionFilterMode::Pi => Self::session_is_pi(session),
             SessionFilterMode::OpenCode => Self::session_is_open_code(session),
+            SessionFilterMode::Cursor => Self::session_is_cursor(session),
+            SessionFilterMode::ExternalClis => {
+                Self::session_is_codex(session)
+                    || Self::session_is_claude_code(session)
+                    || Self::session_is_pi(session)
+                    || Self::session_is_open_code(session)
+                    || Self::session_is_cursor(session)
+            }
         }
     }
 
@@ -220,43 +250,41 @@ impl SessionPicker {
         }
 
         if !self.all_server_groups.is_empty() {
-            let grouped_sections: Vec<(String, String, String, Vec<SessionRef>)> = self
-                .all_server_groups
-                .iter()
-                .enumerate()
-                .filter_map(|(group_idx, group)| {
-                    let visible: Vec<SessionRef> = filtered_refs
-                        .iter()
-                        .copied()
-                        .filter(|session_ref| match session_ref {
-                            SessionRef::Group {
-                                group_idx: ref_group_idx,
-                                session_idx,
-                            } => {
-                                if *ref_group_idx != group_idx {
-                                    return false;
-                                }
-                                group
-                                    .sessions
-                                    .get(*session_idx)
-                                    .is_some_and(|session| !saved_ids.contains(&session.id))
-                            }
-                            _ => false,
-                        })
-                        .collect();
+            // Partition the filtered refs by group in a single pass instead of
+            // rescanning every filtered ref once per group. The previous code
+            // was O(groups * filtered_refs); with many remote/server groups and
+            // many sessions this scaled poorly on every search keystroke. One
+            // bucketing pass is O(filtered_refs), then emitting is O(groups).
+            let mut group_buckets: Vec<Vec<SessionRef>> =
+                vec![Vec::new(); self.all_server_groups.len()];
+            for session_ref in filtered_refs.iter().copied() {
+                if let SessionRef::Group {
+                    group_idx,
+                    session_idx,
+                } = session_ref
+                    && let Some(group) = self.all_server_groups.get(group_idx)
+                    && group
+                        .sessions
+                        .get(session_idx)
+                        .is_some_and(|session| !saved_ids.contains(&session.id))
+                {
+                    group_buckets[group_idx].push(session_ref);
+                }
+            }
 
-                    if visible.is_empty() {
-                        None
-                    } else {
-                        Some((
-                            group.name.clone(),
-                            group.icon.clone(),
-                            group.version.clone(),
-                            visible,
-                        ))
-                    }
-                })
-                .collect();
+            let mut grouped_sections: Vec<(String, String, String, Vec<SessionRef>)> = Vec::new();
+            for (group_idx, group) in self.all_server_groups.iter().enumerate() {
+                let visible = std::mem::take(&mut group_buckets[group_idx]);
+                if visible.is_empty() {
+                    continue;
+                }
+                grouped_sections.push((
+                    group.name.clone(),
+                    group.icon.clone(),
+                    group.version.clone(),
+                    visible,
+                ));
+            }
 
             for (name, icon, version, visible) in grouped_sections {
                 self.items.push(PickerItem::ServerHeader {
@@ -326,7 +354,7 @@ impl SessionPicker {
         self.auto_scroll_preview = true;
     }
 
-    fn find_item_index_for_session_id(&self, session_id: &str) -> Option<usize> {
+    pub(super) fn find_item_index_for_session_id(&self, session_id: &str) -> Option<usize> {
         self.item_to_session
             .iter()
             .enumerate()
@@ -347,11 +375,17 @@ impl SessionPicker {
 
     pub(super) fn cycle_filter_mode(&mut self) {
         self.filter_mode = self.filter_mode.next();
+        if self.filter_mode == SessionFilterMode::Active {
+            self.refresh_live_presence();
+        }
         self.rebuild_items();
     }
 
     pub(super) fn cycle_filter_mode_backwards(&mut self) {
         self.filter_mode = self.filter_mode.previous();
+        if self.filter_mode == SessionFilterMode::Active {
+            self.refresh_live_presence();
+        }
         self.rebuild_items();
     }
 }

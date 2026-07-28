@@ -5,15 +5,167 @@ use std::process::Command;
 
 /// Default system prompt for jcode (embedded at compile time)
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("prompt/system_prompt.md");
+
+/// Prompt guidance for the optional Mermaid rendering capability.
+pub const MERMAID_PROMPT: &str = "# Mermaid\n\nRender fenced `mermaid` blocks inline.";
+
+/// Harness capabilities that conditionally contribute prompt modules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptCapabilities {
+    pub mermaid: bool,
+}
+
+impl Default for PromptCapabilities {
+    fn default() -> Self {
+        Self { mermaid: true }
+    }
+}
+
+impl PromptCapabilities {
+    fn current() -> Self {
+        Self {
+            mermaid: crate::config::config().features.mermaid,
+        }
+    }
+}
+
+fn base_system_prompt_parts(capabilities: PromptCapabilities) -> Vec<String> {
+    let mut parts = vec![DEFAULT_SYSTEM_PROMPT.to_string()];
+    if capabilities.mermaid {
+        parts.push(MERMAID_PROMPT.to_string());
+    }
+    parts
+}
+
+/// Built-in default swarm prompt: model-routing guidance for spawned swarm
+/// agents (which model/effort to pick per task kind). Users can override it by
+/// creating `~/.jcode/swarm-prompt.md` (global) or `./.jcode/swarm-prompt.md`
+/// (project). See [`load_swarm_prompt`].
+pub const DEFAULT_SWARM_PROMPT: &str = include_str!("prompt/swarm_prompt.md");
+
+/// Load the swarm prompt used to steer swarm model routing. Precedence:
+/// project `./.jcode/swarm-prompt.md`, then global `~/.jcode/swarm-prompt.md`,
+/// then the built-in [`DEFAULT_SWARM_PROMPT`].
+pub fn load_swarm_prompt(working_dir: Option<&Path>) -> String {
+    let project_dir = working_dir.unwrap_or(Path::new("."));
+    let candidates = [
+        Some(project_dir.join(".jcode").join("swarm-prompt.md")),
+        crate::storage::jcode_dir()
+            .ok()
+            .map(|dir| dir.join("swarm-prompt.md")),
+    ];
+    for path in candidates.into_iter().flatten() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    DEFAULT_SWARM_PROMPT.trim().to_string()
+}
+
+/// Reasoning-effort sentinel that means "use the strongest reasoning the model
+/// supports, AND actively orchestrate the work with the swarm tool". Providers
+/// translate this to their strongest real effort when building API requests,
+/// while the UI/session keep the literal `swarm` marker so the agent knows to
+/// inject [`SWARM_EFFORT_DIRECTIVE`].
+pub const SWARM_EFFORT: &str = "swarm";
+
+/// Reasoning-effort sentinel for the **deep task graph** mode: strongest model
+/// reasoning AND the comprehensive DAG-first swarm workflow (decompose into a
+/// validated task graph, critique/verify gates, typed artifact handoffs). Sits
+/// one rung above [`SWARM_EFFORT`] on the effort ladder: `... xhigh`, `swarm`
+/// (light fan-out), `swarm-deep` (deep task graph). Providers translate this to
+/// their strongest real effort, while the UI/session keep the literal marker so
+/// the agent knows to inject [`SWARM_DEEP_EFFORT_DIRECTIVE`].
+pub const SWARM_DEEP_EFFORT: &str = "swarm-deep";
+
+/// System-prompt directive injected when the active reasoning effort is
+/// [`SWARM_EFFORT`]. Instructs the agent to lean on the swarm tooling.
+pub const SWARM_EFFORT_DIRECTIVE: &str = "# Swarm Effort\n\nYou are running at the maximum reasoning effort with swarm orchestration enabled. For any non-trivial task, decompose the work and use the `swarm` tool to spawn and coordinate parallel agents (spawn workers with concrete prompts, assign tasks, and collect their reports) instead of doing everything yourself in one thread. Prefer parallelizing independent subtasks across swarm members, and use a coordinator/plan when the work has multiple stages. Only skip the swarm for trivial, single-step requests.";
+
+/// System-prompt directive injected when the active reasoning effort is
+/// [`SWARM_DEEP_EFFORT`]. Instructs the agent to run the comprehensive DAG-first
+/// task-graph workflow.
+pub const SWARM_DEEP_EFFORT_DIRECTIVE: &str = "# Deep Task Graph\n\nYou are running at maximum reasoning effort with the deep task-graph swarm workflow. Treat the task DAG as the primary object, not ad hoc agent chat. Workflow:\n\n1. Seed a graph with `swarm task_graph` using `mode: \"deep\"`: lay out nodes (kind explore|implement|verify|fix|synthesize) and `depends_on` edges instead of answering directly. (At this effort the server already defaults the plan to deep, but pass `mode: \"deep\"` explicitly anyway.) The engine auto-inserts a plan-wide root gate over your seed: the plan cannot finish until a final adversarial audit passes, and that audit can inject new top-level work.\n2. For any node that is too big, `swarm expand_node` to decompose it into a child sub-DAG (you become its planner/integrator). In deep mode a critique/verify gate is auto-inserted before a composite node can close. The graph is EXPECTED to outgrow its seed, often by several times: growth (expansions and gate-injected gaps) is the system working, not scope creep. plan_status reports seeded-vs-grown counts.\n3. Finish each node with `swarm complete_node` and a typed artifact: `findings`, `evidence` (file:line / commit refs), `validation`, `open_questions`, a required `confidence` (low|medium|high; report low honestly, it routes follow-up work to shore up that scope), and an honest `what_i_did_not_check`. Downstream nodes are hydrated with these artifacts automatically. There is no other way to close a deep node: a turn ending without expand_node/complete_node re-queues the node to a fresh worker and fails it on repeat.\n4. When a critique/verify gate finds gaps or failures, use `swarm inject_gap` to add new nodes; the parent cannot close until they drain. A passing gate artifact must account for EVERY node it audited by id (the server rejects rubber stamps), and cannot pass over a low-confidence sibling without addressing it explicitly, so treat low-confidence siblings as priority probe targets.\n5. Use `swarm run_plan` to drive the graph to completion. It returns immediately and drives the plan as a background task (progress card + wake on completion), so keep working or answer the user while it runs; check `swarm plan_status` or `bg` for progress. Deep mode fans out wide automatically (many workers run in parallel, bounded only by the swarm member cap), so prefer decomposing into MANY independent sibling nodes rather than a few serial ones: keep the ready set wide so run_plan can dispatch lots of agents at once. Only add `depends_on` edges for real data dependencies.\n\nComprehensiveness is structural: prefer decomposition + gates over a single thorough answer, so it is very unlikely any nook or cranny is missed.";
+
+/// Returns true when `effort` is either swarm sentinel (light or deep),
+/// case-insensitive. Used by providers to map to the strongest real effort.
+pub fn is_swarm_effort(effort: &str) -> bool {
+    let trimmed = effort.trim();
+    trimmed.eq_ignore_ascii_case(SWARM_EFFORT) || trimmed.eq_ignore_ascii_case(SWARM_DEEP_EFFORT)
+}
+
+/// Returns true when `effort` is specifically the deep task-graph sentinel.
+pub fn is_deep_swarm_effort(effort: &str) -> bool {
+    effort.trim().eq_ignore_ascii_case(SWARM_DEEP_EFFORT)
+}
+
+/// The user-facing "general effort" ladder is one list, but each rung is one of
+/// two internal kinds: a plain reasoning level (mapped straight to the provider
+/// wire effort) or a swarm orchestration mode (which also pins reasoning to the
+/// model's max). [`EffortKind`] is the single classifier all consumers use so the
+/// UI, providers, and scheduler never disagree about what a rung means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortKind {
+    /// A plain reasoning level (none/low/medium/high/xhigh/max).
+    Reasoning,
+    /// Light swarm mode: max reasoning + parallel fan-out.
+    SwarmLight,
+    /// Deep swarm mode: max reasoning + DAG-first task graph.
+    SwarmDeep,
+}
+
+impl EffortKind {
+    /// True when this rung is a swarm orchestration mode rather than a plain
+    /// reasoning level. Such rungs must not be treated as per-model effort
+    /// variants (e.g. they should not generate `model (effort)` picker rows).
+    pub fn is_swarm_mode(self) -> bool {
+        matches!(self, EffortKind::SwarmLight | EffortKind::SwarmDeep)
+    }
+}
+
+/// Classify a general-effort rung string into its [`EffortKind`].
+pub fn classify_effort(effort: &str) -> EffortKind {
+    let trimmed = effort.trim();
+    if trimmed.eq_ignore_ascii_case(SWARM_DEEP_EFFORT) {
+        EffortKind::SwarmDeep
+    } else if trimmed.eq_ignore_ascii_case(SWARM_EFFORT) {
+        EffortKind::SwarmLight
+    } else {
+        EffortKind::Reasoning
+    }
+}
+
+/// True when an effort rung is a swarm orchestration mode (light or deep) rather
+/// than a plain reasoning level. Convenience wrapper over [`classify_effort`].
+pub fn is_swarm_mode_effort(effort: &str) -> bool {
+    classify_effort(effort).is_swarm_mode()
+}
+
+/// Append the appropriate swarm directive to a split prompt's dynamic part when
+/// the active reasoning effort is a swarm sentinel. The deep sentinel injects the
+/// DAG-first task-graph directive; the light sentinel injects the fan-out
+/// directive. No-op otherwise.
+pub fn append_swarm_effort_directive(split: &mut SplitSystemPrompt, effort: Option<&str>) {
+    let directive = match effort {
+        Some(effort) if is_deep_swarm_effort(effort) => SWARM_DEEP_EFFORT_DIRECTIVE,
+        Some(effort) if is_swarm_effort(effort) => SWARM_EFFORT_DIRECTIVE,
+        _ => return,
+    };
+    if !split.dynamic_part.is_empty() {
+        split.dynamic_part.push_str("\n\n");
+    }
+    split.dynamic_part.push_str(directive);
+}
 /// Mission-continuation template (embedded at compile time). Consumed by the
 /// `mission` module in the upper `jcode-app-core` layer; the asset lives here
 /// alongside the other prompt templates.
 pub const MISSION_CONTINUATION_TEMPLATE: &str = include_str!("prompt/mission_continuation.md");
-const SELFDEV_HINT_PROMPT: &str = include_str!("prompt/selfdev_hint.txt");
 const SELFDEV_MODE_PROMPT: &str = include_str!("prompt/selfdev_mode.txt");
 const SELFDEV_FOCUS_TUI_PROMPT: &str = include_str!("prompt/selfdev_focus_tui.txt");
 const SELFDEV_FOCUS_DESKTOP_PROMPT: &str = include_str!("prompt/selfdev_focus_desktop.txt");
-
 /// Split system prompt for efficient caching
 /// Static content is cached, dynamic content is not
 #[derive(Debug, Clone, Default)]
@@ -63,7 +215,7 @@ pub struct ContextInfo {
     pub has_project_agents_md: bool,
     /// Project AGENTS.md size (chars)
     pub project_agents_md_chars: usize,
-    /// Whether global ~/.AGENTS.md was loaded
+    /// Whether global ~/AGENTS.md was loaded
     pub has_global_agents_md: bool,
     /// Global AGENTS.md size (chars)
     pub global_agents_md_chars: usize,
@@ -77,7 +229,6 @@ pub struct ContextInfo {
     pub prompt_overlay_chars: usize,
     /// Preferred tools section size (chars)
     pub preferred_tools_chars: usize,
-
     // === Dynamic (Conversation) ===
     /// Tool definitions sent to API (chars)
     pub tool_defs_chars: usize,
@@ -210,20 +361,36 @@ pub fn build_system_prompt_full(
     memory_prompt: Option<&str>,
     working_dir: Option<&Path>,
 ) -> (String, ContextInfo) {
-    let mut parts = vec![DEFAULT_SYSTEM_PROMPT.to_string()];
+    build_system_prompt_full_with_capabilities(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        PromptCapabilities::current(),
+    )
+}
+
+pub fn build_system_prompt_full_with_capabilities(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    capabilities: PromptCapabilities,
+) -> (String, ContextInfo) {
+    let mut parts = base_system_prompt_parts(capabilities);
     let mut info = ContextInfo {
-        system_prompt_chars: DEFAULT_SYSTEM_PROMPT.len(),
+        system_prompt_chars: parts.join("\n\n").len(),
         ..Default::default()
     };
 
-    // Add self-dev guidance. Full workflow instructions are only included for
-    // active self-dev sessions; other sessions get a lightweight hint.
+    // Add self-dev guidance only in active self-dev sessions. Normal sessions
+    // learn about the on-ramp from the mode-aware `selfdev` tool schema.
     if is_selfdev {
         let selfdev_prompt = build_selfdev_prompt_for_working_dir(working_dir);
         info.selfdev_chars = selfdev_prompt.len();
         parts.push(selfdev_prompt);
-    } else {
-        parts.push(build_selfdev_hint_prompt());
     }
 
     // Add AGENTS.md instructions with tracking (from working_dir or cwd)
@@ -290,23 +457,39 @@ pub fn build_system_prompt_split(
     memory_prompt: Option<&str>,
     working_dir: Option<&Path>,
 ) -> (SplitSystemPrompt, ContextInfo) {
-    let mut static_parts = vec![DEFAULT_SYSTEM_PROMPT.to_string()];
+    build_system_prompt_split_with_capabilities(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        PromptCapabilities::current(),
+    )
+}
+
+pub fn build_system_prompt_split_with_capabilities(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    capabilities: PromptCapabilities,
+) -> (SplitSystemPrompt, ContextInfo) {
+    let mut static_parts = base_system_prompt_parts(capabilities);
     let mut dynamic_parts = Vec::new();
     let mut info = ContextInfo {
-        system_prompt_chars: DEFAULT_SYSTEM_PROMPT.len(),
+        system_prompt_chars: static_parts.join("\n\n").len(),
         ..Default::default()
     };
 
     // === STATIC CONTENT (cacheable) ===
 
-    // Add self-dev guidance. Full workflow instructions are only included for
-    // active self-dev sessions; other sessions get a lightweight hint.
+    // Add self-dev guidance only in active self-dev sessions. Normal sessions
+    // learn about the on-ramp from the mode-aware `selfdev` tool schema.
     if is_selfdev {
         let selfdev_prompt = build_selfdev_prompt_static_for_working_dir(working_dir);
         info.selfdev_chars = selfdev_prompt.len();
         static_parts.push(selfdev_prompt);
-    } else {
-        static_parts.push(build_selfdev_hint_prompt());
     }
 
     // Add AGENTS.md instructions (static per project)
@@ -374,16 +557,13 @@ pub fn build_system_prompt_split(
 }
 
 /// Build self-dev tools prompt section (static version without dynamic socket path)
-fn build_selfdev_hint_prompt() -> String {
-    SELFDEV_HINT_PROMPT.to_string()
-}
-
-/// Build self-dev tools prompt section (static version without dynamic socket path)
+#[cfg(test)]
 fn build_selfdev_prompt_static() -> String {
     build_selfdev_prompt_static_for_context(SelfDevProductContext::Tui)
 }
 
 /// Build self-dev tools prompt section
+#[cfg(test)]
 fn build_selfdev_prompt() -> String {
     build_selfdev_prompt_for_context(SelfDevProductContext::Tui)
 }
@@ -444,23 +624,20 @@ pub fn build_session_context(working_dir: Option<&Path>) -> String {
     lines.push(format!("Architecture: {}", std::env::consts::ARCH));
     lines.push(format!(
         "Jcode version: {} ({})",
-        jcode_build_meta::VERSION,
-        jcode_build_meta::GIT_HASH
+        jcode_build_meta::version(),
+        jcode_build_meta::git_hash()
     ));
 
     if let Some(hardware) = hardware_context() {
         lines.push(hardware);
     }
 
-    let cwd = working_dir
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok());
-    if let Some(cwd) = cwd.as_ref() {
+    let cwd = working_dir.map(Path::to_path_buf);
+    if let Some(cwd) = cwd.as_deref() {
         lines.push(format!("Working directory: {}", cwd.display()));
-    }
-
-    if let Some(git_info) = get_git_info(cwd.as_deref()) {
-        lines.push(git_info);
+        if let Some(git_info) = get_git_info(Some(cwd)) {
+            lines.push(git_info);
+        }
     }
 
     lines.join("\n")
@@ -529,6 +706,16 @@ fn get_git_info(working_dir: Option<&Path>) -> Option<String> {
 }
 
 fn hardware_context() -> Option<String> {
+    // Hardware never changes for the life of the process, but this used to be
+    // rebuilt for every session create/attach, forking `lspci` each time. On a
+    // busy shared server that meant one subprocess per client connection.
+    static HARDWARE_CONTEXT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HARDWARE_CONTEXT
+        .get_or_init(hardware_context_uncached)
+        .clone()
+}
+
+fn hardware_context_uncached() -> Option<String> {
     let mut lines = Vec::new();
 
     if let Some(machine) = machine_model() {
@@ -657,7 +844,7 @@ pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<Stri
     // Home directory files
     if let Ok(global_agents_md) = crate::storage::user_home_path("AGENTS.md")
         && let Some((content, size)) =
-            load_file(&global_agents_md, "Global Instructions (~/.AGENTS.md)")
+            load_file(&global_agents_md, "Global Instructions (~/AGENTS.md)")
     {
         info.has_global_agents_md = true;
         info.global_agents_md_chars = size;

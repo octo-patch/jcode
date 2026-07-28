@@ -118,7 +118,7 @@ fn compact_todos_height(data: &InfoWidgetData) -> u16 {
 
 fn compact_memory_height(data: &InfoWidgetData) -> u16 {
     if let Some(info) = &data.memory_info
-        && (info.total_count > 0 || info.activity.is_some() || info.sidecar_model.is_some())
+        && info.should_render()
     {
         return 1;
     }
@@ -137,7 +137,13 @@ fn compact_model_height(data: &InfoWidgetData) -> u16 {
         if has_provider || data.auth_method != AuthMethod::Unknown {
             lines += 1;
         }
-        if data.session_count.is_some() || data.session_name.is_some() {
+        // Mirror render_model_info: a blank session name alone produces no line.
+        let has_session_line = data.session_count.is_some()
+            || data
+                .session_name
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+        if has_session_line {
             lines += 1;
         }
         lines
@@ -161,15 +167,20 @@ fn compact_usage_height(data: &InfoWidgetData) -> u16 {
     if let Some(info) = &data.usage_info
         && info.available
     {
-        match info.provider {
-            UsageProvider::CostBased | UsageProvider::Copilot => return 2,
-            _ => {
-                let label = info.provider.label();
-                let label_line = u16::from(!label.is_empty());
-                let spark_line = u16::from(info.spark.is_some());
-                return 2 + label_line + spark_line;
-            }
+        // Must mirror render_usage_compact exactly, otherwise the compact
+        // overview page either clips its last lines or reserves blank rows.
+        if matches!(info.provider, UsageProvider::CostBased) {
+            // Single "$cost · tokens" line.
+            return 1;
         }
+        // Subscription-style providers render an optional provider label plus
+        // whichever primary, secondary, and Spark windows are actually present.
+        let label = info.provider.label();
+        let label_line = u16::from(!label.is_empty());
+        let primary_line = u16::from(info.primary_limit_label.is_some());
+        let secondary_line = u16::from(info.secondary_limit_label.is_some());
+        let spark_line = u16::from(info.spark.is_some());
+        return label_line + primary_line + secondary_line + spark_line;
     }
     0
 }
@@ -214,22 +225,19 @@ fn expanded_todos_height(data: &InfoWidgetData) -> u16 {
 
 fn expanded_memory_height(data: &InfoWidgetData) -> u16 {
     if let Some(info) = &data.memory_info
-        && (info.total_count > 0 || info.activity.is_some() || info.sidecar_model.is_some())
+        && info.should_render()
     {
         let mut height = 1u16;
-        if info.activity.is_some() {
+        if info.should_show_activity() {
             height += 1 + 4;
-        }
-        if info.sidecar_model.is_some() {
-            height += 1;
-        }
-        if let Some(activity) = &info.activity
-            && activity
-                .recent_events
-                .iter()
-                .any(is_traceworthy_memory_event)
-        {
-            height += 1;
+            if let Some(activity) = &info.activity
+                && activity
+                    .recent_events
+                    .iter()
+                    .any(is_traceworthy_memory_event)
+            {
+                height += 1;
+            }
         }
         return height;
     }
@@ -262,6 +270,7 @@ mod tests {
     fn compute_page_layout_keeps_multiple_expanded_pages_when_height_allows() {
         let data = InfoWidgetData {
             todos: vec![TodoItem {
+                group: None,
                 content: "ship refactor".to_string(),
                 status: "pending".to_string(),
                 priority: "high".to_string(),
@@ -270,6 +279,7 @@ mod tests {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
             memory_info: Some(MemoryInfo {
                 total_count: 3,

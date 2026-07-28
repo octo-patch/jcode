@@ -41,6 +41,10 @@ fn test_usage_card_does_not_capture_typing() {
 fn test_usage_report_updates_display_only_card_without_system_message() {
     let mut app = create_test_app();
     app.usage_report_refreshing = true;
+    // App::new seeds the provider transcript with the immutable session-context
+    // reminder, so assert the usage report adds nothing on top of it rather
+    // than expecting an empty transcript.
+    let provider_messages_before = app.materialized_provider_messages().len();
     app.handle_usage_report(vec![crate::usage::ProviderUsage {
         provider_name: "OpenAI (ChatGPT)".to_string(),
         limits: vec![crate::usage::UsageLimit {
@@ -51,6 +55,7 @@ fn test_usage_report_updates_display_only_card_without_system_message() {
         extra_info: vec![("plan".to_string(), "pro".to_string())],
         hard_limit_reached: false,
         error: None,
+        last_used_unix_secs: None,
     }]);
 
     assert!(!app.usage_report_refreshing);
@@ -62,7 +67,12 @@ fn test_usage_report_updates_display_only_card_without_system_message() {
     assert!(msg.content.contains("5h"));
     assert!(msg.content.contains("82%"));
     assert!(msg.content.contains("plan: pro"));
-    assert!(app.materialized_provider_messages().is_empty());
+    let leaked = app.materialized_provider_messages();
+    assert_eq!(
+        leaked.len(),
+        provider_messages_before,
+        "usage report must not add provider-visible messages: {leaked:#?}"
+    );
 }
 
 #[test]
@@ -81,6 +91,7 @@ fn test_usage_progress_updates_card_incrementally() {
             extra_info: Vec::new(),
             hard_limit_reached: false,
             error: None,
+            last_used_unix_secs: None,
         }],
         completed: 1,
         total: 2,
@@ -669,6 +680,7 @@ fn test_improve_status_summarizes_current_todos() {
             &app.session.id,
             &[
                 crate::todo::TodoItem {
+                    group: None,
                     id: "one".to_string(),
                     content: "Profile startup path".to_string(),
                     status: "in_progress".to_string(),
@@ -677,8 +689,10 @@ fn test_improve_status_summarizes_current_todos() {
                     assigned_to: None,
                     confidence: Some(82),
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
                 crate::todo::TodoItem {
+                    group: None,
                     id: "two".to_string(),
                     content: "Add regression test".to_string(),
                     status: "completed".to_string(),
@@ -687,6 +701,7 @@ fn test_improve_status_summarizes_current_todos() {
                     assigned_to: None,
                     confidence: None,
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
             ],
         )
@@ -770,6 +785,7 @@ fn test_improve_resume_uses_saved_mode_and_current_todos() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "resume1".to_string(),
                 content: "Refactor command parsing".to_string(),
                 status: "in_progress".to_string(),
@@ -778,6 +794,7 @@ fn test_improve_resume_uses_saved_mode_and_current_todos() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");

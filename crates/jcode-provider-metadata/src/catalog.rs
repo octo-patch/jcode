@@ -126,6 +126,20 @@ pub const OPENAI_NATIVE_OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiC
     requires_api_key: true,
 };
 
+pub const GEMINI_OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "gemini-api",
+    display_name: "Gemini API",
+    // Google's official OpenAI-compatible surface for the Gemini Developer API.
+    // The `/models` endpoint here returns `models/`-prefixed ids, which the live
+    // probe layer normalizes back to bare model names.
+    api_base: "https://generativelanguage.googleapis.com/v1beta/openai",
+    api_key_env: "GEMINI_API_KEY",
+    env_file: "gemini.env",
+    setup_url: "https://ai.google.dev/gemini-api/docs/openai",
+    default_model: Some("gemini-2.5-flash"),
+    requires_api_key: true,
+};
+
 pub const DEEPSEEK_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     id: "deepseek",
     display_name: "DeepSeek",
@@ -394,6 +408,19 @@ pub const XIAOMI_MIMO_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile
     requires_api_key: true,
 };
 
+pub const CELERIS_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "celeris",
+    display_name: "Celeris",
+    // Celeris scopes the base URL per model: https://inference.celeris.ai/<model>/v1.
+    // `celeris-1` is the only served model today.
+    api_base: "https://inference.celeris.ai/celeris-1/v1",
+    api_key_env: "CELERIS_API_KEY",
+    env_file: "celeris.env",
+    setup_url: "https://docs.celeris.ai/",
+    default_model: Some("celeris-1"),
+    requires_api_key: true,
+};
+
 pub const OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     id: "openai-compatible",
     display_name: "OpenAI-compatible",
@@ -405,7 +432,7 @@ pub const OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfi
     requires_api_key: true,
 };
 
-pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 35] = [
+pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 37] = [
     OPENCODE_PROFILE,
     OPENCODE_GO_PROFILE,
     ZAI_PROFILE,
@@ -419,6 +446,7 @@ pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 35] = [
     OPENROUTER_OPENAI_COMPAT_PROFILE,
     ANTHROPIC_OPENAI_COMPAT_PROFILE,
     OPENAI_NATIVE_OPENAI_COMPAT_PROFILE,
+    GEMINI_OPENAI_COMPAT_PROFILE,
     DEEPSEEK_PROFILE,
     COMTEGRA_PROFILE,
     FPT_PROFILE,
@@ -438,6 +466,7 @@ pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 35] = [
     XAI_PROFILE,
     NVIDIA_NIM_PROFILE,
     XIAOMI_MIMO_PROFILE,
+    CELERIS_PROFILE,
     LMSTUDIO_PROFILE,
     OLLAMA_PROFILE,
     OPENAI_COMPAT_PROFILE,
@@ -448,7 +477,7 @@ pub const CLAUDE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     display_name: "Anthropic/Claude",
     auth_kind: LoginProviderAuthKind::OAuth,
     auth_state_key: LoginProviderAuthStateKey::Anthropic,
-    auth_status_method: "OAuth / API key",
+    auth_status_method: "OAuth",
     aliases: &["anthropic"],
     menu_detail: "requires Claude Pro or Max subscription",
     recommended: true,
@@ -500,7 +529,7 @@ pub const OPENAI_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     display_name: "OpenAI",
     auth_kind: LoginProviderAuthKind::OAuth,
     auth_state_key: LoginProviderAuthStateKey::OpenAi,
-    auth_status_method: "OAuth / API key",
+    auth_status_method: "OAuth",
     aliases: &[],
     menu_detail: "requires ChatGPT Plus or Pro subscription",
     recommended: true,
@@ -1013,6 +1042,24 @@ pub const GEMINI_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     order: LoginProviderSurfaceOrder::new(Some(13), Some(11), Some(4), Some(11), Some(13)),
 };
 
+pub const GEMINI_API_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
+    id: "gemini-api",
+    display_name: "Gemini API",
+    auth_kind: LoginProviderAuthKind::ApiKey,
+    auth_state_key: LoginProviderAuthStateKey::OpenRouterLike,
+    auth_status_method: "API key",
+    aliases: &[
+        "gemini-key",
+        "gemini-apikey",
+        "google-ai-studio",
+        "ai-studio",
+    ],
+    menu_detail: "Google AI Studio Developer API key (OpenAI-compatible)",
+    recommended: false,
+    target: LoginProviderTarget::OpenAiCompatible(GEMINI_OPENAI_COMPAT_PROFILE),
+    order: LoginProviderSurfaceOrder::new(Some(38), Some(38), Some(38), Some(38), Some(38)),
+};
+
 pub const ANTIGRAVITY_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
     id: "antigravity",
     display_name: "Antigravity",
@@ -1039,6 +1086,19 @@ pub const XIAOMI_MIMO_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDes
     order: LoginProviderSurfaceOrder::new(Some(37), Some(37), Some(37), Some(37), Some(37)),
 };
 
+pub const CELERIS_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
+    id: "celeris",
+    display_name: "Celeris",
+    auth_kind: LoginProviderAuthKind::ApiKey,
+    auth_state_key: LoginProviderAuthStateKey::OpenRouterLike,
+    auth_status_method: "API key",
+    aliases: &["celeris-ai", "celeris1", "celeris-1"],
+    menu_detail: "OpenAI-compatible low-latency Celeris API",
+    recommended: false,
+    target: LoginProviderTarget::OpenAiCompatible(CELERIS_PROFILE),
+    order: LoginProviderSurfaceOrder::new(Some(38), Some(38), Some(38), Some(38), Some(38)),
+};
+
 pub const GOOGLE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
     id: "google",
     display_name: "Google/Gmail",
@@ -1052,7 +1112,7 @@ pub const GOOGLE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     order: LoginProviderSurfaceOrder::new(Some(13), None, None, None, None),
 };
 
-pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 46] = [
+pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 48] = [
     AUTO_IMPORT_LOGIN_PROVIDER,
     CLAUDE_LOGIN_PROVIDER,
     ANTHROPIC_API_LOGIN_PROVIDER,
@@ -1091,12 +1151,14 @@ pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 46] = [
     XAI_LOGIN_PROVIDER,
     NVIDIA_NIM_LOGIN_PROVIDER,
     XIAOMI_MIMO_LOGIN_PROVIDER,
+    CELERIS_LOGIN_PROVIDER,
     LMSTUDIO_LOGIN_PROVIDER,
     OLLAMA_LOGIN_PROVIDER,
     OPENAI_COMPAT_LOGIN_PROVIDER,
     CURSOR_LOGIN_PROVIDER,
     COPILOT_LOGIN_PROVIDER,
     GEMINI_LOGIN_PROVIDER,
+    GEMINI_API_LOGIN_PROVIDER,
     ANTIGRAVITY_LOGIN_PROVIDER,
     GOOGLE_LOGIN_PROVIDER,
 ];

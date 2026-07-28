@@ -53,6 +53,13 @@ pub struct SystemProfile {
     pub is_wsl: bool,
     pub terminal: String,
     pub tier: PerformanceTier,
+    /// True when the host terminal is known to corrupt its GPU glyph atlas
+    /// under heavy per-cell color/redraw churn (the macOS 26 "garbled glyphs"
+    /// bug seen in the VS Code integrated terminal and Apple Terminal, where
+    /// letters like n/m/r/w get re-rendered as stale boxes). When set we run a
+    /// "glyph-safe" policy that suppresses decorative per-cell color animation
+    /// and caps full-frame repaints to keep the atlas stable.
+    pub fragile_glyph_cache: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +129,17 @@ pub fn profile() -> &'static SystemProfile {
     PROFILE.get_or_init(detect)
 }
 
+/// Pin the process-global system profile to the synthetic Full-tier profile.
+///
+/// Test harnesses call this so rendered output (perf badge, animation policy,
+/// idle status facts) does not depend on the host's load average or free
+/// memory at the moment the test process first touched `profile()`. First
+/// initialization wins: calling this after `profile()` has already run is a
+/// no-op, and production code paths never call it.
+pub fn pin_full_profile_for_tests() {
+    let _ = PROFILE.set(synthetic_profile(SyntheticSystemProfile::Native));
+}
+
 pub fn synthetic_profile(kind: SyntheticSystemProfile) -> SystemProfile {
     match kind {
         SyntheticSystemProfile::Native => SystemProfile {
@@ -133,6 +151,7 @@ pub fn synthetic_profile(kind: SyntheticSystemProfile) -> SystemProfile {
             is_wsl: false,
             terminal: "kitty".to_string(),
             tier: PerformanceTier::Full,
+            fragile_glyph_cache: false,
         },
         SyntheticSystemProfile::Wsl => SystemProfile {
             load_avg_1m: Some(0.4),
@@ -151,6 +170,7 @@ pub fn synthetic_profile(kind: SyntheticSystemProfile) -> SystemProfile {
                 true,
                 "wezterm",
             ),
+            fragile_glyph_cache: false,
         },
         SyntheticSystemProfile::WslWindowsTerminal => SystemProfile {
             load_avg_1m: Some(0.4),
@@ -169,6 +189,7 @@ pub fn synthetic_profile(kind: SyntheticSystemProfile) -> SystemProfile {
                 true,
                 "windows-terminal",
             ),
+            fragile_glyph_cache: false,
         },
     }
 }
@@ -192,6 +213,17 @@ pub fn tui_policy_for(
 
     if profile.is_wsl || profile.is_windows_terminal_family() {
         enable_decorative_animations = false;
+    }
+
+    // Glyph-safe mode for terminals with a fragile GPU glyph atlas (macOS 26
+    // VS Code integrated terminal / Apple Terminal). The primary fix lives in
+    // `jcode-tui-style`: colors are quantized to the 256-palette there, which
+    // bounds the distinct (glyph, color) atlas keys so the animations no longer
+    // overflow the cache (#330). Here we only trim full-frame repaint pressure
+    // as cheap insurance; decorative animations stay ON so the experience is
+    // unchanged apart from slightly reduced color fidelity.
+    if profile.fragile_glyph_cache {
+        redraw_fps = redraw_fps.min(30);
     }
 
     if profile.is_wsl {
@@ -246,11 +278,12 @@ pub fn init_background() {
     std::thread::spawn(|| {
         let p = PROFILE.get_or_init(detect);
         crate::logging::info(&format!(
-            "perf: tier={} terminal={} ssh={} wsl={} load={} cpus={} mem_avail={}MB mem_total={}MB",
+            "perf: tier={} terminal={} ssh={} wsl={} glyph_safe={} load={} cpus={} mem_avail={}MB mem_total={}MB",
             p.tier,
             p.terminal,
             p.is_ssh,
             p.is_wsl,
+            p.fragile_glyph_cache,
             p.load_avg_1m
                 .map(|v| format!("{:.1}", v))
                 .unwrap_or_else(|| "?".into()),
@@ -284,12 +317,27 @@ fn detect() -> SystemProfile {
         &terminal,
     );
 
-    let tier = match crate::config::config().display.performance.as_str() {
-        "full" => PerformanceTier::Full,
-        "reduced" => PerformanceTier::Reduced,
-        "minimal" => PerformanceTier::Minimal,
-        _ => auto_tier,
-    };
+    // Highest priority: explicit env override (used by tests/CI to keep the
+    // tier deterministic regardless of host load, and by users to force a
+    // tier for one invocation without editing config).
+    let env_tier = std::env::var("JCODE_PERF_TIER").ok().and_then(|raw| {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(PerformanceTier::Full),
+            "reduced" => Some(PerformanceTier::Reduced),
+            "minimal" => Some(PerformanceTier::Minimal),
+            _ => None,
+        }
+    });
+
+    let tier =
+        env_tier.unwrap_or_else(
+            || match crate::config::config().display.performance.as_str() {
+                "full" => PerformanceTier::Full,
+                "reduced" => PerformanceTier::Reduced,
+                "minimal" => PerformanceTier::Minimal,
+                _ => auto_tier,
+            },
+        );
 
     SystemProfile {
         load_avg_1m,
@@ -298,9 +346,37 @@ fn detect() -> SystemProfile {
         total_memory_mb,
         is_ssh,
         is_wsl,
+        fragile_glyph_cache: detect_fragile_glyph_cache(&terminal),
         terminal,
         tier,
     }
+}
+
+/// Detect terminals whose GPU glyph atlas corrupts under heavy per-cell
+/// color/redraw churn. On macOS 26 (Tahoe) the VS Code integrated terminal
+/// (xterm.js) and Apple Terminal exhibit the "garbled glyphs" bug where a
+/// fixed set of similar-shaped letters (n/m/r/w/...) get re-rendered as stale
+/// cached boxes once the atlas overflows. Anthropic shipped the same class of
+/// bug for Claude Code (anthropics/claude-code#60831, #61562) with the
+/// `gpuAcceleration: off` workaround; we instead reduce the churn that
+/// surfaces it. GPU-robust terminals (Ghostty, iTerm2, kitty, WezTerm,
+/// Alacritty) are unaffected and excluded.
+fn detect_fragile_glyph_cache(terminal: &str) -> bool {
+    // Opt-out / opt-in override for users who want to force the behavior.
+    if let Ok(raw) = std::env::var("JCODE_GLYPH_SAFE_MODE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+
+    // Only macOS surfaces this; other platforms render these terminals fine.
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+
+    matches!(terminal, "vscode" | "apple_terminal")
 }
 
 fn compute_tier(
@@ -652,6 +728,7 @@ mod tests {
             is_wsl: false,
             terminal: "kitty".to_string(),
             tier: PerformanceTier::Full,
+            fragile_glyph_cache: false,
         };
         assert!((p.load_ratio().unwrap() - 0.5).abs() < 0.01);
         assert!((p.memory_pressure().unwrap() - 0.75).abs() < 0.01);
@@ -762,6 +839,7 @@ mod tests {
             is_wsl: false,
             terminal: "windows-terminal".to_string(),
             tier: PerformanceTier::Full,
+            fragile_glyph_cache: false,
         };
         let mut display = crate::config::DisplayConfig::default();
         display.redraw_fps = 60;
@@ -776,5 +854,72 @@ mod tests {
     fn test_detect_runs() {
         let p = detect();
         assert!(!p.terminal.is_empty());
+    }
+
+    fn glyph_safe_profile(terminal: &str) -> SystemProfile {
+        SystemProfile {
+            load_avg_1m: Some(0.2),
+            cpu_count: Some(8),
+            available_memory_mb: Some(8192),
+            total_memory_mb: Some(16384),
+            is_ssh: false,
+            is_wsl: false,
+            terminal: terminal.to_string(),
+            tier: PerformanceTier::Full,
+            fragile_glyph_cache: true,
+        }
+    }
+
+    #[test]
+    fn test_glyph_safe_mode_keeps_animations_and_caps_redraw() {
+        // VS Code integrated terminal / Apple Terminal on macOS 26 corrupt the
+        // GPU glyph atlas under truecolor color churn (#330). The root-cause fix
+        // is color quantization in jcode-tui-style, so the perf policy keeps
+        // decorative animations ON and only trims full-frame repaint pressure.
+        let profile = glyph_safe_profile("vscode");
+        let mut display = crate::config::DisplayConfig::default();
+        display.redraw_fps = 60;
+        display.animation_fps = 60;
+        let policy = tui_policy_for(&profile, &display);
+        assert_eq!(policy.tier, PerformanceTier::Full);
+        assert!(policy.enable_decorative_animations);
+        assert_eq!(policy.redraw_fps, 30);
+        // Interactive features stay on; this is purely a rendering mitigation.
+        assert!(policy.enable_focus_change);
+        assert!(policy.enable_keyboard_enhancement);
+    }
+
+    #[test]
+    fn test_non_fragile_terminal_keeps_decorative_animations() {
+        let profile = SystemProfile {
+            fragile_glyph_cache: false,
+            ..glyph_safe_profile("ghostty")
+        };
+        let mut display = crate::config::DisplayConfig::default();
+        display.redraw_fps = 60;
+        display.animation_fps = 60;
+        let policy = tui_policy_for(&profile, &display);
+        assert!(policy.enable_decorative_animations);
+        assert_eq!(policy.redraw_fps, 60);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_detect_fragile_glyph_cache_targets_macos_terminals() {
+        // Env override must not leak between cases.
+        let prev = std::env::var("JCODE_GLYPH_SAFE_MODE").ok();
+        unsafe {
+            std::env::remove_var("JCODE_GLYPH_SAFE_MODE");
+        }
+        assert!(detect_fragile_glyph_cache("vscode"));
+        assert!(detect_fragile_glyph_cache("apple_terminal"));
+        assert!(!detect_fragile_glyph_cache("ghostty"));
+        assert!(!detect_fragile_glyph_cache("iterm.app"));
+        assert!(!detect_fragile_glyph_cache("kitty"));
+        if let Some(prev) = prev {
+            unsafe {
+                std::env::set_var("JCODE_GLYPH_SAFE_MODE", prev);
+            }
+        }
     }
 }

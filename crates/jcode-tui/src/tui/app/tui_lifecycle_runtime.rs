@@ -47,11 +47,7 @@ impl App {
 
         app.suppress_terminal_title_updates = !set_title;
         if set_title && !session_name.is_empty() {
-            let icon = crate::id::session_icon(&session_name);
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::SetTitle(format!("{} replay: {}", icon, session_name))
-            );
+            app.update_terminal_title();
         }
         app
     }
@@ -76,22 +72,32 @@ impl App {
             .map(|s| s.to_string())
             .unwrap_or_else(|| session_id.to_string());
         let session_icon = crate::id::session_icon(&session_name);
-        let session_label = crate::process_title::terminal_session_label(
-            &session_name,
-            self.session.display_title(),
-        );
+        // Keep the live terminal title aligned with /resume: an explicit rename
+        // wins, then the model's current todo/goal title, then the generated title.
+        let todo_title = self
+            .session
+            .custom_title
+            .is_none()
+            .then(|| crate::todo::load_session_title(session_id))
+            .flatten();
+        let display_title = self
+            .session
+            .custom_title
+            .as_deref()
+            .or(todo_title.as_deref())
+            .or(self.session.title.as_deref());
         let is_canary = if self.is_remote {
             self.remote_is_canary.unwrap_or(self.session.is_canary)
         } else {
             self.session.is_canary
         };
-        let suffix = if is_canary { " [self-dev]" } else { "" };
         let server_name = self.remote_server_short_name.as_deref().unwrap_or("jcode");
         let icon = connection_type_icon(self.connection_type.as_deref()).unwrap_or(session_icon);
-        let server_label = if server_name.eq_ignore_ascii_case("jcode") {
-            "jcode".to_string()
+        let session_label = crate::process_title::terminal_session_label(&session_name, None);
+        let fallback_label = if server_name.eq_ignore_ascii_case("jcode") {
+            format!("jcode {session_label}")
         } else {
-            format!("jcode/{}", server_name.to_lowercase())
+            format!("jcode/{} {session_label}", server_name.to_lowercase())
         };
         if server_name.eq_ignore_ascii_case("jcode") {
             crate::process_title::set_client_display_title(&session_name, is_canary);
@@ -102,12 +108,15 @@ impl App {
                 is_canary,
             );
         }
+        let window_title = crate::process_title::terminal_window_title(
+            icon,
+            display_title,
+            Some(&fallback_label),
+            is_canary,
+        );
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::terminal::SetTitle(format!(
-                "{} {} {}{}",
-                icon, server_label, session_label, suffix
-            ))
+            crossterm::terminal::SetTitle(window_title)
         );
     }
 
@@ -115,6 +124,31 @@ impl App {
         self.remote_session_id
             .clone()
             .or_else(|| self.resume_session_id.clone())
+    }
+
+    /// Resolve the session id to resume across a client reload re-exec.
+    ///
+    /// Prefers the live `remote_session_id`, then the id captured from a
+    /// History payload that was deferred for a version mismatch
+    /// (`pending_reload_session_id`), then the resume target the client was
+    /// launched with. Only when none of those is known do we fabricate a fresh
+    /// `ses_*` id. Fabricating eagerly is what caused issue #328: the re-exec
+    /// would `jcode --resume <bogus-id>` and crash with "No session found
+    /// matching ..." after an auto-update, because the version-mismatch defer
+    /// path returns before `remote_session_id` is ever assigned.
+    pub(super) fn reload_handoff_session_id(&self) -> String {
+        self.remote_session_id
+            .clone()
+            .or_else(|| self.pending_reload_session_id.clone())
+            .or_else(|| self.resume_session_id.clone())
+            .unwrap_or_else(|| {
+                let fabricated = crate::id::new_id("ses");
+                crate::logging::warn(&format!(
+                    "Reload handoff has no known session id (remote_session_id, pending reload id, and resume target all empty); fabricating {} for re-exec",
+                    fabricated
+                ));
+                fabricated
+            })
     }
 
     pub fn runtime_mode(&self) -> AppRuntimeMode {
@@ -155,10 +189,46 @@ impl App {
             return false;
         };
 
-        std::fs::metadata(&candidate)
+        // The candidate may be a channel symlink to a release wrapper script;
+        // compare the payload that actually runs (`client_binary_mtime` is the
+        // running payload's mtime). Comparing the wrapper's mtime reported a
+        // phantom "newer client" forever after release installs whose wrapper
+        // was written after the payload, re-execing the client in a loop.
+        std::fs::metadata(crate::build::resolve_binary_payload(&candidate))
             .ok()
             .and_then(|m| m.modified().ok())
             .is_some_and(|mtime| mtime > startup_mtime)
+    }
+
+    /// After an in-process server reload (e.g. `self-dev build-reload`), the
+    /// server PID is unchanged and connected clients never disconnect, so they
+    /// keep running their old binary and client-side changes never take effect.
+    /// When this is a self-dev session, a newer client binary is on disk, and the
+    /// client is idle, re-exec onto the new binary so TUI-side changes apply too.
+    /// Returns true when a client reload was requested.
+    pub(super) fn maybe_self_reload_after_server_reload(&mut self) -> bool {
+        if !self.is_remote {
+            return false;
+        }
+        let is_selfdev_session = self.remote_is_canary.unwrap_or(self.session.is_canary);
+        if !is_selfdev_session {
+            return false;
+        }
+        // Never interrupt an in-flight turn; the reconnect path will catch it later.
+        if self.is_processing {
+            return false;
+        }
+        if !self.has_newer_binary() {
+            return false;
+        }
+        let session_id = self.reload_handoff_session_id();
+        self.append_reload_message(
+            "Server reloaded onto a newer build; reloading client binary to match...",
+        );
+        self.save_input_for_reload(&session_id);
+        self.reload_requested = Some(session_id);
+        self.should_quit = true;
+        true
     }
 
     /// Initialize MCP servers (call after construction)
@@ -437,6 +507,47 @@ impl App {
 }
 
 pub(super) fn handle_dev_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed == "/onboarding-sim"
+        || trimmed == "/onboarding-sim on"
+        || trimmed == "/onboarding-sim off"
+        || trimmed == "/onboarding-sim status"
+    {
+        let mode = trimmed.strip_prefix("/onboarding-sim").unwrap_or("").trim();
+        match mode {
+            "status" => {
+                let status = if app.onboarding_sim_active() {
+                    "on"
+                } else {
+                    "off"
+                };
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Onboarding simulator is {status}. Alt+5 resets and opens it; Cmd+5 toggles it; `/onboarding-sim on` / `off` also work. While active: Tab/→ next screen, Shift+Tab/← previous, h/l preview the highlight, Esc exits."
+                )));
+            }
+            "" | "on" => {
+                app.start_onboarding_simulator();
+                app.push_display_message(DisplayMessage::system(
+                    "Onboarding simulator started. Step screens with Tab/→, press Alt+5 to reset to the first screen, or Cmd+5 to toggle. On the import screen Up/Down move the checkbox cursor; h/l preview the highlight; Esc exits. Nothing real is logged in or imported.".to_string(),
+                ));
+            }
+            "off" => {
+                app.stop_onboarding_simulator();
+                app.push_display_message(DisplayMessage::system(
+                    "Onboarding simulator stopped.".to_string(),
+                ));
+            }
+            _ => unreachable!("guarded by command matcher"),
+        }
+        return true;
+    }
+
+    if trimmed.starts_with("/onboarding-sim ") {
+        app.push_display_message(DisplayMessage::system(
+            "Usage: `/onboarding-sim`, `/onboarding-sim on`, `/onboarding-sim off`, or `/onboarding-sim status`. (Alt+5 resets and opens it; Cmd+5 toggles it.)".to_string(),
+        ));
+        return true;
+    }
+
     if trimmed == "/onboarding-preview"
         || trimmed == "/onboarding-preview on"
         || trimmed == "/onboarding-preview off"

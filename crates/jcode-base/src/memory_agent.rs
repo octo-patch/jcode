@@ -44,6 +44,50 @@ const TOPIC_CHANGE_THRESHOLD: f32 = 0.3;
 /// Maximum memories to surface per turn
 const MAX_MEMORIES_PER_TURN: usize = 5;
 
+/// Dynamic no-sidecar gate tunables (variable-k surfacing without an LLM).
+///
+/// When the memory sidecar is disabled (no LLM to judge relevance), we used to
+/// blindly pad the hybrid top-5 every turn, which injected ~5 memories even on
+/// turns that needed none. Instead we keep a score-relative window: always keep
+/// the top candidate, then keep each following candidate only while its hybrid
+/// score stays within `GATE_REL_FLOOR` of the top AND within `GATE_DROP_RATIO`
+/// of the previous kept score. The first big gap cuts the tail. This injects a
+/// VARIABLE count (1..=MAX_MEMORIES_PER_TURN) instead of a fixed 5.
+///
+/// Bench (self-dev corpus, 150 query windows): precision@5 0.23 -> 0.36 (+56%),
+/// avg injected 5.0 -> ~2.25/turn, at zero added cost. Note this cannot drop to
+/// 0 on no-memory turns (cosdiag proved no zero-cost score separates them); the
+/// only lever for true 0-injection is the LLM precision rerank (sidecar mode).
+const GATE_REL_FLOOR: f32 = 0.90;
+const GATE_DROP_RATIO: f32 = 0.95;
+
+/// Score-relative dynamic gate over hybrid-ranked `(entry, score)` candidates.
+///
+/// Always keeps the top candidate, then keeps each following candidate only
+/// while its score stays within `GATE_REL_FLOOR` of the top score AND within
+/// `GATE_DROP_RATIO` of the previously kept score; the first gap that breaks
+/// either bound truncates the tail. Caps output at `max_k`. Returns a variable
+/// count (1..=max_k for a non-empty input), not a fixed top-k.
+fn dynamic_gate_select(
+    candidates: Vec<(MemoryEntry, f32)>,
+    max_k: usize,
+) -> Vec<(MemoryEntry, f32)> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let top = candidates[0].1.max(f32::MIN_POSITIVE);
+    let mut prev = top;
+    let mut out: Vec<(MemoryEntry, f32)> = Vec::new();
+    for (entry, sim) in candidates.into_iter().take(max_k) {
+        if !out.is_empty() && (sim < top * GATE_REL_FLOOR || sim < prev * GATE_DROP_RATIO) {
+            break;
+        }
+        prev = sim;
+        out.push((entry, sim));
+    }
+    out
+}
+
 /// Reset surfaced memories every N turns to allow re-surfacing
 const TURN_RESET_INTERVAL: usize = 50;
 
@@ -98,6 +142,7 @@ pub fn build_transcript_for_extraction(messages: &[crate::message::Message]) -> 
                     transcript.push_str(&format!("[Result: {}]\n", preview));
                 }
                 crate::message::ContentBlock::Reasoning { .. }
+                | crate::message::ContentBlock::ReasoningTrace { .. }
                 | crate::message::ContentBlock::AnthropicThinking { .. }
                 | crate::message::ContentBlock::OpenAIReasoning { .. } => {}
                 crate::message::ContentBlock::Image { .. } => {
@@ -260,6 +305,27 @@ fn relevance_context_signature(context: &str) -> String {
         .join("\n")
 }
 
+/// Decide whether to run the expensive Mode-2 listwise rerank this turn.
+///
+/// - First rerank of a session (`last_rerank_turn == None`) always fires.
+/// - A topic change always fires (don't delay a genuine topic jump).
+/// - Otherwise the cadence floor applies: fire only if at least `cadence` turns
+///   have passed since the last rerank. `cadence <= 1` means every turn.
+fn should_run_rerank(
+    turn_count: usize,
+    last_rerank_turn: Option<usize>,
+    cadence: usize,
+    topic_changed: bool,
+) -> bool {
+    if topic_changed {
+        return true;
+    }
+    match last_rerank_turn {
+        None => true,
+        Some(last) => cadence <= 1 || turn_count.saturating_sub(last) >= cadence,
+    }
+}
+
 fn bump_turn_stat() {
     if let Ok(mut stats) = MEMORY_AGENT_STATS.lock() {
         stats.turns_processed = stats.turns_processed.saturating_add(1);
@@ -292,15 +358,21 @@ struct SessionState {
     turn_count: usize,
     /// Turn count since last extraction for this session
     turns_since_extraction: usize,
+    /// `turn_count` at which the Mode-2 listwise rerank last ran, for the
+    /// cadence floor (rerank at most once per `memory_rerank_cadence` turns).
+    last_rerank_turn: Option<usize>,
+    /// Memory IDs that the last consensus rerank verified as relevant. On
+    /// cadence-gated turns we re-surface only these (intersected with the
+    /// current candidate set) instead of falling back to the noisy no-LLM
+    /// hybrid order, which would otherwise inject low-similarity bloat and
+    /// destroy the high-precision guarantee.
+    last_verified_ids: Vec<String>,
 }
 
 /// The persistent memory agent state
 pub struct MemoryAgent {
     /// Channel to receive messages
     rx: mpsc::Receiver<AgentMessage>,
-
-    /// Optional sidecar for LLM-backed memory decisions.
-    sidecar: Option<Sidecar>,
 
     /// Per-session state keyed by session ID
     sessions: HashMap<String, SessionState>,
@@ -311,9 +383,19 @@ impl MemoryAgent {
     fn new(rx: mpsc::Receiver<AgentMessage>) -> Self {
         Self {
             rx,
-            sidecar: memory::memory_sidecar_enabled().then(Sidecar::new),
             sessions: HashMap::new(),
         }
+    }
+
+    /// Construct a fresh sidecar for an LLM-backed memory operation, but ONLY
+    /// when the LLM precision-judge path is actually usable right now (sidecar
+    /// mode is enabled AND a real LLM backend is reachable).
+    ///
+    /// Built fresh on each call rather than cached at construction so that
+    /// login changes (gaining or losing access to a provider/credentials) are
+    /// reflected immediately without restarting the agent.
+    fn live_sidecar(&self) -> Option<Sidecar> {
+        memory::memory_llm_judge_available().then(Sidecar::new)
     }
 
     /// Reset all agent state
@@ -403,6 +485,37 @@ impl MemoryAgent {
         if context.is_empty() {
             return Ok(());
         }
+        // Memory is only productive with the LLM precision judge. If sidecar mode
+        // is requested but no LLM backend is reachable (e.g. logged out / lost
+        // provider access), go dormant for this turn instead of silently
+        // degrading to the low-precision no-LLM hybrid path. Re-checked live, so
+        // memory resumes automatically once a login returns.
+        if !memory::memory_runtime_active() {
+            crate::logging::event_rate_limited(
+                crate::logging::LogLevel::Info,
+                "memory_runtime_dormant",
+                std::time::Duration::from_secs(300),
+                "MEMORY_RUNTIME_DORMANT",
+                vec![
+                    ("session_id", session_id.to_string()),
+                    (
+                        "reason",
+                        "sidecar_mode_without_reachable_llm_backend".to_string(),
+                    ),
+                ],
+            );
+            memory::set_state(MemoryState::Idle);
+            crate::memory_judge_metrics::record(
+                crate::memory_judge_metrics::JudgeDecision::NoBackend,
+                session_id,
+                0,
+            );
+            return Ok(());
+        }
+        // Focused query (latest user intent, boilerplate/tool-noise stripped) used
+        // for listwise LLM reranking. Benchmarking showed the cross-encoder/LLM
+        // reranker only works with this focused query, not the full noisy window.
+        let focused_query = memory::format_focused_query_for_relevance(&messages);
 
         let context_signature = relevance_context_signature(&context);
         {
@@ -428,42 +541,46 @@ impl MemoryAgent {
         memory::set_state(MemoryState::Embedding);
         memory::add_event(MemoryEventKind::EmbeddingStarted);
 
-        // Step 1: Embed current context
+        // Step 1: Embed current context (via the active embedding backend:
+        // local MiniLM by default, or the remote OpenAI backend when configured).
         let start = Instant::now();
         let context_for_embedding = context.clone();
-        let context_embedding =
-            match tokio::task::spawn_blocking(move || embedding::embed(&context_for_embedding))
-                .await
-            {
-                Ok(Ok(emb)) => emb,
-                Ok(Err(e)) => {
-                    crate::logging::event_rate_limited(
-                        crate::logging::LogLevel::Info,
-                        "memory_agent_embedding_failed",
-                        std::time::Duration::from_secs(60),
-                        "MEMORY_EMBEDDING_FAILED",
-                        vec![
-                            ("session_id", session_id.to_string()),
-                            ("error", e.to_string()),
-                            ("fallback", "skip_memory_relevance".to_string()),
-                        ],
-                    );
-                    memory::set_state(MemoryState::Idle);
-                    return Ok(());
-                }
-                Err(e) => {
-                    crate::logging::info(&format!("Embedding task failed: {}", e));
-                    memory::set_state(MemoryState::Idle);
-                    return Ok(());
-                }
-            };
+        let context_embedding = match tokio::task::spawn_blocking(move || {
+            crate::embedding_backend::embed_query_active(&context_for_embedding)
+        })
+        .await
+        {
+            Ok(Ok((emb, _model))) => emb,
+            Ok(Err(e)) => {
+                crate::logging::event_rate_limited(
+                    crate::logging::LogLevel::Info,
+                    "memory_agent_embedding_failed",
+                    std::time::Duration::from_secs(60),
+                    "MEMORY_EMBEDDING_FAILED",
+                    vec![
+                        ("session_id", session_id.to_string()),
+                        ("error", e.to_string()),
+                        ("fallback", "skip_memory_relevance".to_string()),
+                    ],
+                );
+                memory::set_state(MemoryState::Idle);
+                return Ok(());
+            }
+            Err(e) => {
+                crate::logging::info(&format!("Embedding task failed: {}", e));
+                memory::set_state(MemoryState::Idle);
+                return Ok(());
+            }
+        };
 
         // Check for topic change (comparing against this session's last embedding)
+        let mut topic_changed = false;
         {
             let ss = self.session_state(session_id);
             if let Some(ref last_emb) = ss.last_context_embedding {
                 let similarity = embedding::cosine_similarity(&context_embedding, last_emb);
                 if similarity < TOPIC_CHANGE_THRESHOLD {
+                    topic_changed = true;
                     crate::logging::info(&format!(
                         "[{}] Topic change detected (sim={:.2}), resetting session memory state",
                         session_id, similarity
@@ -487,15 +604,21 @@ impl MemoryAgent {
                                 .await;
                             let ss = self.session_state(session_id);
                             ss.surfaced_memories.clear();
-                            memory::clear_injected_memories(session_id);
                         } else {
                             ss.surfaced_memories.clear();
-                            memory::clear_injected_memories(session_id);
                         }
                     } else {
                         ss.surfaced_memories.clear();
-                        memory::clear_injected_memories(session_id);
                     }
+                    // NOTE: injected-memory tracking is intentionally NOT
+                    // cleared here. Topic changes fire frequently on real
+                    // sessions (consecutive coding turns often drop below the
+                    // similarity threshold), and the previously injected
+                    // memories are still in the transcript, so the model
+                    // already knows them. `surfaced_memories` (pending
+                    // payloads that may never have been consumed) is cleared
+                    // so a new topic can re-surface them; actually-injected
+                    // IDs age out via the TTL in `memory::pending` instead.
                 }
             }
         }
@@ -527,10 +650,13 @@ impl MemoryAgent {
             }
         }
 
-        // Step 2: Find similar memories by embedding
-        let candidates = memory_manager.find_similar_with_embedding(
+        // Step 2: Find candidate memories via hybrid retrieval (dense + BM25
+        // fused with RRF). Benchmarking showed the old dense-only path with a
+        // 0.5 cosine floor surfaced essentially nothing on real session windows;
+        // hybrid recovers recall and lets the sidecar/rerank do the filtering.
+        let candidates = memory_manager.find_similar_hybrid(
+            &context,
             &context_embedding,
-            memory::EMBEDDING_SIMILARITY_THRESHOLD,
             memory::EMBEDDING_MAX_HITS,
         )?;
 
@@ -570,7 +696,13 @@ impl MemoryAgent {
             return Ok(());
         }
 
-        // Step 3: Use Haiku to decide what's relevant and worth surfacing
+        // Step 3: Decide which candidates to surface.
+        // Mode-2 (sidecar enabled): a single listwise LLM rerank reorders the
+        // hybrid candidates by relevance to the focused query and omits
+        // irrelevant ones; we surface the top MAX_MEMORIES_PER_TURN. This matches
+        // the validated benchmark pipeline (recall@5 0.53 -> 0.75) and uses ONE
+        // LLM call instead of the old per-candidate binary checks.
+        // Mode-1 (no sidecar): take the top hybrid-ranked candidates by score.
         memory::set_state(MemoryState::SidecarChecking {
             count: new_candidates.len(),
         });
@@ -578,9 +710,107 @@ impl MemoryAgent {
 
         let candidate_ids: Vec<String> = new_candidates.iter().map(|(e, _)| e.id.clone()).collect();
 
-        let relevant = self
-            .evaluate_candidates(session_id, &context, new_candidates)
-            .await?;
+        // Cadence gate for the EXPENSIVE Mode-2 rerank: run the listwise LLM
+        // rerank at most once per `memory_rerank_cadence` turns. Skipped turns
+        // re-surface only the last judge-verified set (never unvetted hybrid),
+        // so precision is preserved between reranks. A topic change or the first
+        // rerank of a session always fires, so genuine topic jumps are never
+        // delayed.
+        let should_rerank = {
+            let cadence = crate::config::config().agents.memory_rerank_cadence;
+            let ss = self.session_state(session_id);
+            should_run_rerank(ss.turn_count, ss.last_rerank_turn, cadence, topic_changed)
+        };
+
+        let relevant = if let Some(sidecar) = self.live_sidecar() {
+            if should_rerank {
+                let agents = &crate::config::config().agents;
+                let votes = agents.memory_rerank_votes.max(1);
+                let min_agree = agents.memory_rerank_min_agree.clamp(1, votes);
+                // Record the attempt before awaiting the judge. Failed attempts
+                // still obey the configured cadence instead of retrying on every
+                // subsequent context update.
+                let attempt_turn = self.session_state(session_id).turn_count;
+                self.session_state(session_id).last_rerank_turn = Some(attempt_turn);
+                let (reranked, outcome) =
+                    crate::memory_rerank::rerank_candidates_consensus_attributed(
+                        &sidecar,
+                        &focused_query,
+                        new_candidates.clone(),
+                        votes,
+                        min_agree,
+                    )
+                    .await;
+                // Attribute exactly why this turn surfaced what it did: a judged
+                // verdict is the productive path; any rerank failure (transport
+                // error / unparseable / all judges failed) is a no-LLM
+                // degradation we want to drive to zero.
+                crate::memory_judge_metrics::record(
+                    crate::memory_judge_metrics::JudgeDecision::from_rerank_outcome(outcome),
+                    session_id,
+                    candidate_ids.len(),
+                );
+                if outcome == crate::memory_rerank::RerankOutcome::Judged {
+                    // Real judge verdict: surface it and remember it as the new
+                    // verified set for future cadence/failure carries.
+                    let result: Vec<_> = reranked.into_iter().take(MAX_MEMORIES_PER_TURN).collect();
+                    {
+                        let ss = self.session_state(session_id);
+                        ss.last_verified_ids = result.iter().map(|e| e.id.clone()).collect();
+                    }
+                    result
+                } else {
+                    // Judge FAILED this turn (rerank returned empty). Do NOT inject
+                    // unvetted hybrid order; carry the last judge-verified set so
+                    // everything surfaced stays judge-backed. The failed attempt still
+                    // advances the cadence, while the global circuit breaker suppresses
+                    // cross-session retry storms.
+                    let carried = self.carry_verified(session_id, new_candidates);
+                    crate::logging::event_rate_limited(
+                        crate::logging::LogLevel::Info,
+                        "memory_judge_failed_carry",
+                        std::time::Duration::from_secs(60),
+                        "Memory judge unavailable; carrying previously verified memories",
+                        vec![
+                            ("session_id", session_id.to_string()),
+                            ("outcome", format!("{outcome:?}")),
+                            ("carried", carried.len().to_string()),
+                        ],
+                    );
+                    carried
+                }
+            } else {
+                // Cadence-gated turn: re-surface ONLY the memories the last
+                // consensus rerank verified (intersected with the current
+                // candidate set), preserving high precision. Falling back to the
+                // noisy no-LLM hybrid order here would inject low-similarity
+                // bloat (the exact behavior we are trying to avoid).
+                crate::memory_judge_metrics::record(
+                    crate::memory_judge_metrics::JudgeDecision::CadenceCarry,
+                    session_id,
+                    candidate_ids.len(),
+                );
+                let carried = self.carry_verified(session_id, new_candidates);
+                crate::logging::info(&format!(
+                    "[{}] Memory rerank gated by cadence; re-surfacing {} consensus-verified memories",
+                    session_id,
+                    carried.len()
+                ));
+                carried
+            }
+        } else {
+            // No LLM judge. This is reached only when the user explicitly opted
+            // OUT of the sidecar (`memory_sidecar_enabled = false`); when sidecar
+            // mode is on but no LLM backend is reachable, `process_context`
+            // returns early before this point (memory goes dormant rather than
+            // degrading to the low-precision no-LLM path).
+            crate::memory_judge_metrics::record(
+                crate::memory_judge_metrics::JudgeDecision::OptedOut,
+                session_id,
+                candidate_ids.len(),
+            );
+            self.select_top_candidates_no_sidecar(session_id, new_candidates)
+        };
 
         let verified_ids: Vec<String> = relevant.iter().map(|e| e.id.clone()).collect();
         let rejected_ids: Vec<String> = candidate_ids
@@ -592,7 +822,7 @@ impl MemoryAgent {
         let retrieval_ctx = RetrievalContext {
             verified_ids: verified_ids.clone(),
             rejected_ids,
-            context_snippet: context[..context.len().min(200)].to_string(),
+            context_snippet: jcode_core::util::truncate_str(&context, 200).to_string(),
         };
 
         // Step 4: Format and store for main agent
@@ -643,91 +873,55 @@ impl MemoryAgent {
         Ok(())
     }
 
-    /// Use Haiku to evaluate which candidates are actually relevant
-    async fn evaluate_candidates(
+    /// Mode-1 (no sidecar) candidate selection: a score-relative dynamic gate
+    /// over the hybrid-ranked candidates. Returns a VARIABLE number of memories
+    /// (1..=`MAX_MEMORIES_PER_TURN`) instead of always padding to a fixed top-k,
+    /// cutting the tail at the first large score gap. See `GATE_REL_FLOOR` /
+    /// `GATE_DROP_RATIO` for the rationale and benchmark numbers.
+    ///
+    /// In Mode-2 the listwise LLM reranker (`memory_rerank::rerank_candidates`)
+    /// handles relevance selection instead (and can drop to 0), so this is only
+    /// reached when the memory sidecar is disabled (no LLM available to judge
+    /// relevance) or on a cadence-gated turn.
+    fn select_top_candidates_no_sidecar(
         &self,
         session_id: &str,
-        context: &str,
         candidates: Vec<(MemoryEntry, f32)>,
-    ) -> Result<Vec<MemoryEntry>> {
-        if !memory::memory_sidecar_enabled() {
-            return Ok(candidates
-                .into_iter()
-                .take(MAX_MEMORIES_PER_TURN)
-                .map(|(entry, sim)| {
-                    crate::logging::info(&format!(
-                        "[{}] Memory relevant (semantic sim={:.2}): {}",
-                        session_id,
-                        sim,
-                        &entry.content[..entry.content.len().min(40)]
-                    ));
-                    entry
-                })
-                .collect());
+    ) -> Vec<MemoryEntry> {
+        let selected = dynamic_gate_select(candidates, MAX_MEMORIES_PER_TURN);
+        for (entry, sim) in &selected {
+            crate::logging::info(&format!(
+                "[{}] Memory relevant (semantic sim={:.2}): {}",
+                session_id,
+                sim,
+                jcode_core::util::truncate_str(&entry.content, 40)
+            ));
         }
+        selected.into_iter().map(|(entry, _)| entry).collect()
+    }
 
-        let Some(sidecar) = self.sidecar.clone() else {
-            return Ok(Vec::new());
-        };
-
-        let mut relevant = Vec::new();
-
-        // Process in parallel
-        let futures: Vec<_> = candidates
+    /// Re-surface ONLY the memories the last consensus rerank verified,
+    /// intersected with the current candidate set. Used both for cadence-gated
+    /// turns and as the fallback when a judge fails this turn: in either case we
+    /// ride the last judge verdict rather than dropping to unvetted hybrid order.
+    /// No prior verdict (or no overlap) -> surface nothing. This keeps the LLM
+    /// judge the ONLY thing that can put a memory in front of the agent.
+    fn carry_verified(
+        &mut self,
+        session_id: &str,
+        candidates: Vec<(MemoryEntry, f32)>,
+    ) -> Vec<MemoryEntry> {
+        let verified: HashSet<String> = self
+            .session_state(session_id)
+            .last_verified_ids
             .iter()
-            .take(MAX_MEMORIES_PER_TURN)
-            .map(|(entry, sim)| {
-                let sidecar = sidecar.clone();
-                let content = entry.content.clone();
-                let ctx = context.to_string();
-                let similarity = *sim;
-                async move {
-                    let start = Instant::now();
-                    let result = sidecar.check_relevance(&content, &ctx).await;
-                    (result, start.elapsed(), similarity)
-                }
-            })
+            .cloned()
             .collect();
-
-        let results = futures::future::join_all(futures).await;
-
-        for ((entry, _), (result, elapsed, sim)) in candidates.iter().zip(results) {
-            match result {
-                Ok((is_relevant, reason)) => {
-                    memory::add_event(MemoryEventKind::SidecarComplete {
-                        latency_ms: elapsed.as_millis() as u64,
-                    });
-
-                    if is_relevant {
-                        crate::logging::info(&format!(
-                            "[{}] Memory relevant (sim={:.2}): {} - {}",
-                            session_id,
-                            sim,
-                            &entry.content[..entry.content.len().min(40)],
-                            reason
-                        ));
-                        memory::add_event(MemoryEventKind::SidecarRelevant {
-                            memory_preview: entry.content[..entry.content.len().min(30)]
-                                .to_string(),
-                        });
-                        relevant.push(entry.clone());
-                    } else {
-                        memory::add_event(MemoryEventKind::SidecarNotRelevant);
-                    }
-                }
-                Err(e) => {
-                    memory::add_event(MemoryEventKind::Error {
-                        message: e.to_string(),
-                    });
-                }
-            }
-
-            if relevant.len() >= MAX_MEMORIES_PER_TURN {
-                break;
-            }
-        }
-
-        Ok(relevant)
+        candidates
+            .into_iter()
+            .filter(|(e, _)| verified.contains(&e.id))
+            .map(|(e, _)| e)
+            .collect()
     }
 
     /// Extract memories from a context string
@@ -735,13 +929,16 @@ impl MemoryAgent {
     /// This is an incremental extraction - we extract from a portion of the
     /// conversation (on topic change or periodically) rather than waiting for session end.
     async fn extract_from_context(&self, session_id: &str, context: &str, reason: &str) {
-        if !memory::memory_sidecar_enabled() {
+        // Memory extraction requires the LLM. Skip when sidecar mode is off OR
+        // (sidecar mode on but) no LLM backend is reachable. Re-checked live so a
+        // login change is reflected without a restart.
+        let Some(sidecar) = self.live_sidecar() else {
             crate::logging::info(&format!(
-                "Incremental extraction skipped for session {}: memory sidecar disabled",
+                "Incremental extraction skipped for session {}: LLM judge unavailable",
                 session_id
             ));
             return;
-        }
+        };
 
         // Don't extract from very short contexts
         if context.len() < 200 {
@@ -756,15 +953,9 @@ impl MemoryAgent {
             reason: reason.to_string(),
         });
 
-        let Some(sidecar) = self.sidecar.clone() else {
-            crate::logging::info(&format!(
-                "Incremental extraction skipped for session {}: sidecar unavailable",
-                session_id
-            ));
-            return;
-        };
         let memory_manager = self.manager_for_session(session_id);
         let context_owned = context.to_string();
+        let session_id_owned = session_id.to_string();
 
         let existing: Vec<String> = {
             let context_summary = if context_owned.len() > 2000 {
@@ -800,6 +991,7 @@ impl MemoryAgent {
                 Ok(extracted) if !extracted.is_empty() => {
                     let mut stored_count = 0;
                     let mut stored_ids: Vec<String> = Vec::new();
+                    let mut known_ids: Vec<String> = Vec::new();
                     let mut reinforced_count = 0;
                     let mut superseded_count = 0;
 
@@ -869,6 +1061,7 @@ impl MemoryAgent {
 
                             if did_reinforce {
                                 reinforced_count += 1;
+                                known_ids.push(existing_id.clone());
                             }
                             continue;
                         }
@@ -967,6 +1160,19 @@ impl MemoryAgent {
                         ));
                         memory::add_event(MemoryEventKind::ExtractionComplete { count: total });
                     }
+
+                    // The session this transcript came from already contains
+                    // this information verbatim; re-injecting freshly
+                    // extracted (or just-reinforced) memories back into it
+                    // would be a pure echo. Mark them as known so retrieval
+                    // skips them for this session (other sessions still see
+                    // them normally).
+                    known_ids.extend(stored_ids.iter().cloned());
+                    memory::mark_memories_known(
+                        &session_id_owned,
+                        &known_ids,
+                        "extracted from this session's transcript",
+                    );
                     memory::set_state(MemoryState::Idle);
                 }
                 Ok(_) => {
@@ -1027,27 +1233,12 @@ impl MemoryAgent {
                 }
             }
 
-            // 2. Boost confidence for verified memories (they were actually useful)
-            let mut boosted = 0usize;
-            for id in &ctx.verified_ids {
-                match boost_memory_confidence(&memory_manager, id, 0.05) {
-                    Ok(()) => boosted += 1,
-                    Err(e) => {
-                        crate::logging::info(&format!("Confidence boost failed for {}: {}", id, e))
-                    }
-                }
-            }
-
-            // 3. Gentle decay for rejected memories (may be stale)
-            let mut decayed = 0usize;
-            for id in &ctx.rejected_ids {
-                match decay_memory_confidence(&memory_manager, id, 0.02) {
-                    Ok(()) => decayed += 1,
-                    Err(e) => {
-                        crate::logging::info(&format!("Confidence decay failed for {}: {}", id, e))
-                    }
-                }
-            }
+            // 2 + 3. Batch confidence updates: boost verified, decay rejected.
+            // Each graph is loaded and saved ONCE for the whole turn instead of
+            // once per id (graphs are multi-MB JSON; per-id round trips rewrote
+            // megabytes 5-10x per turn).
+            let (boosted, decayed) =
+                apply_confidence_updates(&memory_manager, &ctx.verified_ids, &ctx.rejected_ids);
             if boosted > 0 || decayed > 0 {
                 memory::add_event(MemoryEventKind::MaintenanceConfidence { boosted, decayed });
             }
@@ -1060,7 +1251,7 @@ impl MemoryAgent {
                 crate::logging::info(&format!(
                     "Memory gap detected: {} candidates retrieved but none relevant. Context: {}...",
                     ctx.rejected_ids.len(),
-                    &ctx.context_snippet[..ctx.context_snippet.len().min(100)]
+                    jcode_core::util::truncate_str(&ctx.context_snippet, 100)
                 ));
             }
 
@@ -1177,7 +1368,7 @@ async fn refine_clusters(
                 let member_contents: Vec<String> = project_ids
                     .iter()
                     .filter_map(|id| project_graph.get_memory(id))
-                    .map(|m| m.content[..m.content.len().min(80)].to_string())
+                    .map(|m| jcode_core::util::truncate_str(&m.content, 80).to_string())
                     .collect();
                 if let Ok(name) = name_cluster_with_sidecar(&member_contents).await
                     && let Some(cluster) = project_graph.clusters.get_mut(cluster_id)
@@ -1513,74 +1704,76 @@ async fn discover_links(manager: &MemoryManager, memory_ids: &[String]) -> Resul
     Ok(linked)
 }
 
-/// Boost a memory's confidence score
-fn boost_memory_confidence(manager: &MemoryManager, memory_id: &str, amount: f32) -> Result<()> {
-    // Load project graph first
-    let mut graph = manager.load_project_graph()?;
-    if graph.get_memory(memory_id).is_some() {
-        if let Some(entry) = graph.get_memory_mut(memory_id) {
-            entry.boost_confidence(amount);
-            let conf = entry.confidence;
-            manager.save_project_graph(&graph)?;
-            crate::logging::info(&format!(
-                "Boosted confidence for {} to {:.2}",
-                memory_id, conf
-            ));
-        }
-        return Ok(());
+/// Apply confidence boosts (verified) and decays (rejected) in a single pass
+/// over each graph. Loads and saves the project and global graphs at most ONCE
+/// each, instead of once per id, to avoid rewriting multi-MB JSON repeatedly.
+///
+/// Returns (boosted_count, decayed_count).
+fn apply_confidence_updates(
+    manager: &MemoryManager,
+    verified_ids: &[String],
+    rejected_ids: &[String],
+) -> (usize, usize) {
+    const BOOST: f32 = 0.05;
+    const DECAY: f32 = 0.02;
+
+    if verified_ids.is_empty() && rejected_ids.is_empty() {
+        return (0, 0);
     }
 
-    // Try global
-    let mut graph = manager.load_global_graph()?;
-    if graph.get_memory(memory_id).is_some() {
-        if let Some(entry) = graph.get_memory_mut(memory_id) {
-            entry.boost_confidence(amount);
-            let conf = entry.confidence;
-            manager.save_global_graph(&graph)?;
-            crate::logging::info(&format!(
-                "Boosted confidence for {} to {:.2}",
-                memory_id, conf
-            ));
+    let mut boosted = 0usize;
+    let mut decayed = 0usize;
+
+    // Process project then global; an id lives in exactly one graph, so once an
+    // update lands we don't need to touch it again.
+    for scope in ["project", "global"] {
+        let mut graph = match if scope == "project" {
+            manager.load_project_graph()
+        } else {
+            manager.load_global_graph()
+        } {
+            Ok(g) => g,
+            Err(e) => {
+                crate::logging::info(&format!(
+                    "Confidence update: failed to load {} graph: {}",
+                    scope, e
+                ));
+                continue;
+            }
+        };
+
+        let mut changed = false;
+        for id in verified_ids {
+            if let Some(entry) = graph.get_memory_mut(id) {
+                entry.boost_confidence(BOOST);
+                boosted += 1;
+                changed = true;
+            }
         }
-        return Ok(());
+        for id in rejected_ids {
+            if let Some(entry) = graph.get_memory_mut(id) {
+                entry.decay_confidence(DECAY);
+                decayed += 1;
+                changed = true;
+            }
+        }
+
+        if changed {
+            let saved = if scope == "project" {
+                manager.save_project_graph(&graph)
+            } else {
+                manager.save_global_graph(&graph)
+            };
+            if let Err(e) = saved {
+                crate::logging::info(&format!(
+                    "Confidence update: failed to save {} graph: {}",
+                    scope, e
+                ));
+            }
+        }
     }
 
-    Err(anyhow::anyhow!("Memory not found: {}", memory_id))
-}
-
-/// Decay a memory's confidence score
-fn decay_memory_confidence(manager: &MemoryManager, memory_id: &str, amount: f32) -> Result<()> {
-    // Load project graph first
-    let mut graph = manager.load_project_graph()?;
-    if graph.get_memory(memory_id).is_some() {
-        if let Some(entry) = graph.get_memory_mut(memory_id) {
-            entry.decay_confidence(amount);
-            let conf = entry.confidence;
-            manager.save_project_graph(&graph)?;
-            crate::logging::info(&format!(
-                "Decayed confidence for {} to {:.2}",
-                memory_id, conf
-            ));
-        }
-        return Ok(());
-    }
-
-    // Try global
-    let mut graph = manager.load_global_graph()?;
-    if graph.get_memory(memory_id).is_some() {
-        if let Some(entry) = graph.get_memory_mut(memory_id) {
-            entry.decay_confidence(amount);
-            let conf = entry.confidence;
-            manager.save_global_graph(&graph)?;
-            crate::logging::info(&format!(
-                "Decayed confidence for {} to {:.2}",
-                memory_id, conf
-            ));
-        }
-        return Ok(());
-    }
-
-    Err(anyhow::anyhow!("Memory not found: {}", memory_id))
+    (boosted, decayed)
 }
 
 /// Initialize and start the global memory agent

@@ -260,9 +260,36 @@ pub struct MemoryEntry {
     /// Embedding vector for similarity search (384 dimensions for MiniLM)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// Identifier of the embedding model that produced `embedding`, e.g.
+    /// "minilm-l6-v2" (local) or "openai:text-embedding-3-small". `None` means
+    /// the legacy local MiniLM model (memories written before model tagging).
+    /// Used to keep dense similarity comparisons within a single vector space:
+    /// only embeddings from the active model are compared; mismatched memories
+    /// remain reachable via lexical (BM25) search and RRF fusion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
     /// Confidence score (0.0-1.0) - decays over time, boosted by use
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+}
+
+/// Model id used for memories embedded before model tagging existed. These were
+/// all produced by the local all-MiniLM-L6-v2 model.
+pub const LEGACY_EMBEDDING_MODEL: &str = "minilm-l6-v2";
+
+impl MemoryEntry {
+    /// The embedding model id for this entry, treating an untagged (`None`)
+    /// embedding as the legacy local MiniLM model.
+    pub fn effective_embedding_model(&self) -> &str {
+        self.embedding_model
+            .as_deref()
+            .unwrap_or(LEGACY_EMBEDDING_MODEL)
+    }
+
+    /// Whether this entry's embedding was produced by `model` (legacy-aware).
+    pub fn embedding_matches_model(&self, model: &str) -> bool {
+        self.embedding.is_some() && self.effective_embedding_model() == model
+    }
 }
 
 fn default_confidence() -> f32 {
@@ -273,12 +300,18 @@ fn default_active() -> bool {
     true
 }
 
+fn new_memory_id() -> String {
+    let ts = Utc::now().timestamp_millis();
+    let rand: u64 = rand::random();
+    format!("mem_{ts}_{rand}")
+}
+
 impl MemoryEntry {
     pub fn new(category: MemoryCategory, content: impl Into<String>) -> Self {
         let now = Utc::now();
         let content = content.into();
         Self {
-            id: jcode_core::id::new_id("mem"),
+            id: new_memory_id(),
             category,
             search_text: normalize_memory_search_text(&content, &[]),
             content,
@@ -293,6 +326,7 @@ impl MemoryEntry {
             superseded_by: None,
             reinforcements: Vec::new(),
             embedding: None,
+            embedding_model: None,
             confidence: 1.0,
         }
     }
@@ -361,6 +395,19 @@ impl MemoryEntry {
         self
     }
 
+    /// Override the generated id (e.g. deterministic ids like `skill:<name>`).
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    /// Override created/updated timestamps (e.g. to backdate synthetic entries).
+    pub fn with_timestamps(mut self, created_at: DateTime<Utc>, updated_at: DateTime<Utc>) -> Self {
+        self.created_at = created_at;
+        self.updated_at = updated_at;
+        self
+    }
+
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
         self.access_count += 1;
@@ -387,6 +434,24 @@ impl MemoryEntry {
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
         self.embedding = Some(embedding);
         self
+    }
+
+    /// Set embedding vector together with the model id that produced it.
+    pub fn with_embedding_for_model(
+        mut self,
+        embedding: Vec<f32>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.embedding = Some(embedding);
+        self.embedding_model = Some(model.into());
+        self
+    }
+
+    /// Set or clear the embedding and its model id together, keeping the two
+    /// fields consistent.
+    pub fn set_embedding(&mut self, embedding: Option<Vec<f32>>, model: Option<String>) {
+        self.embedding = embedding;
+        self.embedding_model = model;
     }
 
     /// Check if this memory has an embedding

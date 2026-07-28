@@ -166,7 +166,7 @@ pub(super) fn build_refactor_prompt(plan_only: bool, focus: Option<&str>) -> Str
             "You are entering refactor planning mode for this repository.\n\
 Your job is to inspect the project and identify the highest-leverage safe refactors worth doing next.\n\
 \n\
-First inspect the codebase, current repo state, and the in-repo quality docs if they exist, especially `docs/REFACTORING.md`, `docs/CODE_QUALITY_10_10_PLAN.md`, and `docs/CODE_QUALITY_TODO.md`. Then write a concise ranked todo list using `todo` with the best 3-7 candidate refactors. Prefer behavior-preserving extraction, file splits, dead-code deletion, warning reduction, test isolation, and clearer module boundaries.\n\
+First inspect the codebase, current repo state, and the in-repo quality docs if they exist, especially `docs/REFACTORING.md`, `docs/plans/CODE_QUALITY_10_10_PLAN.md`, and `docs/plans/CODE_QUALITY_TODO.md`. Then write a concise ranked todo list using `todo` with the best 3-7 candidate refactors. Prefer behavior-preserving extraction, file splits, dead-code deletion, warning reduction, test isolation, and clearer module boundaries.\n\
 \n\
 This is plan-only mode: do not edit files, write patches, or otherwise modify source code or git state. Read/search/analyze freely, and you may run builds/tests if that helps rank the work, but stop after presenting the ranked refactor plan and brief rationale.\n\
 \n\
@@ -178,11 +178,11 @@ Avoid broad speculative rewrites, cosmetic churn, and risky busywork. If the rep
             "You are entering refactor mode for this repository.\n\
 Your job is to move the codebase closer to a practical 10/10 by making the highest-leverage safe refactors, validating them, getting an independent review, and only continuing while the next batch is clearly worth the churn.\n\
 \n\
-First inspect the codebase, current repo state, and the in-repo quality docs if they exist, especially `docs/REFACTORING.md`, `docs/CODE_QUALITY_10_10_PLAN.md`, and `docs/CODE_QUALITY_TODO.md`. Then write a concise ranked todo list using `todo` with the best 3-7 refactors to tackle next. Prefer behavior-preserving extraction, splitting oversized modules, dead-code deletion, warning reduction, test improvements, and boundary clarification.{}\n\
+First inspect the codebase, current repo state, and the in-repo quality docs if they exist, especially `docs/REFACTORING.md`, `docs/plans/CODE_QUALITY_10_10_PLAN.md`, and `docs/plans/CODE_QUALITY_TODO.md`. Then write a concise ranked todo list using `todo` with the best 3-7 refactors to tackle next. Prefer behavior-preserving extraction, splitting oversized modules, dead-code deletion, warning reduction, test improvements, and boundary clarification.{}\n\
 \n\
 For v1, do the implementation work yourself in this main session. Do not create a swarm for ordinary execution. Keep changes locally scoped and easy to validate.\n\
 \n\
-After each meaningful batch, use the `subagent` tool exactly once to launch an independent read-only reviewer. In that subagent prompt, explicitly forbid file edits, patch application, and git changes. Ask it to inspect the changed areas plus nearby tests and report concrete regressions, risks, abstraction problems, or follow-up refactors. Incorporate valid findings before continuing.\n\
+After each meaningful batch, use the `swarm` tool with `action=spawn` exactly once to launch an independent read-only reviewer. In that worker prompt, explicitly forbid file edits, patch application, and git changes. Ask it to inspect the changed areas plus nearby tests and report concrete regressions, risks, abstraction problems, or follow-up refactors. Incorporate valid findings before continuing.\n\
 \n\
 Validate each meaningful batch with relevant builds, tests, or repo verification scripts. Prefer behavior-preserving changes first. After the batch and independent review, reassess. If strong refactors remain, write a fresh todo list and continue. If remaining work has diminishing returns or becomes too risky, stop and explain why.\n\
 \n\
@@ -419,19 +419,19 @@ pub(super) fn start_synthetic_user_turn(app: &mut App, content: String) {
     app.thinking_buffer.clear();
     app.streaming_tool_calls.clear();
     app.batch_progress = None;
-    app.streaming_input_tokens = 0;
-    app.streaming_output_tokens = 0;
-    app.streaming_cache_read_tokens = None;
-    app.streaming_cache_creation_tokens = None;
-    app.current_api_usage_recorded = false;
+    app.streaming.streaming_input_tokens = 0;
+    app.streaming.streaming_output_tokens = 0;
+    app.streaming.streaming_cache_read_tokens = None;
+    app.streaming.streaming_cache_creation_tokens = None;
+    app.kv_cache.current_api_usage_recorded = false;
     app.upstream_provider = None;
     app.status_detail = None;
-    app.streaming_tps_start = None;
-    app.streaming_tps_elapsed = std::time::Duration::ZERO;
-    app.streaming_tps_collect_output = false;
-    app.streaming_total_output_tokens = 0;
-    app.streaming_tps_observed_output_tokens = 0;
-    app.streaming_tps_observed_elapsed = std::time::Duration::ZERO;
+    app.streaming.streaming_tps_start = None;
+    app.streaming.streaming_tps_elapsed = std::time::Duration::ZERO;
+    app.streaming.streaming_tps_collect_output = false;
+    app.streaming.streaming_total_output_tokens = 0;
+    app.streaming.streaming_tps_observed_output_tokens = 0;
+    app.streaming.streaming_tps_observed_elapsed = std::time::Duration::ZERO;
     app.processing_started = Some(Instant::now());
     app.visible_turn_started = Some(Instant::now());
     app.pending_turn = true;
@@ -445,6 +445,7 @@ pub(super) fn interrupt_and_queue_synthetic_message(
 ) {
     app.cancel_requested = true;
     app.interleave_message = None;
+    app.interleave_images.clear();
     app.pending_soft_interrupts.clear();
     app.pending_soft_interrupt_requests.clear();
     app.set_status_notice(status_notice);

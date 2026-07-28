@@ -344,7 +344,7 @@ fn test_openai_usage_data_from_provider_report_preserves_hard_limit_flag() {
 }
 
 #[test]
-fn test_openai_snapshot_does_not_treat_hard_limit_flag_as_exhausted() {
+fn test_openai_snapshot_treats_hard_limit_flag_as_exhausted() {
     let usage = OpenAIUsageData {
         hard_limit_reached: true,
         five_hour: Some(OpenAIUsageWindow {
@@ -361,7 +361,7 @@ fn test_openai_snapshot_does_not_treat_hard_limit_flag_as_exhausted() {
         &usage,
     );
 
-    assert!(!snapshot.exhausted);
+    assert!(snapshot.exhausted);
     assert_eq!(snapshot.five_hour_ratio, Some(1.0));
     assert_eq!(snapshot.seven_day_ratio, None);
 }
@@ -443,6 +443,35 @@ fn test_parse_openai_usage_payload_prefers_wham_windows_and_additional_limits() 
 }
 
 #[test]
+fn test_parse_openai_usage_payload_labels_monthly_primary_window() {
+    let json = serde_json::json!({
+        "plan_type": "team",
+        "rate_limit": {
+            "allowed": false,
+            "limit_reached": true,
+            "primary_window": {
+                "used_percent": 100.0,
+                "limit_window_seconds": 2_628_000,
+                "reset_at": 1_786_512_910
+            },
+            "secondary_window": null
+        }
+    });
+
+    let parsed = openai_helpers::parse_openai_usage_payload(&json);
+    assert_eq!(parsed.limits.len(), 1);
+    assert_eq!(parsed.limits[0].name, "Monthly window");
+
+    let usage = openai_usage_data_from_provider_report(&ProviderUsage {
+        provider_name: "OpenAI (ChatGPT)".to_string(),
+        limits: parsed.limits,
+        hard_limit_reached: parsed.hard_limit_reached,
+        ..Default::default()
+    });
+    assert!(usage.exhausted());
+}
+
+#[test]
 fn test_parse_openai_usage_payload_falls_back_to_nested_rate_limits() {
     let json = serde_json::json!({
         "plan": "team",
@@ -487,7 +516,9 @@ fn test_account_usage_probe_prefers_best_available_alternative() {
                 label: "work".to_string(),
                 email: Some("work@example.com".to_string()),
                 exhausted: true,
+                primary_label: None,
                 five_hour_ratio: Some(1.0),
+                secondary_label: None,
                 seven_day_ratio: Some(1.0),
                 resets_at: Some("2026-01-01T00:00:00Z".to_string()),
                 error: None,
@@ -496,7 +527,9 @@ fn test_account_usage_probe_prefers_best_available_alternative() {
                 label: "backup".to_string(),
                 email: Some("backup@example.com".to_string()),
                 exhausted: false,
+                primary_label: None,
                 five_hour_ratio: Some(0.45),
+                secondary_label: None,
                 seven_day_ratio: Some(0.10),
                 resets_at: Some("2026-01-01T01:00:00Z".to_string()),
                 error: None,
@@ -505,7 +538,9 @@ fn test_account_usage_probe_prefers_best_available_alternative() {
                 label: "secondary".to_string(),
                 email: Some("secondary@example.com".to_string()),
                 exhausted: false,
+                primary_label: None,
                 five_hour_ratio: Some(0.70),
+                secondary_label: None,
                 seven_day_ratio: Some(0.20),
                 resets_at: Some("2026-01-01T02:00:00Z".to_string()),
                 error: None,
@@ -533,7 +568,9 @@ fn test_account_usage_probe_detects_all_accounts_exhausted() {
                 label: "primary".to_string(),
                 email: None,
                 exhausted: true,
+                primary_label: None,
                 five_hour_ratio: Some(1.0),
+                secondary_label: None,
                 seven_day_ratio: Some(1.0),
                 resets_at: None,
                 error: None,
@@ -542,7 +579,9 @@ fn test_account_usage_probe_detects_all_accounts_exhausted() {
                 label: "backup".to_string(),
                 email: None,
                 exhausted: true,
+                primary_label: None,
                 five_hour_ratio: Some(1.0),
+                secondary_label: None,
                 seven_day_ratio: Some(1.0),
                 resets_at: None,
                 error: None,

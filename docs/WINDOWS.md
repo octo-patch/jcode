@@ -1,137 +1,164 @@
-# Windows Support Architecture
+# Windows Support
 
-This document describes how jcode achieves cross-platform support for Linux, macOS, and Windows.
+Jcode supports Windows as a first-class platform. The Windows implementation uses native named pipes, Windows process management, PowerShell installation, and platform-specific launch-hotkey integration.
 
-## Status
+## Support status
 
-- **Transport layer**: Implemented (`src/transport/`)
-- **Platform module**: Implemented (`src/platform.rs`)
-- **Windows transport**: Implemented but untested (`src/transport/windows.rs`)
-- **Windows platform**: Implemented (`src/platform.rs` has `#[cfg(windows)]` branches)
-- **Windows CI**: Not yet set up
+| Area | Status |
+|---|---|
+| Windows 11 x64 | Supported and manually verified |
+| Windows 11 ARM64 | Release builds and automated install checks |
+| PowerShell installer | Tested on Windows CI |
+| Native IPC and process lifecycle | Covered by targeted and end-to-end Windows tests |
+| `jcode update` | Supported with SHA-256 verification |
+| Release assets | x64 and ARM64 `.exe` and `.tar.gz` assets |
+| Authenticode signing | Release pipeline ready; requires the one-time Azure configuration below |
 
-## Design Principle
+PowerShell 5.1 or later is required by the installer. The x64 build is the default for Intel and AMD Windows computers. The ARM64 build is selected automatically on ARM64 Windows.
 
-**Zero cost on Unix.** The abstraction layer uses `#[cfg]` compile-time gates and type aliases so that Linux and macOS code paths compile to the exact same binary as before. Windows gets its own implementations behind `#[cfg(windows)]`. No traits, no dynamic dispatch, no runtime branching.
+## Install
 
-## Install Paths
+Open PowerShell and run:
 
-Current Windows install paths from `scripts/install.ps1`:
-
-- Launcher: `%LOCALAPPDATA%\\jcode\\bin\\jcode.exe`
-- Stable channel binary: `%LOCALAPPDATA%\\jcode\\builds\\stable\\jcode.exe`
-- Immutable versioned binaries: `%LOCALAPPDATA%\\jcode\\builds\\versions\\<version>\\jcode.exe`
-
-Unlike the current Unix self-dev/local-build flow, the PowerShell installer currently installs the stable channel rather than a separate `current` channel.
-
-## Transport Layer (`src/transport/`)
-
-The transport layer abstracts IPC (Inter-Process Communication). On Unix, jcode uses Unix domain sockets. On Windows, jcode uses named pipes.
-
-### Module Structure
-
-```
-src/transport/
-  mod.rs        - conditional re-exports (cfg-gated)
-  unix.rs       - type aliases wrapping tokio Unix sockets (zero-cost)
-  windows.rs    - named pipe Listener/Stream with split support
+```powershell
+irm https://jcode.sh/install.ps1 | iex
 ```
 
-### Unix (Linux + macOS)
+The installer:
 
-Unix transport is a thin re-export of existing types:
+1. Detects x64 or ARM64.
+2. Downloads the matching asset from the official GitHub release.
+3. Verifies it against the release's `SHA256SUMS` file.
+4. Installs immutable, stable, and launcher copies under `%LOCALAPPDATA%\jcode`.
+5. Adds `%LOCALAPPDATA%\jcode\bin` to the user `PATH`.
 
-```rust
-pub use tokio::net::UnixListener as Listener;
-pub use tokio::net::UnixStream as Stream;
-pub use tokio::net::unix::OwnedWriteHalf as WriteHalf;
-pub use tokio::net::unix::OwnedReadHalf as ReadHalf;
-pub use std::os::unix::net::UnixStream as SyncStream;
+Alacritty installation and the global launch hotkey are optional and are no longer installed automatically. To request both explicitly:
+
+```powershell
+$script = [scriptblock]::Create((irm https://jcode.sh/install.ps1))
+& $script -ConfigureAlacritty -ConfigureHotkey
 ```
 
-The compiled binary is byte-for-byte identical to what it was before the abstraction.
+Jcode can also offer these options interactively after launch.
 
-### Windows
+If a release does not contain a matching prebuilt Windows asset, the installer
+fails with an actionable message rather than silently starting a long build.
+To explicitly allow a source build:
 
-Windows transport provides custom types wrapping `tokio::net::windows::named_pipe`:
-
-- **`Listener`**: Wraps `NamedPipeServer` with an accept loop that creates new pipe instances for each connection (named pipes are single-client, so a new instance is created after each accept)
-- **`Stream`**: Enum over `NamedPipeServer` (accepted) or `NamedPipeClient` (connected), implementing `AsyncRead + AsyncWrite`
-- **`ReadHalf` / `WriteHalf`**: Created via `stream.into_split()` using `Arc<Mutex<Stream>>` since named pipes don't support native kernel-level splitting
-- **`SyncStream`**: Opens the named pipe as a regular file for blocking I/O
-
-Socket paths are converted to pipe names: `/run/user/1000/jcode.sock` becomes `\\.\pipe\jcode`.
-
-### API Surface
-
-Both platforms export the same interface:
-
-| Export | Unix | Windows |
-|--------|------|---------|
-| `Listener` | `tokio::net::UnixListener` | Custom struct wrapping `NamedPipeServer` |
-| `Stream` | `tokio::net::UnixStream` | Enum over `NamedPipeServer`/`NamedPipeClient` |
-| `ReadHalf` | `tokio::net::unix::OwnedReadHalf` | `Arc<Mutex<Stream>>` wrapper |
-| `WriteHalf` | `tokio::net::unix::OwnedWriteHalf` | `Arc<Mutex<Stream>>` wrapper |
-| `SyncStream` | `std::os::unix::net::UnixStream` | `std::fs::File` wrapper |
-
-## Platform Module (`src/platform.rs`)
-
-Centralizes all non-IPC OS-specific operations:
-
-| Function | Unix | Windows |
-|----------|------|---------|
-| `symlink_or_copy(src, dst)` | `std::os::unix::fs::symlink()` | Try `symlink_file/dir`, fall back to copy |
-| `atomic_symlink_swap(src, dst, temp)` | Create temp symlink + rename | Remove + copy (best effort) |
-| `set_permissions_owner_only(path)` | `chmod 600` | No-op |
-| `set_permissions_executable(path)` | `chmod 755` | No-op |
-| `is_process_running(pid)` | `kill(pid, 0)` | Returns `true` (stub) |
-| `replace_process(cmd)` | `exec()` (replaces process) | `spawn()` + `exit()` |
-
-## Files Migrated
-
-All OS-specific code has been moved out of application files into the transport and platform modules:
-
-| File | What was migrated |
-|------|------------------|
-| `src/server.rs` | `UnixListener`, `UnixStream`, `OwnedReadHalf`, `OwnedWriteHalf` |
-| `src/tui/backend.rs` | `UnixStream`, `OwnedWriteHalf`, `OwnedReadHalf` |
-| `src/tui/client.rs` | `UnixStream`, `OwnedWriteHalf` |
-| `src/tui/app.rs` | `UnixListener`, `OwnedWriteHalf`, file permissions |
-| `src/tool/communicate.rs` | `std::os::unix::net::UnixStream` |
-| `src/tool/debug_socket.rs` | `tokio::net::UnixStream` |
-| `src/main.rs` | `UnixStream` (health checks), all `exec()` calls, file permissions |
-| `src/build.rs` | Symlinks, executable permissions |
-| `src/update.rs` | Symlinks, permissions, atomic swap |
-| `src/auth/oauth.rs` | Credential file permissions |
-| `src/skill.rs` | Symlink creation |
-| `src/video_export.rs` | Frame symlinks |
-| `src/ambient.rs` | Process liveness check |
-| `src/registry.rs` | Process liveness check |
-| `src/session.rs` | Process liveness check |
-
-## Dependencies
-
-```toml
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+```powershell
+$script = [scriptblock]::Create((irm https://jcode.sh/install.ps1))
+& $script -BuildFromSource
 ```
 
-The `tokio` dependency already includes named pipe support on Windows (part of `features = ["full"]`).
+Source builds require Git, Rust, and Visual Studio 2022 Build Tools with the
+**Desktop development with C++** workload.
 
-## What Doesn't Change
+### Install paths
 
-The vast majority of the codebase is platform-agnostic:
+- Launcher: `%LOCALAPPDATA%\jcode\bin\jcode.exe`
+- Stable binary: `%LOCALAPPDATA%\jcode\builds\stable\jcode.exe`
+- Versioned binary: `%LOCALAPPDATA%\jcode\builds\versions\<version>\jcode.exe`
+- User data and configuration: `%USERPROFILE%\.jcode`
 
-- All provider code (HTTP-based)
-- All tool implementations (except bash tool's shell selection)
-- TUI rendering (crossterm + ratatui already cross-platform)
-- Agent logic, memory, sessions, config
-- MCP client/server protocol
-- JSON serialization, protocol handling
+### Verify an installation
 
-## Remaining Work
+```powershell
+jcode --version
+Get-Command jcode
+Get-FileHash (Get-Command jcode).Source -Algorithm SHA256
+```
 
-1. **Windows CI** - Add GitHub Actions Windows runner, test compilation and basic IPC
-2. **Shell tool** - Detect platform and use `cmd.exe` or `pwsh.exe` on Windows
-3. **Self-update** - Handle Windows exe replacement (can't overwrite running binary)
-4. **Testing** - Run full test suite on Windows
+Compare the hash with `SHA256SUMS` on the matching [GitHub release](https://github.com/1jehuang/jcode/releases/latest).
+
+After Authenticode signing is enabled, this must report `Valid`:
+
+```powershell
+Get-AuthenticodeSignature (Get-Command jcode).Source | Format-List Status,StatusMessage,SignerCertificate
+```
+
+## Microsoft Defender and SmartScreen
+
+Two different Windows warnings are commonly confused:
+
+- **Microsoft Defender SmartScreen** shows messages such as “Windows protected your PC” when a downloaded application is unsigned or has not accumulated enough publisher reputation. Authenticode signing with a trusted, timestamped certificate is the primary fix. Reputation still builds over time for a new publisher identity.
+- **Microsoft Defender Antivirus** reports a named threat or suspicious behavior. Signing helps establish provenance, but a heuristic false positive must also be submitted to Microsoft with the exact signed file and SHA-256 hash.
+
+Do not tell users to disable Defender, add exclusions, or bypass a named malware detection. First verify the release URL, checksum, and Authenticode signature. If a correctly signed official build is still detected, submit it through the [Microsoft Security Intelligence file submission portal](https://www.microsoft.com/wdsi/filesubmission) as a software developer false positive.
+
+### Heuristic-trigger reduction already in place
+
+The Windows setup is deliberately designed to avoid unnecessary suspicious behavior:
+
+- Release downloads are verified against `SHA256SUMS`.
+- Optional terminal and global-hotkey setup requires explicit consent.
+- The old hidden VBScript startup trampoline has been removed.
+- The hotkey listener uses a direct PowerShell shortcut with `RemoteSigned`, not `ExecutionPolicy Bypass`.
+- Release binaries are built on GitHub-hosted Windows runners and tested before publication.
+
+## Enable Authenticode signing
+
+The release workflow supports [Azure Artifact Signing](https://azure.microsoft.com/products/artifact-signing) with GitHub OIDC. This keeps the certificate private key in Microsoft's managed signing service instead of exporting it into a GitHub secret.
+
+This is a one-time owner setup and may require Azure billing and organization or identity verification:
+
+1. Create an Artifact Signing account and a public-trust certificate profile.
+2. Create a Microsoft Entra application or managed identity with a federated credential for `1jehuang/jcode` GitHub Actions.
+3. Grant it the **Artifact Signing Certificate Profile Signer** role on the certificate profile.
+4. Add these GitHub Actions secrets:
+   - `AZURE_CLIENT_ID`
+   - `AZURE_TENANT_ID`
+   - `AZURE_SUBSCRIPTION_ID`
+5. Add these GitHub Actions variables:
+   - `WINDOWS_SIGNING_ENDPOINT`, for example `https://eus.codesigning.azure.net/`
+   - `WINDOWS_SIGNING_ACCOUNT`
+   - `WINDOWS_SIGNING_CERTIFICATE_PROFILE`
+6. Push a test tag and confirm the `Sign and publish Windows assets` job signs both executables and that `Get-AuthenticodeSignature` returns `Valid`.
+7. Leave `WINDOWS_SIGNING_REQUIRED` unset or set it to `true`. Signing is required by default for Windows assets, so missing configuration or a signing outage omits Windows from that release while every other successful platform can still publish. Setting it to `false` is an explicit emergency override and is not suitable for an official Windows release.
+
+The workflow applies SHA-256 Authenticode signatures and RFC 3161 timestamps before packaging, checksum generation, and release upload. Both x64 and ARM64 executables are signed on a supported x64 Windows signing runner.
+
+Do not describe the Defender and SmartScreen rollout as complete until signing enforcement is active and a public release has a valid signature.
+
+## Release acceptance checklist
+
+For every release that changes Windows behavior:
+
+- [ ] Windows x64 CI build and targeted tests pass.
+- [ ] Windows lifecycle end-to-end tests pass.
+- [ ] x64 and ARM64 installer verification passes.
+- [ ] Both `.exe` files have a valid, timestamped Authenticode signature.
+- [ ] `SHA256SUMS` contains both Windows executables and archives.
+- [ ] A clean Windows 11 machine installs, launches, updates, and uninstalls successfully.
+- [ ] Defender Antivirus reports no named detection on the signed release.
+- [ ] SmartScreen identifies the expected publisher. Any low-reputation warning is tracked separately from malware detection.
+- [ ] The website Windows button points to a published asset and contains no preview or work-in-progress wording.
+- [ ] Release notes mention material Windows fixes or limitations.
+
+## Continuous integration
+
+Windows is covered by:
+
+- `.github/workflows/ci.yml`: release build, test compilation, targeted platform tests, runtime smoke tests, lifecycle end-to-end tests, installer verification, and PowerShell syntax checks.
+- `.github/workflows/windows-smoke.yml`: manually dispatchable x64 and ARM64 smoke validation.
+- `.github/workflows/release.yml`: x64 and ARM64 builds, managed signing required for Windows publication, signature verification, packaging, and checksums. Every platform and architecture publishes independently, so a Windows failure cannot block any successful Unix asset.
+
+## Architecture notes
+
+Unix domain sockets are replaced by Windows named pipes under `crates/jcode-base/src/transport/windows.rs`. Platform-specific filesystem, process, update, and replacement behavior is selected at compile time with `#[cfg(windows)]`, so Windows support does not add runtime branching to Unix builds.
+
+Windows launch-hotkey setup is implemented in `crates/jcode-setup-hints/src/windows_setup.rs` and is only installed after explicit user consent.
+
+## Reporting Windows problems
+
+Include the following in a GitHub issue:
+
+- Windows edition, version, and architecture
+- Jcode version from `jcode --version`
+- Installation method
+- Terminal and PowerShell version (`$PSVersionTable.PSVersion`)
+- Exact Defender or SmartScreen message
+- Defender threat name, if one was shown
+- SHA-256 from `Get-FileHash`
+- Authenticode status from `Get-AuthenticodeSignature`
+
+Do not upload private configuration, credentials, session transcripts, or `.jcode` authentication files.

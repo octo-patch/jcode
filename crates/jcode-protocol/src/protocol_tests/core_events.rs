@@ -13,6 +13,38 @@ fn test_request_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn test_soft_interrupt_images_roundtrip_and_legacy_default() -> Result<()> {
+    let req = Request::SoftInterrupt {
+        id: 2,
+        content: "look at this".to_string(),
+        images: vec![("image/png".to_string(), "ZmFrZQ==".to_string())],
+        urgent: true,
+    };
+    let json = serde_json::to_string(&req)?;
+    let decoded = parse_request_json(&json)?;
+    let Request::SoftInterrupt {
+        content,
+        images,
+        urgent,
+        ..
+    } = decoded
+    else {
+        return Err(anyhow!("wrong request type"));
+    };
+    assert_eq!(content, "look at this");
+    assert_eq!(images, vec![("image/png".to_string(), "ZmFrZQ==".to_string())]);
+    assert!(urgent);
+
+    let legacy = r#"{"type":"soft_interrupt","id":3,"content":"legacy","urgent":false}"#;
+    let decoded = parse_request_json(legacy)?;
+    let Request::SoftInterrupt { images, .. } = decoded else {
+        return Err(anyhow!("wrong legacy request type"));
+    };
+    assert!(images.is_empty());
+    Ok(())
+}
+
+#[test]
 fn test_compacted_history_request_roundtrip() -> Result<()> {
     let req = Request::GetCompactedHistory {
         id: 7,
@@ -36,27 +68,43 @@ fn test_compacted_history_request_roundtrip() -> Result<()> {
 fn test_notify_auth_changed_provider_hint_is_optional() -> Result<()> {
     let legacy = r#"{"type":"notify_auth_changed","id":9}"#;
     let decoded = parse_request_json(legacy)?;
-    let Request::NotifyAuthChanged { id, provider, auth } = decoded else {
+    let Request::NotifyAuthChanged {
+        id,
+        provider,
+        auth,
+        prefer_strongest,
+    } = decoded
+    else {
         return Err(anyhow!("wrong request type"));
     };
     assert_eq!(id, 9);
     assert_eq!(provider, None);
     assert_eq!(auth, None);
+    assert!(!prefer_strongest);
 
     let req = Request::NotifyAuthChanged {
         id: 10,
         provider: Some("azure-openai".to_string()),
         auth: None,
+        prefer_strongest: true,
     };
     let json = serde_json::to_string(&req)?;
     assert!(json.contains("\"provider\":\"azure-openai\""));
+    assert!(json.contains("\"prefer_strongest\":true"));
     let decoded = parse_request_json(&json)?;
-    let Request::NotifyAuthChanged { id, provider, auth } = decoded else {
+    let Request::NotifyAuthChanged {
+        id,
+        provider,
+        auth,
+        prefer_strongest,
+    } = decoded
+    else {
         return Err(anyhow!("wrong request type"));
     };
     assert_eq!(id, 10);
     assert_eq!(provider.as_deref(), Some("azure-openai"));
     assert_eq!(auth, None);
+    assert!(prefer_strongest);
     Ok(())
 }
 
@@ -72,6 +120,7 @@ fn test_notify_auth_changed_typed_auth_payload_roundtrip() -> Result<()> {
             expected_runtime: Some(RuntimeProviderKey::new("openai-compatible")),
             expected_catalog_namespace: Some(CatalogNamespace::new("cerebras")),
         }),
+        prefer_strongest: false,
     };
     let json = serde_json::to_string(&req)?;
     assert!(json.contains("\"provider\":\"cerebras\""));
@@ -80,11 +129,18 @@ fn test_notify_auth_changed_typed_auth_payload_roundtrip() -> Result<()> {
     assert!(json.contains("\"expected_catalog_namespace\":\"cerebras\""));
 
     let decoded = parse_request_json(&json)?;
-    let Request::NotifyAuthChanged { id, provider, auth } = decoded else {
+    let Request::NotifyAuthChanged {
+        id,
+        provider,
+        auth,
+        prefer_strongest,
+    } = decoded
+    else {
         return Err(anyhow!("wrong request type"));
     };
     assert_eq!(id, 11);
     assert_eq!(provider.as_deref(), Some("cerebras"));
+    assert!(!prefer_strongest);
     let auth = auth.expect("typed auth payload should roundtrip");
     assert_eq!(auth.provider.as_str(), "cerebras");
     assert_eq!(auth.credential_source, Some(AuthCredentialSource::ApiKeyFile));
@@ -285,6 +341,7 @@ fn test_side_pane_images_event_roundtrip() -> Result<()> {
             source: jcode_session_types::RenderedImageSource::ToolResult {
                 tool_name: "read".to_string(),
             },
+            anchor: None,
         }],
     };
     let json = encode_event(&event);
@@ -394,6 +451,7 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
         connection_type: Some("websocket".to_string()),
         status_detail: None,
         upstream_provider: None,
+        resolved_credential: None,
         reasoning_effort: None,
         service_tier: None,
         subagent_model: None,

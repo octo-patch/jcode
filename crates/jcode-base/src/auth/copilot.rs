@@ -6,19 +6,26 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, RwLock};
 
-static GITHUB_TOKEN_CACHE: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
+/// Cached GitHub token resolved from file or subprocess sources, with the
+/// time it was cached. Env vars are intentionally NOT served from this cache:
+/// they are cheap to read and must take effect immediately when they change.
+/// The TTL bounds how long a deleted/changed credential file keeps working.
+static GITHUB_TOKEN_CACHE: LazyLock<RwLock<Option<(String, std::time::Instant)>>> =
+    LazyLock::new(|| RwLock::new(None));
+const GITHUB_TOKEN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const FAILED_VALIDATION_AUTO_USE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn cached_github_token() -> Option<String> {
-    GITHUB_TOKEN_CACHE
-        .read()
-        .ok()
-        .and_then(|value| value.clone())
+    GITHUB_TOKEN_CACHE.read().ok().and_then(|value| {
+        value.as_ref().and_then(|(token, cached_at)| {
+            (cached_at.elapsed() < GITHUB_TOKEN_CACHE_TTL).then(|| token.clone())
+        })
+    })
 }
 
 fn cache_github_token(token: &str) {
     if let Ok(mut cache) = GITHUB_TOKEN_CACHE.write() {
-        *cache = Some(token.to_string());
+        *cache = Some((token.to_string(), std::time::Instant::now()));
     }
 }
 
@@ -147,18 +154,19 @@ impl CopilotApiToken {
 /// 7. trusted OpenCode/pi auth.json OAuth entries
 /// 8. optional `gh auth token` fallback when JCODE_COPILOT_ALLOW_GH_AUTH_TOKEN=1
 pub fn load_github_token() -> Result<String> {
-    if let Some(token) = cached_github_token() {
-        return Ok(token);
-    }
-
+    // Env vars first: cheap to read and they must win immediately when the
+    // user changes them, so they are never served from (or shadowed by) the
+    // file-source cache below.
     for env_key in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(env_key)
             && !token.trim().is_empty()
         {
-            let token = token.trim().to_string();
-            cache_github_token(&token);
-            return Ok(token);
+            return Ok(token.trim().to_string());
         }
+    }
+
+    if let Some(token) = cached_github_token() {
+        return Ok(token);
     }
 
     let config_path = ExternalCopilotAuthSource::ConfigJson.path();
@@ -595,34 +603,120 @@ fn normalize_github_host_key(host: &str) -> Option<String> {
     }
 }
 
+/// Maximum attempts for the Copilot token exchange when GitHub returns a
+/// transient 5xx (e.g. a 502 from a bad gateway).
+const TOKEN_EXCHANGE_MAX_ATTEMPTS: u32 = 5;
+
+/// Backoff delay (milliseconds) before retry attempt `attempt` (1-based count
+/// of completed attempts). Exponential: 500ms, 1s, 2s, capped at 4s.
+pub(crate) fn token_exchange_backoff_ms(attempt: u32) -> u64 {
+    let base: u64 = 500;
+    base.saturating_mul(1u64 << attempt.saturating_sub(1).min(6))
+        .min(4_000)
+}
+
+/// Whether an HTTP status from the token exchange is worth retrying.
+pub(crate) fn token_exchange_retryable_status(status: u16) -> bool {
+    (500..600).contains(&status)
+}
+
 /// Exchange a GitHub OAuth token for a short-lived Copilot API bearer token.
+///
+/// GitHub's token service occasionally returns transient 5xx responses
+/// (see issue #548); those are retried with exponential backoff before
+/// failing. 4xx responses (bad/unauthorized token) fail immediately.
 pub async fn exchange_github_token(
     client: &reqwest::Client,
     github_token: &str,
 ) -> Result<CopilotApiToken> {
-    let resp = client
-        .get(COPILOT_TOKEN_URL)
-        .header("Authorization", format!("Token {}", github_token))
-        .header("User-Agent", EDITOR_VERSION)
-        .send()
-        .await
-        .context("Failed to exchange GitHub token for Copilot token")?;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let resp = client
+            .get(COPILOT_TOKEN_URL)
+            .header("Authorization", format!("Token {}", github_token))
+            .header("User-Agent", EDITOR_VERSION)
+            .send()
+            .await
+            .context("Failed to exchange GitHub token for Copilot token")?;
 
-    if !resp.status().is_success() {
         let status = resp.status();
+        if status.is_success() {
+            let token_resp: CopilotTokenResponse = resp
+                .json()
+                .await
+                .context("Failed to parse Copilot token response")?;
+
+            return Ok(CopilotApiToken {
+                token: token_resp.token,
+                expires_at: token_resp.expires_at,
+            });
+        }
+
+        let retryable = token_exchange_retryable_status(status.as_u16());
+        if retryable && attempt < TOKEN_EXCHANGE_MAX_ATTEMPTS {
+            let delay_ms = token_exchange_backoff_ms(attempt);
+            crate::logging::warn(&format!(
+                "Copilot token exchange got transient HTTP {}, retrying in {}ms (attempt {}/{})",
+                status, delay_ms, attempt, TOKEN_EXCHANGE_MAX_ATTEMPTS
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            continue;
+        }
+
         let body = crate::util::http_error_body(resp, "HTTP error").await;
+        if retryable {
+            anyhow::bail!(
+                "Copilot token exchange failed after {} attempts (HTTP {}): {}",
+                attempt,
+                status,
+                body
+            );
+        }
         anyhow::bail!("Copilot token exchange failed (HTTP {}): {}", status, body);
     }
+}
 
-    let token_resp: CopilotTokenResponse = resp
-        .json()
-        .await
-        .context("Failed to parse Copilot token response")?;
+/// Run a live Copilot auth check and persist the result as a validation record.
+///
+/// This is the only definitive way to know a discovered GitHub token is actually
+/// usable for Copilot: a token can exist locally while the account is banned,
+/// not entitled, or otherwise rejected by the Copilot token service. We exchange
+/// the GitHub OAuth token for a Copilot bearer token (the same call the live
+/// provider makes) and record success/failure so presence-based readiness
+/// surfaces (`validation_failure_blocks_auto_use`, `check_fast`) reflect reality.
+///
+/// Returns `Ok(())` when the token exchange succeeds, or the underlying error
+/// (whose message embeds the HTTP status, e.g. `HTTP 401`/`HTTP 403`) otherwise.
+pub async fn verify_copilot_credentials_live(client: &reqwest::Client) -> Result<()> {
+    let github_token = load_github_token()?;
+    let result = exchange_github_token(client, &github_token).await;
 
-    Ok(CopilotApiToken {
-        token: token_resp.token,
-        expires_at: token_resp.expires_at,
-    })
+    let summary = match &result {
+        Ok(_) => "copilot token exchange ok".to_string(),
+        Err(err) => format!("{err}"),
+    };
+    let record = crate::auth::validation::ProviderValidationRecord {
+        checked_at_ms: chrono::Utc::now().timestamp_millis(),
+        success: result.is_ok(),
+        provider_smoke_ok: Some(result.is_ok()),
+        tool_smoke_ok: None,
+        summary,
+    };
+    // Best-effort: a failure to persist must not change the live result.
+    let _ = crate::auth::validation::save("copilot", record);
+    // Refresh the auth snapshot so readiness surfaces pick up the new record.
+    crate::auth::AuthStatus::invalidate_cache();
+
+    result.map(|_| ())
+}
+
+/// Convenience wrapper around [`verify_copilot_credentials_live`] that builds a
+/// short-lived HTTP client. Useful for callers (e.g. the TUI crate) that do not
+/// depend on `reqwest` directly.
+pub async fn verify_copilot_credentials_live_default() -> Result<()> {
+    let client = reqwest::Client::new();
+    verify_copilot_credentials_live(&client).await
 }
 
 /// Initiate GitHub OAuth device flow for Copilot authentication.

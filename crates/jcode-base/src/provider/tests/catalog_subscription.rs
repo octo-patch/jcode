@@ -58,7 +58,22 @@ fn test_openai_live_catalog_replaces_static_fallback_list() {
     populate_account_models(vec!["gpt-5.4-live-only".to_string()]);
     let models = known_openai_model_ids();
 
-    assert_eq!(models, vec!["gpt-5.4-live-only".to_string()]);
+    assert_eq!(
+        models[..2],
+        [
+            "gpt-5.4-live-only".to_string(),
+            jcode_provider_core::CHATGPT_WEB_MODEL.to_string()
+        ]
+    );
+    // The only entries allowed past the live catalog are the platform-API-only
+    // GPT Pro models, appended when an OPENAI_API_KEY is configured on the
+    // machine running the tests.
+    for extra in &models[2..] {
+        assert!(
+            jcode_provider_core::is_openai_api_only_pro_model(extra),
+            "unexpected non-pro extra model '{extra}' in live catalog list"
+        );
+    }
 
     crate::auth::codex::set_active_account_override(None);
 }
@@ -69,19 +84,24 @@ fn test_anthropic_live_catalog_replaces_static_fallback_list() {
     crate::env::remove_var("ANTHROPIC_API_KEY");
     crate::auth::claude::set_active_account_override(Some("work".to_string()));
 
+    // Use a model the static classifier does not recognize so this exercises
+    // the generic catalog-driven path (>=1M cached limit => synthesized [1m]
+    // alias). The id must carry no parseable version, because any versioned
+    // Claude id is now classified statically (>=5.0 => native 1M, which
+    // deliberately gets no redundant [1m] alias).
     populate_context_limits(
-        [("claude-opus-4-7".to_string(), 1_048_576)]
+        [("claude-nebula-preview".to_string(), 1_048_576)]
             .into_iter()
             .collect(),
     );
-    populate_anthropic_models(vec!["claude-opus-4-7".to_string()]);
+    populate_anthropic_models(vec!["claude-nebula-preview".to_string()]);
     let models = known_anthropic_model_ids();
 
     assert_eq!(
         models,
         vec![
-            "claude-opus-4-7".to_string(),
-            "claude-opus-4-7[1m]".to_string()
+            "claude-nebula-preview".to_string(),
+            "claude-nebula-preview[1m]".to_string()
         ]
     );
 
@@ -97,6 +117,12 @@ fn test_openai_model_catalog_hydrates_from_disk_cache() {
             context_limits: [("openai-disk-only-model".to_string(), 424_242)]
                 .into_iter()
                 .collect(),
+            reasoning_efforts: [(
+                "openai-disk-only-model".to_string(),
+                vec!["low".to_string(), "max".to_string()],
+            )]
+            .into_iter()
+            .collect(),
         });
 
         assert_eq!(
@@ -106,6 +132,11 @@ fn test_openai_model_catalog_hydrates_from_disk_cache() {
         assert_eq!(
             context_limit_for_model("openai-disk-only-model"),
             Some(424_242)
+        );
+        assert_eq!(
+            cached_openai_reasoning_efforts()
+                .and_then(|efforts| efforts.get("openai-disk-only-model").cloned()),
+            Some(vec!["low".to_string(), "max".to_string()])
         );
 
         crate::auth::codex::set_active_account_override(None);
@@ -118,8 +149,8 @@ fn test_anthropic_model_catalog_hydrates_from_disk_cache() {
         crate::env::remove_var("ANTHROPIC_API_KEY");
         crate::auth::claude::set_active_account_override(Some("disk-claude".to_string()));
         persist_anthropic_model_catalog(&AnthropicModelCatalog {
-            available_models: vec!["claude-opus-4-7".to_string()],
-            context_limits: [("claude-opus-4-7".to_string(), 1_048_576)]
+            available_models: vec!["claude-nebula-preview".to_string()],
+            context_limits: [("claude-nebula-preview".to_string(), 1_048_576)]
                 .into_iter()
                 .collect(),
         });
@@ -127,11 +158,14 @@ fn test_anthropic_model_catalog_hydrates_from_disk_cache() {
         assert_eq!(
             cached_anthropic_model_ids(),
             Some(vec![
-                "claude-opus-4-7".to_string(),
-                "claude-opus-4-7[1m]".to_string()
+                "claude-nebula-preview".to_string(),
+                "claude-nebula-preview[1m]".to_string()
             ])
         );
-        assert_eq!(context_limit_for_model("claude-opus-4-7"), Some(1_048_576));
+        assert_eq!(
+            context_limit_for_model("claude-nebula-preview"),
+            Some(1_048_576)
+        );
 
         crate::auth::claude::set_active_account_override(None);
     });
@@ -215,34 +249,118 @@ fn test_subscription_model_guard_allows_only_curated_models_when_enabled() {
     crate::subscription_catalog::clear_runtime_env();
     crate::subscription_catalog::apply_runtime_env();
 
-    assert!(ensure_model_allowed_for_subscription("moonshotai/kimi-k2.5").is_ok());
-    assert!(ensure_model_allowed_for_subscription("kimi/k2.5").is_ok());
+    assert!(ensure_model_allowed_for_subscription("claude-opus-4-8").is_ok());
+    assert!(ensure_model_allowed_for_subscription("opus 4.8").is_ok());
+    assert!(ensure_model_allowed_for_subscription("claude-sonnet-4-6").is_ok());
+    assert!(ensure_model_allowed_for_subscription("sonnet 4.6").is_ok());
+    assert!(ensure_model_allowed_for_subscription("gpt-5.5").is_ok());
     assert!(ensure_model_allowed_for_subscription("gpt-5.4").is_err());
 
     crate::subscription_catalog::clear_runtime_env();
 }
 
 #[test]
+fn test_subscription_model_guard_gates_ultra_models_on_plus_tier() {
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", temp_home.path().to_string_lossy().to_string());
+    crate::env::remove_var(crate::subscription_catalog::JCODE_TIER_ENV);
+    crate::subscription_catalog::clear_runtime_env();
+    crate::subscription_catalog::apply_runtime_env();
+
+    // Unknown/absent tier behaves like Plus: Sol is available, while the
+    // Ultra-tier Fable model is rejected with an upgrade hint.
+    assert!(ensure_model_allowed_for_subscription("gpt-5.6-sol").is_ok());
+    let error = ensure_model_allowed_for_subscription("claude-fable-5")
+        .expect_err("fable should be gated on Plus");
+    assert!(error.to_string().contains("Ultra"), "{error}");
+    assert!(error.to_string().contains("Upgrade"), "{error}");
+
+    // Ultra tier unlocks Fable too.
+    crate::env::set_var(crate::subscription_catalog::JCODE_TIER_ENV, "ultra");
+    assert!(ensure_model_allowed_for_subscription("claude-fable-5").is_ok());
+    assert!(ensure_model_allowed_for_subscription("sol").is_ok());
+
+    crate::env::remove_var(crate::subscription_catalog::JCODE_TIER_ENV);
+    crate::env::remove_var("JCODE_HOME");
+    crate::subscription_catalog::clear_runtime_env();
+}
+
+#[test]
 fn test_filtered_display_models_respects_curated_subscription_catalog() {
     let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::tempdir().expect("temp home");
+    crate::env::set_var("JCODE_HOME", temp_home.path().to_string_lossy().to_string());
+    crate::env::remove_var(crate::subscription_catalog::JCODE_TIER_ENV);
     crate::subscription_catalog::clear_runtime_env();
     crate::subscription_catalog::apply_runtime_env();
 
     let filtered = filtered_display_models(vec![
         "gpt-5.4".to_string(),
-        "moonshotai/kimi-k2.5".to_string(),
-        "openrouter/healer-alpha".to_string(),
+        "claude-opus-4-8".to_string(),
+        "claude-sonnet-4-6".to_string(),
+        "gpt-5.5".to_string(),
+        "gpt-5.6-sol".to_string(),
+        "claude-fable-5".to_string(),
     ]);
 
+    // Plus (default) tier includes Sol and hides only Ultra-tier Fable.
     assert_eq!(
         filtered,
         vec![
-            "moonshotai/kimi-k2.5".to_string(),
-            "openrouter/healer-alpha".to_string()
+            "claude-opus-4-8".to_string(),
+            "claude-sonnet-4-6".to_string(),
+            "gpt-5.5".to_string(),
+            "gpt-5.6-sol".to_string(),
         ]
     );
 
+    crate::env::set_var(crate::subscription_catalog::JCODE_TIER_ENV, "ultra");
+    let filtered = filtered_display_models(vec![
+        "claude-fable-5".to_string(),
+        "gpt-5.6-sol".to_string(),
+        "gpt-5.4".to_string(),
+    ]);
+    assert_eq!(
+        filtered,
+        vec!["claude-fable-5".to_string(), "gpt-5.6-sol".to_string()]
+    );
+
+    crate::env::remove_var(crate::subscription_catalog::JCODE_TIER_ENV);
+    crate::env::remove_var("JCODE_HOME");
     crate::subscription_catalog::clear_runtime_env();
+}
+
+#[test]
+fn test_remote_jcode_subscription_fallback_keeps_managed_route_identity() {
+    let models = vec![
+        "claude-opus-4-8".to_string(),
+        "claude-sonnet-4-6".to_string(),
+        "gpt-5.5".to_string(),
+        "gpt-5.6-sol".to_string(),
+    ];
+    let routes = remote_model_routes_fallback(
+        Some(crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME),
+        &models,
+    );
+
+    assert_eq!(
+        routes
+            .iter()
+            .map(|route| route.model.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "gpt-5.5",
+            "gpt-5.6-sol",
+        ]
+    );
+    assert!(routes.iter().all(|route| {
+        route.provider == crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME
+            && route.api_method == crate::subscription_catalog::JCODE_ROUTE_API_METHOD
+            && route.available
+    }));
 }
 
 #[test]
@@ -255,9 +373,9 @@ fn test_subscription_filters_do_not_activate_from_saved_credentials_alone() {
     assert_eq!(
         filtered_display_models(vec![
             "gpt-5.4".to_string(),
-            "moonshotai/kimi-k2.5".to_string(),
+            "claude-opus-4-8".to_string(),
         ]),
-        vec!["gpt-5.4".to_string(), "moonshotai/kimi-k2.5".to_string()]
+        vec!["gpt-5.4".to_string(), "claude-opus-4-8".to_string()]
     );
 
     crate::env::remove_var(crate::subscription_catalog::JCODE_API_KEY_ENV);

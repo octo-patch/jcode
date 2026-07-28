@@ -1,109 +1,77 @@
 import Foundation
 
-public struct PairResponse: Codable, Sendable {
-    public let token: String
-    public let serverName: String
-    public let serverVersion: String
-
-    enum CodingKeys: String, CodingKey {
-        case token
-        case serverName = "server_name"
-        case serverVersion = "server_version"
-    }
-}
-
-public struct PairError: Codable, Sendable {
-    public let error: String
-}
-
-public struct HealthResponse: Codable, Sendable {
-    public let status: String
-    public let version: String
-    public let gateway: Bool
-}
-
+/// Exchanges a pairing code for a long-lived auth token via `POST /pair`.
 public struct PairingClient: Sendable {
-    public let host: String
-    public let port: UInt16
+    public struct Response: Equatable, Sendable {
+        public var token: String
+        public var serverName: String
+        public var serverVersion: String
 
-    public init(host: String, port: UInt16 = 7643) {
-        self.host = host
-        self.port = port
-    }
-
-    private var baseURL: URL {
-        var components = URLComponents()
-        components.scheme = "http"
-        components.host = host
-        components.port = Int(port)
-        return components.url!
-    }
-
-    private static let insecureSession: URLSession = {
-        let config = URLSessionConfiguration.default
-        return URLSession(configuration: config, delegate: InsecureDelegate.shared, delegateQueue: nil)
-    }()
-
-    public func checkHealth() async throws -> HealthResponse {
-        let url = baseURL.appendingPathComponent("health")
-        let (data, response) = try await Self.insecureSession.data(from: url)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw PairingError.serverUnreachable
+        public init(token: String, serverName: String, serverVersion: String) {
+            self.token = token
+            self.serverName = serverName
+            self.serverVersion = serverVersion
         }
-        return try JSONDecoder().decode(HealthResponse.self, from: data)
+    }
+
+    public enum PairingError: Error, Equatable {
+        case invalidCode(String)
+        case serverError(statusCode: Int, message: String)
+        case invalidResponse
+    }
+
+    private let session: URLSession
+
+    public init(session: URLSession = .shared) {
+        self.session = session
     }
 
     public func pair(
+        gateway: Gateway,
         code: String,
-        deviceId: String,
-        deviceName: String,
-        apnsToken: String? = nil
-    ) async throws -> PairResponse {
-        let url = baseURL.appendingPathComponent("pair")
-        var request = URLRequest(url: url)
+        deviceID: String,
+        deviceName: String
+    ) async throws -> Response {
+        var request = URLRequest(url: gateway.pairURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        var body: [String: String] = [
+        request.timeoutInterval = 15
+        let body: [String: String] = [
             "code": code,
-            "device_id": deviceId,
+            "device_id": deviceID,
             "device_name": deviceName,
         ]
-        if let apns = apnsToken {
-            body["apns_token"] = apns
-        }
-        request.httpBody = try JSONEncoder().encode(body)
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await Self.insecureSession.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
-            throw PairingError.serverUnreachable
+            throw PairingError.invalidResponse
         }
-
-        switch http.statusCode {
-        case 200:
-            return try JSONDecoder().decode(PairResponse.self, from: data)
-        case 401:
-            let err = try? JSONDecoder().decode(PairError.self, from: data)
-            throw PairingError.invalidCode(err?.error ?? "Invalid or expired pairing code")
-        default:
-            let err = try? JSONDecoder().decode(PairError.self, from: data)
-            throw PairingError.serverError(err?.error ?? "HTTP \(http.statusCode)")
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard http.statusCode == 200 else {
+            let message = object["error"] as? String ?? "HTTP \(http.statusCode)"
+            if http.statusCode == 401 {
+                throw PairingError.invalidCode(message)
+            }
+            throw PairingError.serverError(statusCode: http.statusCode, message: message)
         }
+        guard let token = object["token"] as? String, !token.isEmpty else {
+            throw PairingError.invalidResponse
+        }
+        return Response(
+            token: token,
+            serverName: object["server_name"] as? String ?? "jcode",
+            serverVersion: object["server_version"] as? String ?? "unknown"
+        )
     }
-}
 
-final class InsecureDelegate: NSObject, URLSessionDelegate, Sendable {
-    static let shared = InsecureDelegate()
-    func urlSession(
-        _ session: URLSession,
-        didReceive challenge: URLAuthenticationChallenge
-    ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
-        (.useCredential, URLCredential(trust: challenge.protectionSpace.serverTrust!))
+    /// Probes `GET /health`. Returns true when the gateway is reachable.
+    public func checkHealth(gateway: Gateway) async -> Bool {
+        var request = URLRequest(url: gateway.healthURL)
+        request.timeoutInterval = 5
+        guard let (_, response) = try? await session.data(for: request),
+            let http = response as? HTTPURLResponse
+        else { return false }
+        return http.statusCode == 200
     }
-}
-
-public enum PairingError: Error, Sendable {
-    case serverUnreachable
-    case invalidCode(String)
-    case serverError(String)
 }

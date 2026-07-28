@@ -1,19 +1,16 @@
 use super::{
-    ClientConnectionInfo, SwarmEvent, SwarmEventType, SwarmMember, SwarmState, VersionedPlan,
-    broadcast_swarm_plan, persist_swarm_state_for, record_swarm_event,
+    ClientConnectionInfo, FileTouchService, SwarmEvent, SwarmEventType, SwarmMember, SwarmState,
+    VersionedPlan, broadcast_swarm_plan, persist_swarm_state_for, record_swarm_event,
 };
 use crate::agent::Agent;
 use crate::protocol::{
     AgentStatusSnapshot, NotificationType, PlanGraphStatus, ServerEvent, SessionActivitySnapshot,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
-
-type SessionFilesTouched = Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>;
 
 pub(super) struct CommResyncPlanContext<'a> {
     pub(super) client_event_tx: &'a mpsc::UnboundedSender<ServerEvent>,
@@ -63,6 +60,87 @@ fn live_activity_snapshot(
         })
 }
 
+/// Recent-token lookback window used when reporting per-agent churn in
+/// `swarm list`. Short enough to reflect "what is this agent doing right now".
+pub(super) const SWARM_LIST_TOKEN_WINDOW_SECS: u64 = 10;
+
+/// Runtime extras for a swarm member, gathered without holding the agent lock
+/// for long. Used to enrich the `swarm list` roster with live activity,
+/// provider/model, token churn, turn count, and todo progress.
+#[derive(Default)]
+pub(super) struct MemberRuntimeExtras {
+    pub(super) activity: Option<SessionActivitySnapshot>,
+    pub(super) provider_name: Option<String>,
+    pub(super) provider_model: Option<String>,
+    pub(super) turn_count: Option<u64>,
+    pub(super) recent_total_tokens: Option<u64>,
+    pub(super) recent_output_tokens: Option<u64>,
+    pub(super) recent_window_secs: Option<u64>,
+    pub(super) cumulative_total_tokens: Option<u64>,
+    pub(super) last_activity_age_secs: Option<u64>,
+    pub(super) todos_completed: Option<usize>,
+    pub(super) todos_total: Option<usize>,
+}
+
+/// Gather live runtime extras for a single member session.
+///
+/// `member_is_running` is used as a fallback "processing" hint when no live
+/// client connection is reporting activity (e.g. headless sessions).
+pub(super) async fn member_runtime_extras(
+    session_id: &str,
+    member_is_running: bool,
+    sessions: &SessionAgents,
+    client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+) -> MemberRuntimeExtras {
+    let activity = {
+        let connections = client_connections.read().await;
+        live_activity_snapshot(&connections, session_id, member_is_running)
+    };
+
+    let (provider_name, provider_model) = {
+        let agent_sessions = sessions.read().await;
+        if let Some(agent) = agent_sessions.get(session_id) {
+            // Never block on a busy agent: token churn and turns come from the
+            // lock-free metrics registry, so a missing provider name here just
+            // means the agent is mid-turn.
+            if let Ok(agent) = agent.try_lock() {
+                (Some(agent.provider_name()), Some(agent.provider_model()))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    };
+
+    let metrics = crate::session_metrics::snapshot(
+        session_id,
+        std::time::Duration::from_secs(SWARM_LIST_TOKEN_WINDOW_SECS),
+    );
+
+    let (todos_completed, todos_total) = match crate::todo::load_todos(session_id) {
+        Ok(todos) if !todos.is_empty() => {
+            let completed = todos.iter().filter(|t| t.status == "completed").count();
+            (Some(completed), Some(todos.len()))
+        }
+        _ => (None, None),
+    };
+
+    MemberRuntimeExtras {
+        activity,
+        provider_name,
+        provider_model,
+        turn_count: metrics.map(|m| m.turns),
+        recent_total_tokens: metrics.map(|m| m.recent_total_tokens),
+        recent_output_tokens: metrics.map(|m| m.recent_output_tokens),
+        recent_window_secs: metrics.map(|_| SWARM_LIST_TOKEN_WINDOW_SECS),
+        cumulative_total_tokens: metrics.map(|m| m.cumulative_total_tokens),
+        last_activity_age_secs: metrics.and_then(|m| m.last_activity_age_secs),
+        todos_completed,
+        todos_total,
+    }
+}
+
 async fn ensure_same_swarm_access(
     id: u64,
     req_session_id: &str,
@@ -109,7 +187,7 @@ async fn can_read_full_context(
     let members = swarm_members.read().await;
     members
         .get(req_session_id)
-        .map(|member| member.role == "coordinator" || member.role == "worktree_manager")
+        .map(|member| member.role == "coordinator")
         .unwrap_or(false)
 }
 
@@ -175,7 +253,7 @@ pub(super) async fn handle_comm_status(
     sessions: &SessionAgents,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    files_touched_by_session: &SessionFilesTouched,
+    file_touch: &FileTouchService,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     if !ensure_same_swarm_access(
@@ -201,17 +279,9 @@ pub(super) async fn handle_comm_status(
             return;
         };
 
-        let files_touched = {
-            let touches = files_touched_by_session.read().await;
-            let mut files: Vec<String> = touches
-                .get(&target_session)
-                .into_iter()
-                .flat_map(|paths| paths.iter())
-                .map(|path| path.display().to_string())
-                .collect();
-            files.sort();
-            files
-        };
+        let files_touched = file_touch
+            .sorted_file_strings_for_session(&target_session)
+            .await;
 
         let activity = {
             let connections = client_connections.read().await;
@@ -241,6 +311,7 @@ pub(super) async fn handle_comm_status(
             is_headless: Some(member.is_headless),
             live_attachments: Some(member.event_txs.len()),
             status_age_secs: Some(member.last_status_change.elapsed().as_secs()),
+            last_activity_age_secs: crate::session_metrics::last_activity_age_secs(&target_session),
             joined_age_secs: Some(member.joined_at.elapsed().as_secs()),
             files_touched,
             activity,
@@ -381,6 +452,7 @@ pub(super) async fn handle_comm_resync_plan(
                     notification_type: NotificationType::Message {
                         scope: Some("plan".to_string()),
                         channel: None,
+                        tldr: None,
                     },
                     message: format!(
                         "Plan attached to this session (v{}, {} items).",

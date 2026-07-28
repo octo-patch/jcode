@@ -192,6 +192,21 @@ fn insert_mode_autocompletes_workspace_fuzzy_slash_abbreviation() {
 }
 
 #[test]
+fn insert_mode_autocompletes_workspace_slash_command_with_transposed_typo() {
+    let mut workspace = Workspace::fake();
+    workspace.handle_key(KeyInput::Character("i".to_string()));
+    workspace.handle_key(KeyInput::Character("/modle".to_string()));
+
+    assert_eq!(
+        workspace.handle_key(KeyInput::Autocomplete),
+        KeyOutcome::Redraw
+    );
+
+    assert_eq!(workspace.draft, "/model");
+    assert_eq!(workspace.draft_cursor, "/model".len());
+}
+
+#[test]
 fn insert_mode_slash_resume_loads_sessions_instead_of_sending_prompt() {
     let mut workspace = Workspace::fake();
     workspace.handle_key(KeyInput::Character("i".to_string()));

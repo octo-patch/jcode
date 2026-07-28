@@ -10,6 +10,96 @@ pub struct TuiRuntimeState {
     focus_change: bool,
 }
 
+const INHERITED_MODES_ENV: &str = "JCODE_TUI_INHERITED_MODES";
+const INHERITED_THEME_ENV: &str = "JCODE_TUI_INHERITED_THEME";
+
+// Crossterm's Windows implementation enables Win32 console mouse input but does
+// not emit the VT mouse-tracking modes. Windows Terminal and other ConPTY hosts
+// use those VT modes to decide whether a wheel detent is a mouse event or should
+// be translated into Up/Down keys in the alternate screen. Without this second
+// signal, wheel scrolling can accidentally browse prompt history instead of the
+// chat transcript even though crossterm reports mouse capture as enabled.
+#[cfg(any(windows, test))]
+const WINDOWS_VT_MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+#[cfg(any(windows, test))]
+const WINDOWS_VT_MOUSE_DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+#[cfg(windows)]
+fn sync_windows_vt_mouse_capture(enabled: bool) -> io::Result<()> {
+    let sequence = if enabled {
+        WINDOWS_VT_MOUSE_ENABLE
+    } else {
+        WINDOWS_VT_MOUSE_DISABLE
+    };
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(sequence)?;
+    stdout.flush()
+}
+
+#[cfg(not(windows))]
+fn sync_windows_vt_mouse_capture(_enabled: bool) -> io::Result<()> {
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InheritedTerminalModes {
+    mouse_capture: bool,
+    keyboard_enhanced: bool,
+    focus_change: bool,
+}
+
+impl InheritedTerminalModes {
+    fn encode(self) -> String {
+        format!(
+            "mouse={},keyboard={},focus={}",
+            u8::from(self.mouse_capture),
+            u8::from(self.keyboard_enhanced),
+            u8::from(self.focus_change)
+        )
+    }
+
+    fn decode(value: &str) -> Option<Self> {
+        let mut modes = Self {
+            mouse_capture: false,
+            keyboard_enhanced: false,
+            focus_change: false,
+        };
+        let mut seen = 0u8;
+        for field in value.split(',') {
+            let (name, raw) = field.split_once('=')?;
+            let enabled = match raw {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            };
+            match name {
+                "mouse" => {
+                    modes.mouse_capture = enabled;
+                    seen |= 1;
+                }
+                "keyboard" => {
+                    modes.keyboard_enhanced = enabled;
+                    seen |= 2;
+                }
+                "focus" => {
+                    modes.focus_change = enabled;
+                    seen |= 4;
+                }
+                _ => return None,
+            }
+        }
+        (seen == 7).then_some(modes)
+    }
+}
+
+fn has_terminal_exec_handoff(
+    is_resuming: bool,
+    inherited_modes: Option<InheritedTerminalModes>,
+) -> bool {
+    is_resuming && inherited_modes.is_some()
+}
+
 /// RAII guard that guarantees the terminal is restored to a sane state when the
 /// TUI runtime ends, even if the run loop returns an error or unwinds via panic.
 ///
@@ -51,6 +141,9 @@ impl TuiRuntimeGuard {
     /// to exec a follow-up process (reload/rebuild/update), in which case the
     /// next process inherits the terminal modes.
     pub fn finish_for_run_result(mut self, run_result: &crate::tui::RunResult, extra_exec: bool) {
+        if run_result_will_exec(run_result, extra_exec) {
+            export_tui_exec_handoff(&self.state);
+        }
         cleanup_tui_runtime_for_run_result(&self.state, run_result, extra_exec);
         self.armed = false;
     }
@@ -78,6 +171,16 @@ pub fn get_current_session() -> Option<String> {
     crate::get_current_session()
 }
 
+/// Whether a panic in this process should relabel the on-disk session as crashed.
+///
+/// Only an `Active` session can legitimately make that transition. A dying
+/// client (closed terminal window, dropped SSH) must not relabel a session that
+/// the shared server still owns, nor write its stale snapshot over the server's
+/// newer one. See #599; `mark_current_session_crashed` already had this guard.
+fn should_record_panic_as_crash(status: &session::SessionStatus) -> bool {
+    matches!(status, session::SessionStatus::Active)
+}
+
 pub fn install_panic_hook() {
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -90,7 +193,9 @@ pub fn install_panic_hook() {
                 telemetry::record_crash(&provider, &model, telemetry::SessionEndReason::Panic);
             }
 
-            if let Ok(mut session) = session::Session::load(&session_id) {
+            if let Ok(mut session) = session::Session::load(&session_id)
+                && should_record_panic_as_crash(&session.status)
+            {
                 session.mark_crashed(Some(format!("Panic: {}", info)));
                 let _ = session.save();
             }
@@ -131,29 +236,39 @@ pub fn show_crash_resume_hint() {
     let (id, name) = &crashed[0];
     let session_label = id::extract_session_name(id).unwrap_or(name.as_str());
 
+    // Crash hints print outside the TUI, possibly on a console that never had
+    // VT processing enabled (issue #498), so gate the color codes.
+    let ansi = crate::console::stderr_supports_ansi();
+    let (yellow, bold, reset) = if ansi {
+        ("\x1b[33m", "\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+
     if crashed.len() == 1 {
-        eprintln!(
-            "\x1b[33m💥 Session \x1b[1m{}\x1b[0m\x1b[33m crashed. Resume with:\x1b[0m  jcode --resume {}",
+        let message = format!(
+            "{yellow}💥 Session {bold}{}{reset}{yellow} crashed. Resume with:{reset}  jcode --resume {}",
             session_label, id
         );
+        eprintln!("{}", crate::output_style::terminal_text(&message));
     } else {
-        eprintln!(
-            "\x1b[33m💥 {} sessions crashed recently. Most recent: \x1b[1m{}\x1b[0m",
+        let message = format!(
+            "{yellow}💥 {} sessions crashed recently. Most recent: {bold}{}{reset}",
             crashed.len(),
             session_label
         );
-        eprintln!("\x1b[33m   Resume with:\x1b[0m  jcode --resume {}", id);
-        eprintln!("\x1b[33m   List all:\x1b[0m     jcode --resume");
+        eprintln!("{}", crate::output_style::terminal_text(&message));
+        eprintln!("{yellow}   Resume with:{reset}  jcode --resume {}", id);
+        eprintln!("{yellow}   List all:{reset}     jcode --resume");
     }
     eprintln!();
 }
 
-fn init_tui_terminal() -> Result<ratatui::DefaultTerminal> {
+fn init_tui_terminal(inherited_terminal: bool) -> Result<ratatui::DefaultTerminal> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("jcode TUI requires an interactive terminal (stdin/stdout must be a TTY)");
     }
-    let is_resuming = std::env::var("JCODE_RESUMING").is_ok();
-    if is_resuming {
+    if inherited_terminal {
         init_tui_terminal_resume()
     } else {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(ratatui::init)).map_err(|payload| {
@@ -166,54 +281,148 @@ fn init_tui_terminal() -> Result<ratatui::DefaultTerminal> {
 }
 
 pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)> {
-    let terminal = init_tui_terminal()?;
+    let is_resuming = std::env::var_os("JCODE_RESUMING").is_some();
+    let inherited_theme = std::env::var(INHERITED_THEME_ENV).ok();
+    let inherited_modes_raw = std::env::var(INHERITED_MODES_ENV).ok();
+    let inherited_modes = inherited_modes_raw
+        .as_deref()
+        .and_then(InheritedTerminalModes::decode);
+    // JCODE_RESUMING describes the session lifecycle, but only a valid modes
+    // handoff proves the previous process deliberately left the terminal live
+    // across exec. A restart used to restore the terminal before exec while the
+    // new process still took the resume path, leaving it on the primary screen
+    // without mouse capture.
+    let inherited_terminal = has_terminal_exec_handoff(is_resuming, inherited_modes);
+    if inherited_terminal {
+        // OSC terminal queries are unsafe here because the previous process
+        // deliberately exec'd without leaving raw mode or the alternate screen.
+        crate::tui::theme_detect::init_theme_mode_for_resume(inherited_theme.as_deref());
+    } else {
+        // The OSC 11 query needs the cooked terminal and must happen before init.
+        crate::tui::theme_detect::init_theme_mode();
+    }
+    let terminal = init_tui_terminal(inherited_terminal)?;
     crate::tui::mermaid::install_jcode_mermaid_hooks();
     crate::tui::markdown::install_jcode_markdown_hooks();
     crate::tui::mermaid::init_picker();
 
     let perf_policy = crate::perf::tui_policy();
-    let mouse_capture = perf_policy.enable_mouse_capture;
-    let focus_change = perf_policy.enable_focus_change;
-    let keyboard_enhanced = if perf_policy.enable_keyboard_enhancement {
-        tui::enable_keyboard_enhancement()
+    // These private handoff values apply only to this exec boundary. Avoid
+    // leaking them into tools or unrelated child jcode processes.
+    crate::env::remove_var(INHERITED_MODES_ENV);
+    crate::env::remove_var(INHERITED_THEME_ENV);
+
+    let fallback_modes = InheritedTerminalModes {
+        mouse_capture: perf_policy.enable_mouse_capture,
+        keyboard_enhanced: perf_policy.enable_keyboard_enhancement,
+        focus_change: perf_policy.enable_focus_change,
+    };
+    let modes = if inherited_terminal {
+        // The previous process intentionally preserved these modes across exec.
+        // Reassert idempotent modes because terminals, multiplexers, or an older
+        // process may have cleared them during the handoff. Do not push Kitty's
+        // stack-based keyboard enhancement flags again. A later normal exit must
+        // still disable every inherited mode, so retain them in the guard.
+        let modes = inherited_modes.unwrap_or(fallback_modes);
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+        if modes.focus_change {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
+        }
+        if modes.mouse_capture {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+            if let Err(err) = sync_windows_vt_mouse_capture(true) {
+                crate::logging::warn(&format!(
+                    "failed to enable Windows VT mouse tracking: {err}"
+                ));
+            }
+        }
+        modes
     } else {
-        false
+        let keyboard_enhanced = if perf_policy.enable_keyboard_enhancement {
+            tui::enable_keyboard_enhancement()
+        } else {
+            false
+        };
+        let modes = InheritedTerminalModes {
+            mouse_capture: perf_policy.enable_mouse_capture,
+            keyboard_enhanced,
+            focus_change: perf_policy.enable_focus_change,
+        };
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+        if modes.focus_change {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
+        }
+        if modes.mouse_capture {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+            if let Err(err) = sync_windows_vt_mouse_capture(true) {
+                crate::logging::warn(&format!(
+                    "failed to enable Windows VT mouse tracking: {err}"
+                ));
+            }
+        }
+        modes
     };
 
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
-    if focus_change {
-        crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
-    }
-    if mouse_capture {
-        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
-    }
+    crate::logging::info(&format!(
+        "EVENT event=TUI_TERMINAL_MODES phase=initialized pid={} resuming={} handoff={} handoff_raw={} raw_mode={} mouse_capture={} keyboard_enhanced={} focus_change={} idempotent_modes_reasserted={}",
+        std::process::id(),
+        is_resuming,
+        inherited_terminal,
+        inherited_modes_raw.as_deref().unwrap_or("none"),
+        crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+        modes.mouse_capture,
+        modes.keyboard_enhanced,
+        modes.focus_change,
+        inherited_terminal,
+    ));
 
     Ok((
         terminal,
         TuiRuntimeGuard::new(TuiRuntimeState {
-            mouse_capture,
-            keyboard_enhanced,
-            focus_change,
+            mouse_capture: modes.mouse_capture,
+            keyboard_enhanced: modes.keyboard_enhanced,
+            focus_change: modes.focus_change,
         }),
     ))
 }
 
 fn cleanup_tui_runtime(state: &TuiRuntimeState, restore_terminal: bool) {
+    crate::logging::info(&format!(
+        "EVENT event=TUI_TERMINAL_MODES phase=cleanup pid={} restore_terminal={} raw_mode={} mouse_capture={} keyboard_enhanced={} focus_change={}",
+        std::process::id(),
+        restore_terminal,
+        crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+        state.mouse_capture,
+        state.keyboard_enhanced,
+        state.focus_change,
+    ));
+    crate::tui::mermaid::clear_image_state();
+    let image_cleanup = crate::tui::mermaid::take_terminal_image_cleanup_payload();
+    if !image_cleanup.is_empty() {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(image_cleanup.as_bytes());
+        let _ = stdout.flush();
+    }
+
     if restore_terminal {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         if state.focus_change {
             let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
         }
         if state.mouse_capture {
+            if let Err(error) = sync_windows_vt_mouse_capture(false) {
+                crate::logging::warn(&format!(
+                    "failed to disable Windows VT mouse capture: {error}"
+                ));
+            }
             let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         }
         if state.keyboard_enhanced {
             tui::disable_keyboard_enhancement();
         }
-        ratatui::restore();
+        jcode_tui_style::restore_terminal_quietly();
     }
-
-    crate::tui::mermaid::clear_image_state();
 }
 
 fn cleanup_tui_runtime_for_run_result(
@@ -221,11 +430,33 @@ fn cleanup_tui_runtime_for_run_result(
     run_result: &crate::tui::RunResult,
     extra_exec: bool,
 ) {
-    let will_exec = extra_exec
+    cleanup_tui_runtime(state, !run_result_will_exec(run_result, extra_exec));
+}
+
+fn run_result_will_exec(run_result: &crate::tui::RunResult, extra_exec: bool) -> bool {
+    extra_exec
         || run_result.reload_session.is_some()
         || run_result.rebuild_session.is_some()
-        || run_result.update_session.is_some();
-    cleanup_tui_runtime(state, !will_exec);
+        || run_result.update_session.is_some()
+        || run_result.restart_session.is_some()
+}
+
+fn export_tui_exec_handoff(state: &TuiRuntimeState) {
+    let modes = InheritedTerminalModes {
+        mouse_capture: state.mouse_capture,
+        keyboard_enhanced: state.keyboard_enhanced,
+        focus_change: state.focus_change,
+    };
+    crate::env::set_var(INHERITED_MODES_ENV, modes.encode());
+    let theme = crate::tui::theme_detect::current_theme_label();
+    crate::env::set_var(INHERITED_THEME_ENV, theme);
+    crate::logging::info(&format!(
+        "EVENT event=TUI_TERMINAL_MODES phase=exec_handoff pid={} raw_mode={} modes={} theme={}",
+        std::process::id(),
+        crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+        modes.encode(),
+        theme,
+    ));
 }
 
 pub fn print_session_resume_hint(session_id: &str) {
@@ -364,6 +595,83 @@ mod tests {
     }
 
     #[test]
+    fn inherited_terminal_modes_roundtrip() {
+        let modes = InheritedTerminalModes {
+            mouse_capture: true,
+            keyboard_enhanced: false,
+            focus_change: true,
+        };
+        assert_eq!(InheritedTerminalModes::decode(&modes.encode()), Some(modes));
+    }
+
+    #[test]
+    fn windows_vt_mouse_modes_enable_and_disable_the_same_tracking_protocols() {
+        let enable = String::from_utf8_lossy(WINDOWS_VT_MOUSE_ENABLE);
+        let disable = String::from_utf8_lossy(WINDOWS_VT_MOUSE_DISABLE);
+        for mode in ["1000", "1002", "1003", "1015", "1006"] {
+            assert!(
+                enable.contains(&format!("?{mode}h")),
+                "enable sequence must turn on VT mouse mode {mode}"
+            );
+            assert!(
+                disable.contains(&format!("?{mode}l")),
+                "disable sequence must turn off VT mouse mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_terminal_modes_reject_malformed_values() {
+        assert_eq!(InheritedTerminalModes::decode("mouse=1,keyboard=1"), None);
+        assert_eq!(
+            InheritedTerminalModes::decode("mouse=yes,keyboard=1,focus=1"),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_requires_valid_terminal_handoff_metadata() {
+        let modes = InheritedTerminalModes {
+            mouse_capture: true,
+            keyboard_enhanced: true,
+            focus_change: true,
+        };
+        assert!(has_terminal_exec_handoff(true, Some(modes)));
+        assert!(!has_terminal_exec_handoff(true, None));
+        assert!(!has_terminal_exec_handoff(false, Some(modes)));
+    }
+
+    #[test]
+    fn every_exec_action_preserves_terminal_modes() {
+        let with = |field: &str| {
+            let mut result = crate::tui::RunResult::default();
+            match field {
+                "reload" => result.reload_session = Some("session_test".into()),
+                "rebuild" => result.rebuild_session = Some("session_test".into()),
+                "update" => result.update_session = Some("session_test".into()),
+                "restart" => result.restart_session = Some("session_test".into()),
+                _ => unreachable!(),
+            }
+            result
+        };
+
+        for field in ["reload", "rebuild", "update", "restart"] {
+            assert!(
+                run_result_will_exec(&with(field), false),
+                "{field} must preserve terminal modes across exec"
+            );
+        }
+        assert!(run_result_will_exec(
+            &crate::tui::RunResult::default(),
+            true
+        ));
+        assert!(!run_result_will_exec(
+            &crate::tui::RunResult::default(),
+            false
+        ));
+    }
+
+    #[test]
     fn guard_drop_restores_terminal_when_not_finished() {
         // Simulates the error/panic path where explicit teardown is skipped:
         // the guard must restore the terminal exactly once on drop (issue #214).
@@ -436,5 +744,52 @@ mod tests {
         let error = write_session_resume_hint(ClosedWriter, "session_closed_pipe")
             .expect_err("closed stderr should be reported as an I/O error");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+}
+
+#[cfg(test)]
+mod panic_crash_labeling_tests {
+    //! Regression coverage for #599.
+    //!
+    //! Closing a terminal (or dropping SSH) makes `ratatui::restore()`'s
+    //! internal `eprintln!` panic with EIO. The panic hook then relabeled the
+    //! session as `Crashed` and saved the dying client's stale snapshot over the
+    //! server's newer one. Only an `Active` session may be relabeled.
+    use super::*;
+
+    #[test]
+    fn active_session_is_still_labeled_crashed_on_panic() {
+        assert!(should_record_panic_as_crash(
+            &session::SessionStatus::Active
+        ));
+    }
+
+    #[test]
+    fn already_crashed_session_is_not_relabeled() {
+        assert!(!should_record_panic_as_crash(
+            &session::SessionStatus::Crashed {
+                message: Some("earlier crash".to_string())
+            }
+        ));
+    }
+
+    #[test]
+    fn completed_session_is_not_relabeled_by_a_dying_client() {
+        // The exact #599 shape: the session lives on in the shared server and is
+        // no longer Active locally, so a dead-terminal panic must leave it alone.
+        for status in [
+            session::SessionStatus::Closed,
+            session::SessionStatus::Reloaded,
+            session::SessionStatus::Compacted,
+            session::SessionStatus::RateLimited,
+            session::SessionStatus::Error {
+                message: "unrelated".to_string(),
+            },
+        ] {
+            assert!(
+                !should_record_panic_as_crash(&status),
+                "non-active status {status:?} must not be relabeled as crashed"
+            );
+        }
     }
 }

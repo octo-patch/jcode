@@ -267,11 +267,38 @@ fn apply_judge_visible_context_if_needed(session: &mut Session, title_override: 
     session.provider_session_id = None;
 }
 
+/// Drop every side panel page belonging to the discarded session (#605).
+///
+/// The server only emits `SidePanelState` when a page is written, so nothing
+/// else ever tells the client to drop the old session's pages. Shared by both
+/// `/clear` implementations so they cannot drift apart again.
+pub(crate) fn clear_side_panel_for_new_session(app: &mut App) {
+    app.apply_side_panel_snapshot(crate::side_panel::SidePanelSnapshot::default());
+    app.last_side_panel_focus_id = None;
+    app.diff_pane_scroll = 0;
+    app.diff_pane_scroll_x = 0;
+}
+
 pub(super) fn reset_current_session(app: &mut App) {
     app.session.mark_closed();
     let _ = app.session.save();
     app.clear_provider_messages();
     app.clear_display_messages();
+    // A streaming mermaid preview (STREAMING_PREVIEW_DIAGRAM) belongs to the
+    // transcript being discarded; clear it with the rest of the streaming
+    // render state so it cannot outlive the reset (remote /clear at
+    // remote/key_handling.rs does the same).
+    app.clear_streaming_render_state();
+    app.clear_live_usage_state();
+    // The WHOLE transcript is discarded, so every entry in the process-global
+    // ACTIVE_DIAGRAMS registry is now orphaned; drop them so the pinned pane
+    // and the Margin info widget (which draws get_active_diagrams()[0])
+    // cannot keep showing a diagram from the old transcript. Only
+    // full-discard paths may do this: partial-retention paths (/rewind,
+    // Ctrl+R recovery) deliberately keep the registry because body-cache
+    // prefix reuse means retained messages do not re-render/re-register
+    // (see the comments at the /rewind handlers in commands.rs).
+    crate::tui::mermaid::clear_active_diagrams();
     app.queued_messages.clear();
     app.pasted_contents.clear();
     app.pending_images.clear();
@@ -285,9 +312,7 @@ pub(super) fn reset_current_session(app: &mut App) {
     session.autojudge_enabled = Some(app.autojudge_enabled);
     session.ensure_initial_session_context_message();
     app.session = session;
-    app.set_side_panel_snapshot(crate::side_panel::SidePanelSnapshot::default());
-    app.last_side_panel_focus_id = None;
-    app.diff_pane_scroll_x = 0;
+    clear_side_panel_for_new_session(app);
     app.provider_session_id = None;
 }
 
@@ -624,7 +649,8 @@ fn clone_session_for_review(
 }
 
 fn clone_session_for_prompt(app: &App) -> anyhow::Result<(String, String)> {
-    let mut child = Session::create(Some(active_session_id(app)), None);
+    let parent_session_id = active_session_id(app);
+    let mut child = Session::create(Some(parent_session_id.clone()), None);
     child.replace_messages(app.session.messages.clone());
     child.compaction = app.session.compaction.clone();
     child.working_dir = app.session.working_dir.clone();
@@ -634,6 +660,10 @@ fn clone_session_for_prompt(app: &App) -> anyhow::Result<(String, String)> {
     child.autoreview_enabled = app.session.autoreview_enabled;
     child.autojudge_enabled = app.session.autojudge_enabled;
     child.status = crate::session::SessionStatus::Closed;
+    // The parent agent keeps ownership of any in-flight request; tell the
+    // forked agent so it treats the next prompt as fresh work instead of
+    // continuing (and duplicating) the parent's current turn.
+    child.append_fork_notice(&parent_session_id, app.session.display_name());
     child.save()?;
     Ok((child.id.clone(), child.display_name().to_string()))
 }
@@ -672,8 +702,21 @@ pub(super) fn launch_prompt_in_new_session_local(
     content: String,
     images: Vec<(String, String)>,
 ) -> anyhow::Result<bool> {
+    launch_forked_session_local(app, Some((content, images)))
+}
+
+/// Fork (split) the current session into a new window. When `prompt` is
+/// provided it is staged as the first submission of the forked session;
+/// otherwise the fork opens idle with the cloned conversation.
+pub(super) fn launch_forked_session_local(
+    app: &mut App,
+    prompt: Option<(String, Vec<(String, String)>)>,
+) -> anyhow::Result<bool> {
     let (session_id, session_name) = clone_session_for_prompt(app)?;
-    App::save_startup_submission_for_session(&session_id, content, images);
+    let has_prompt = prompt.is_some();
+    if let Some((content, images)) = prompt {
+        App::save_startup_submission_for_session(&session_id, content, images);
+    }
     let exe = super::launch_client_executable();
     let cwd = active_working_dir(app)
         .filter(|path| path.is_dir())
@@ -681,18 +724,35 @@ pub(super) fn launch_prompt_in_new_session_local(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let socket = std::env::var("JCODE_SOCKET").ok();
     let opened = super::spawn_in_new_terminal(&exe, &session_id, &cwd, socket.as_deref())?;
-    if opened {
-        app.push_display_message(DisplayMessage::system(format!(
-            "↗ Next prompt launched in {}.",
-            session_name
-        )));
-        app.set_status_notice("Prompt launched in new session");
-    } else {
-        app.push_display_message(DisplayMessage::system(format!(
-            "↗ New session {} created for the next prompt.\n\nNo terminal was opened automatically. Resume manually:\n\n  jcode --resume {}",
-            session_name, session_id
-        )));
-        app.set_status_notice("Prompt session created");
+    match (opened, has_prompt) {
+        (true, true) => {
+            app.push_display_message(DisplayMessage::system(format!(
+                "↗ Next prompt launched in {}.",
+                session_name
+            )));
+            app.set_status_notice("Prompt launched in new session");
+        }
+        (true, false) => {
+            app.push_display_message(DisplayMessage::system(format!(
+                "✂ Fork → {} (opened in new pane/window)",
+                session_name
+            )));
+            app.set_status_notice(format!("Fork → {}", session_name));
+        }
+        (false, true) => {
+            app.push_display_message(DisplayMessage::system(format!(
+                "↗ New session {} created for the next prompt.\n\nNo terminal was opened automatically. Resume manually:\n\n  jcode --resume {}",
+                session_name, session_id
+            )));
+            app.set_status_notice("Prompt session created");
+        }
+        (false, false) => {
+            app.push_display_message(DisplayMessage::system(format!(
+                "✂ Fork → {}\n\nNo terminal was opened automatically. Resume manually:\n\n  jcode --resume {}",
+                session_name, session_id
+            )));
+            app.set_status_notice("Forked session created");
+        }
     }
     Ok(opened)
 }
@@ -1037,3 +1097,7 @@ pub(super) enum RefactorCommand {
     Status,
     Stop,
 }
+
+#[cfg(test)]
+#[path = "tests/issue_605_clear_side_panel.rs"]
+mod issue_605_clear_side_panel_tests;

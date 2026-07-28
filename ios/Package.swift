@@ -1,5 +1,4 @@
-// swift-tools-version: 6.0
-
+// swift-tools-version:5.9
 import PackageDescription
 
 let package = Package(
@@ -9,20 +8,16 @@ let package = Package(
         .macOS(.v14),
     ],
     products: [
-        .library(
-            name: "JCodeKit",
-            targets: ["JCodeKit"]
-        ),
+        .library(name: "JCodeKit", targets: ["JCodeKit"])
     ],
     targets: [
         .target(
             name: "JCodeKit",
-            path: "Sources/JCodeKit"
+            swiftSettings: [.enableUpcomingFeature("StrictConcurrency")]
         ),
-        .executableTarget(
+        .testTarget(
             name: "JCodeKitTests",
-            dependencies: ["JCodeKit"],
-            path: "Tests/JCodeKitTests"
+            dependencies: ["JCodeKit"]
         ),
     ]
 )

@@ -15,6 +15,8 @@ struct DelayedProvider {
 
 struct NativeAutoCompactionProvider;
 
+struct NativeCompactionStreamProvider;
+
 fn content_text(content: &[ContentBlock]) -> &str {
     match content.first() {
         Some(ContentBlock::Text { text, .. }) => text,
@@ -104,6 +106,50 @@ impl Provider for NativeAutoCompactionProvider {
     }
 }
 
+#[async_trait]
+impl Provider for NativeCompactionStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(StreamEvent::Compaction {
+                    trigger: "openai_native".to_string(),
+                    pre_tokens: Some(80_000),
+                    openai_encrypted_content: Some("enc_native_test".to_string()),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
+    fn uses_jcode_compaction(&self) -> bool {
+        false
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self)
+    }
+}
+
 #[test]
 fn tool_output_to_content_blocks_preserves_labeled_images() {
     let output = ToolOutput::new("Image ready").with_labeled_image(
@@ -143,6 +189,38 @@ fn tool_output_to_content_blocks_preserves_labeled_images() {
         }
         other => panic!("expected trailing label text, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn queued_soft_interrupt_images_are_injected_as_image_blocks() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = Agent::new(provider, registry);
+
+    agent.queue_soft_interrupt(
+        "look at this".to_string(),
+        vec![("image/png".to_string(), "ZmFrZQ==".to_string())],
+        false,
+        SoftInterruptSource::User,
+    );
+    let injected = agent.inject_soft_interrupts();
+
+    assert_eq!(injected.len(), 1);
+    let message = agent
+        .session
+        .messages
+        .last()
+        .expect("soft interrupt should append a user message");
+    assert!(matches!(
+        &message.content[0],
+        ContentBlock::Image { media_type, data }
+            if media_type == "image/png" && data == "ZmFrZQ=="
+    ));
+    assert!(matches!(
+        &message.content[1],
+        ContentBlock::Text { text, .. } if text == "look at this"
+    ));
 }
 
 #[tokio::test]
@@ -214,6 +292,140 @@ async fn run_turn_streaming_mpsc_emits_keepalive_while_provider_is_quiet() {
 
     assert!(saw_text, "expected delayed provider text after keepalive");
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn run_turn_streaming_mpsc_emits_native_compaction_for_client_cache_reset() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeCompactionStreamProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "compact this".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.run_turn_streaming_mpsc(tx).await.unwrap();
+
+    let mut saw_native_compaction = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::Compaction {
+            trigger,
+            messages_compacted,
+            ..
+        } = event
+        {
+            assert_eq!(trigger, "openai_native");
+            assert!(
+                messages_compacted.is_some_and(|count| count > 0),
+                "native compaction should report a non-empty compacted prefix"
+            );
+            saw_native_compaction = true;
+        }
+    }
+    assert!(
+        saw_native_compaction,
+        "native provider compaction must reach clients so they clear KV baselines"
+    );
+}
+
+/// Provider that transparently switches its model mid-stream, mimicking the
+/// Anthropic retired-model fallback (`claude-fable-5` -> `claude-opus-4-8`).
+struct MidStreamModelSwitchProvider {
+    model: std::sync::Mutex<String>,
+    switch_to: String,
+}
+
+#[async_trait]
+impl Provider for MidStreamModelSwitchProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        // Emulate the provider switching its own model state during the request.
+        *self.model.lock().unwrap() = self.switch_to.clone();
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(StreamEvent::TextDelta("hello".to_string())))
+                .await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "claude"
+    }
+
+    fn model(&self) -> String {
+        self.model.lock().unwrap().clone()
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            model: std::sync::Mutex::new(self.model.lock().unwrap().clone()),
+            switch_to: self.switch_to.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn run_turn_streaming_mpsc_emits_model_changed_on_midstream_switch() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MidStreamModelSwitchProvider {
+        model: std::sync::Mutex::new("claude-fable-5".to_string()),
+        switch_to: "claude-opus-4-8".to_string(),
+    });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "test".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move { agent.run_turn_streaming_mpsc(tx).await });
+
+    let mut switched_model = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+            Ok(Some(ServerEvent::ModelChanged { model, error, .. })) => {
+                assert!(error.is_none(), "unexpected model-change error: {error:?}");
+                switched_model = Some(model);
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                if task.is_finished() {
+                    break;
+                }
+            }
+        }
+    }
+
+    task.await.unwrap().unwrap();
+    assert_eq!(
+        switched_model.as_deref(),
+        Some("claude-opus-4-8"),
+        "expected a ModelChanged event resyncing to the served model"
+    );
 }
 
 #[tokio::test]
@@ -474,7 +686,7 @@ async fn new_agent_registers_active_pid_and_clear_swaps_it() {
 }
 
 #[tokio::test]
-async fn default_disabled_tools_are_not_exposed_or_executable() {
+async fn gmail_is_exposed_by_default_and_can_be_explicitly_disabled() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
     let prev_tools = std::env::var_os("JCODE_TOOLS");
@@ -495,23 +707,45 @@ async fn default_disabled_tools_are_not_exposed_or_executable() {
     let mut agent = Agent::new(provider, registry);
     let definitions = agent.tool_definitions().await;
     let tool_names = agent.tool_names().await;
+    let tool_name = "gmail";
 
-    for tool_name in ["gmail", "lsp"] {
-        assert!(
-            !definitions
-                .iter()
-                .any(|definition| definition.name == tool_name),
-            "default-disabled {tool_name} tool must not be sent in model-visible tool definitions"
-        );
-        assert!(
-            !tool_names.iter().any(|name| name == tool_name),
-            "default-disabled {tool_name} tool must not be listed as model-visible"
-        );
-        let err = agent.validate_tool_allowed(tool_name).expect_err(&format!(
-            "default-disabled {tool_name} tool must not be executable"
-        ));
-        assert!(err.to_string().contains("disabled"));
-    }
+    assert!(
+        definitions
+            .iter()
+            .any(|definition| definition.name == tool_name),
+        "{tool_name} must be sent in model-visible tool definitions by default"
+    );
+    assert!(
+        tool_names.iter().any(|name| name == tool_name),
+        "{tool_name} must be listed as model-visible by default"
+    );
+    agent
+        .validate_tool_allowed(tool_name)
+        .expect("gmail must be executable by default");
+
+    crate::env::set_var("JCODE_DISABLED_TOOLS", tool_name);
+    crate::config::Config::invalidate_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    let definitions = agent.tool_definitions().await;
+    let tool_names = agent.tool_names().await;
+
+    assert!(
+        !definitions
+            .iter()
+            .any(|definition| definition.name == tool_name),
+        "explicitly disabled {tool_name} must not be sent in model-visible tool definitions"
+    );
+    assert!(
+        !tool_names.iter().any(|name| name == tool_name),
+        "explicitly disabled {tool_name} must not be listed as model-visible"
+    );
+    let err = agent
+        .validate_tool_allowed(tool_name)
+        .expect_err("explicitly disabled gmail must not be executable");
+    assert!(err.to_string().contains("disabled"));
 
     if let Some(previous) = prev_home {
         crate::env::set_var("JCODE_HOME", previous);
@@ -545,6 +779,7 @@ fn seed_transient_session_state(agent: &mut Agent) {
     agent.push_alert("pending alert".to_string());
     agent.queue_soft_interrupt(
         "queued interrupt".to_string(),
+        Vec::new(),
         true,
         SoftInterruptSource::User,
     );
@@ -704,6 +939,7 @@ async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop(
                 id: "call_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             }],
             timestamp: Some(chrono::Utc::now()),
             tool_duration_ms: None,
@@ -811,6 +1047,7 @@ async fn mark_closed_persists_soft_interrupts_for_restore_after_reload() {
     agent.session.save().expect("save active session");
     agent.queue_soft_interrupt(
         "resume me after reload".to_string(),
+        Vec::new(),
         true,
         SoftInterruptSource::System,
     );
@@ -1063,5 +1300,216 @@ async fn tool_snapshot_is_stable_without_new_mcp_tools() {
     assert!(
         !second_names.iter().any(|n| n == "not_an_mcp_tool"),
         "non-MCP tool registered after lock must not leak into the snapshot"
+    );
+}
+
+#[test]
+fn empty_post_tool_response_gets_more_than_one_retry() {
+    // Regression guard for the Claude Opus 5 benchmark incident. A provider can
+    // return an empty response immediately after tool results; that is a
+    // transient hiccup, not a finished task. With only one retry allowed, a
+    // single empty response (observed once in 43 turns) ended a 20-hour agent
+    // run with the work half-done and the submission unoptimized.
+    assert!(
+        Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS > 1,
+        "a single retry lets one transient empty response end a long run"
+    );
+    // Bounded, so a genuinely finished agent still exits instead of looping.
+    assert!(Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS <= 10);
+}
+
+#[test]
+fn output_budget_truncation_requests_a_continuation() {
+    // Regression guard for the Claude Opus 5 benchmark incident. A turn cut off
+    // by the output budget reports stop_reason=max_tokens and can contain zero
+    // tool calls, which otherwise looks exactly like a finished turn. The agent
+    // must treat it as incomplete and continue rather than ending the run.
+    assert!(Agent::should_continue_after_stop_reason("max_tokens"));
+    assert!(Agent::should_continue_after_stop_reason("MAX_TOKENS"));
+    assert!(Agent::should_continue_after_stop_reason(" max_tokens "));
+    assert!(Agent::should_continue_after_stop_reason(
+        "max_output_tokens"
+    ));
+    assert!(Agent::should_continue_after_stop_reason("length"));
+    assert!(Agent::should_continue_after_stop_reason("truncated"));
+    assert!(Agent::should_continue_after_stop_reason("incomplete"));
+
+    // Normal completions must not trigger a continuation loop.
+    assert!(!Agent::should_continue_after_stop_reason("end_turn"));
+    assert!(!Agent::should_continue_after_stop_reason("tool_use"));
+    assert!(!Agent::should_continue_after_stop_reason("stop"));
+    // An absent reason is the pre-fix wire behaviour: it cannot be recovered
+    // from, which is precisely why MessageEnd must forward the real reason.
+    assert!(!Agent::should_continue_after_stop_reason(""));
+}
+
+#[test]
+fn stranded_tool_use_stop_is_detected() {
+    // Second half of the Opus 5 DeepSWE incident: the provider reported
+    // stop_reason="tool_use" while the parsed tool-call list was empty, so the
+    // turn loop had nothing to execute and broke out mid-task, discarding every
+    // uncommitted edit. `tool_use` is a normal completion reason, so
+    // `should_continue_after_stop_reason` must keep rejecting it; the stranded
+    // case is only recoverable when it is paired with zero tool calls, which is
+    // exactly what this predicate is for.
+    assert!(Agent::is_stranded_tool_use_stop(Some("tool_use")));
+    assert!(Agent::is_stranded_tool_use_stop(Some("TOOL_USE")));
+    assert!(Agent::is_stranded_tool_use_stop(Some(" tool_use ")));
+
+    assert!(!Agent::is_stranded_tool_use_stop(Some("end_turn")));
+    assert!(!Agent::is_stranded_tool_use_stop(Some("max_tokens")));
+    assert!(!Agent::is_stranded_tool_use_stop(Some("")));
+    assert!(!Agent::is_stranded_tool_use_stop(None));
+    // Must stay disjoint from the truncation path so a turn never takes both
+    // continuation branches for one stop reason.
+    assert!(!Agent::should_continue_after_stop_reason("tool_use"));
+}
+
+#[test]
+fn guardrail_stop_reason_detection() {
+    assert!(Agent::is_guardrail_stop_reason(Some("refusal")));
+    assert!(Agent::is_guardrail_stop_reason(Some("REFUSAL")));
+    assert!(Agent::is_guardrail_stop_reason(Some(" content_filter ")));
+    assert!(Agent::is_guardrail_stop_reason(Some("safety")));
+    assert!(Agent::is_guardrail_stop_reason(Some("model_guardrail")));
+    assert!(Agent::is_guardrail_stop_reason(Some("policy_violation_x")));
+    assert!(!Agent::is_guardrail_stop_reason(Some("end_turn")));
+    assert!(!Agent::is_guardrail_stop_reason(Some("max_tokens")));
+    assert!(!Agent::is_guardrail_stop_reason(Some("tool_use")));
+    assert!(!Agent::is_guardrail_stop_reason(Some("stop")));
+    assert!(!Agent::is_guardrail_stop_reason(None));
+}
+
+#[test]
+fn guardrail_notice_for_refusal_stop() {
+    let notice = Agent::provider_guardrail_notice(Some("refusal"), true, true)
+        .expect("refusal with empty text must produce a notice");
+    assert!(
+        notice.contains("refusal"),
+        "notice should name the stop reason: {notice}"
+    );
+    assert!(notice.to_lowercase().contains("guardrail"));
+    // Guardrail stop with visible text still surfaces (partial output then refusal).
+    assert!(Agent::provider_guardrail_notice(Some("refusal"), false, false).is_some());
+}
+
+#[test]
+fn guardrail_notice_for_silent_empty_turn() {
+    // end_turn with zero visible output and reasoning-only content: surface it.
+    let notice = Agent::provider_guardrail_notice(Some("end_turn"), true, true)
+        .expect("empty visible output must produce a notice");
+    assert!(notice.contains("internal reasoning"), "{notice}");
+    assert!(notice.contains("end_turn"), "{notice}");
+    // Unknown stop reason, empty output, no reasoning.
+    let notice = Agent::provider_guardrail_notice(None, true, false)
+        .expect("empty visible output must produce a notice");
+    assert!(notice.contains("unknown"), "{notice}");
+    assert!(!notice.contains("internal reasoning"), "{notice}");
+}
+
+#[test]
+fn guardrail_notice_absent_for_normal_turns() {
+    // Normal turn with visible text: no notice.
+    assert!(Agent::provider_guardrail_notice(Some("end_turn"), false, false).is_none());
+    assert!(Agent::provider_guardrail_notice(None, false, true).is_none());
+}
+
+include!("agent_tests/retention_readiness.rs");
+
+/// Provider that reproduces the DeepSWE Opus 5 incident: the first response
+/// ends with `stop_reason: "tool_use"` while carrying no tool-use block at all,
+/// which is what happens when an unrecognized content block is dropped from the
+/// stream. The second response is a normal completion, so a correct agent
+/// recovers and this provider's queue is exhausted.
+#[derive(Clone, Default)]
+struct StrandedToolUseProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+#[async_trait]
+impl Provider for StrandedToolUseProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call == 1 {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta("working on it".to_string())))
+                    .await;
+                // No ToolUseStart: the tool block was lost, yet the provider
+                // still reports that it stopped in order to call a tool.
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("tool_use".to_string()),
+                    }))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta("all done".to_string())))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "stranded-tool-use"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// End-to-end guard for the incident. Before the fix the agent took the
+/// "no tool calls" branch and ended the turn on the very first response, so a
+/// benchmark trial stopped mid-task and its uncommitted work was never
+/// captured. The agent must instead ask the model to continue, which shows up
+/// as a second provider call and a final turn that ends normally.
+#[tokio::test]
+async fn stranded_tool_use_stop_continues_instead_of_ending_the_turn() {
+    let _guard = crate::storage::lock_test_env();
+    let stranded = StrandedToolUseProvider::default();
+    let calls = stranded.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(stranded);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        2,
+        "a tool_use stop with no tool call must trigger exactly one continuation request"
+    );
+    assert!(
+        text.contains("all done"),
+        "the recovered turn must deliver the model's real completion, got {text:?}"
     );
 }

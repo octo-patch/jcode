@@ -10,8 +10,9 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::{browser, gateway, memory, session, storage, tui};
 
-use super::terminal::init_tui_runtime;
+use super::{output::terminal_title, terminal::init_tui_runtime};
 
+mod menubar;
 mod provider_setup;
 mod report_info;
 mod restart;
@@ -25,6 +26,7 @@ pub(crate) use super::auth_test::{
 pub use super::auth_test::{
     run_auth_test_command, run_auth_test_context_audit_command, run_auth_test_coverage_command,
 };
+pub use menubar::{ensure_menubar_helper_running, run_menubar_command};
 pub(crate) use provider_setup::{ProviderAddOptions, run_provider_add_command};
 pub use restart::{
     maybe_run_pending_restart_restore_on_startup, run_restart_clear_command,
@@ -160,18 +162,16 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             user_id,
             helper,
             clear,
-        } => {
-            return run_cloud_sessions_configure(
-                api_base,
-                api_token,
-                api_token_env,
-                api_token_id,
-                user_id,
-                helper,
-                clear,
-            );
-        }
-        CloudSessionsSubcommand::Status { json } => return run_cloud_sessions_status(json),
+        } => run_cloud_sessions_configure(
+            api_base,
+            api_token,
+            api_token_env,
+            api_token_id,
+            user_id,
+            helper,
+            clear,
+        ),
+        CloudSessionsSubcommand::Status { json } => run_cloud_sessions_status(json),
         CloudSessionsSubcommand::Dashboard {
             limit,
             output,
@@ -181,18 +181,16 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             profile,
             region,
             helper,
-        } => {
-            return run_cloud_sessions_dashboard(CloudSessionsDashboardRequest {
-                limit,
-                output,
-                open,
-                with_view,
-                user_id,
-                profile,
-                region,
-                helper,
-            });
-        }
+        } => run_cloud_sessions_dashboard(CloudSessionsDashboardRequest {
+            limit,
+            output,
+            open,
+            with_view,
+            user_id,
+            profile,
+            region,
+            helper,
+        }),
         CloudSessionsSubcommand::Sync {
             sessions_dir,
             since_days,
@@ -207,23 +205,21 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             profile,
             region,
             helper,
-        } => {
-            return run_cloud_sessions_sync(CloudSessionsSyncRequest {
-                sessions_dir,
-                since_days,
-                all,
-                max,
-                min_interval_mins,
-                raw,
-                dry_run,
-                force,
-                json,
-                user_id,
-                profile,
-                region,
-                helper,
-            });
-        }
+        } => run_cloud_sessions_sync(CloudSessionsSyncRequest {
+            sessions_dir,
+            since_days,
+            all,
+            max,
+            min_interval_mins,
+            raw,
+            dry_run,
+            force,
+            json,
+            user_id,
+            profile,
+            region,
+            helper,
+        }),
         other => run_cloud_sessions_helper_command(other),
     }
 }
@@ -1541,7 +1537,7 @@ async fn run_ambient_visible() -> Result<()> {
 
     let _ = crossterm::execute!(
         std::io::stdout(),
-        crossterm::terminal::SetTitle("🤖 jcode ambient cycle")
+        crossterm::terminal::SetTitle(terminal_title("🤖 jcode ambient cycle"))
     );
 
     let result = app.run(terminal).await;
@@ -1884,7 +1880,7 @@ pub fn run_pair_command(list: bool, revoke: Option<String>) -> Result<()> {
         eprintln!("  Bind address:  \x1b[2m{}\x1b[0m", bind_hint);
     }
 
-    if connect_host == "<your-mac-hostname>" {
+    if connect_host == gateway::UNKNOWN_CONNECT_HOST {
         eprintln!(
             "\n  \x1b[33mTip:\x1b[0m set JCODE_GATEWAY_HOST to your reachable Tailscale hostname."
         );
@@ -1906,58 +1902,7 @@ pub fn run_pair_command(list: bool, revoke: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn resolve_connect_host(bind_addr: &str) -> String {
-    if bind_addr == "0.0.0.0" || bind_addr == "::" {
-        if let Some(host) = std::env::var("JCODE_GATEWAY_HOST")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return host;
-        }
-
-        if let Some(host) = detect_tailscale_dns_name() {
-            return host;
-        }
-
-        return std::env::var("HOSTNAME")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "<your-mac-hostname>".to_string());
-    }
-    bind_addr.to_string()
-}
-
-pub fn parse_tailscale_dns_name(status_json: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(status_json).ok()?;
-    let dns_name = value
-        .get("Self")?
-        .get("DNSName")?
-        .as_str()?
-        .trim()
-        .trim_end_matches('.')
-        .to_string();
-
-    if dns_name.is_empty() {
-        None
-    } else {
-        Some(dns_name)
-    }
-}
-
-pub fn detect_tailscale_dns_name() -> Option<String> {
-    let output = std::process::Command::new("tailscale")
-        .args(["status", "--json"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    parse_tailscale_dns_name(&output.stdout)
-}
+pub use gateway::{detect_tailscale_dns_name, parse_tailscale_dns_name, resolve_connect_host};
 
 pub async fn run_browser(action: &str) -> Result<()> {
     match action {
@@ -2154,6 +2099,34 @@ pub async fn run_server_reload_command(force: bool, emit_json: bool) -> Result<(
     }
 
     let mut client = crate::server::Client::connect().await?;
+
+    // Before asking the (possibly older) daemon to reload, repair a stale
+    // `shared-server` channel from the client side. The running server resolves
+    // its reload target from that channel; if it still points at the server's
+    // own old binary (the "current client, stale server" state, e.g. after a
+    // no-op `/update`), a forced reload would just re-exec the same old binary.
+    // Repointing shared-server -> stable when stable is strictly newer gives the
+    // reload a newer binary to exec into. Never downgrades; preserves a fresher
+    // self-dev pin. Best-effort: a failure here must not block the reload.
+    match crate::build::repair_stale_shared_server_channel() {
+        Ok(crate::build::SharedServerRepair::Repaired {
+            repaired_to,
+            previous,
+        }) => {
+            crate::logging::info(&format!(
+                "server reload: repaired stale shared-server channel {:?} -> {} before reload",
+                previous, repaired_to
+            ));
+        }
+        Ok(crate::build::SharedServerRepair::AlreadyCurrent) => {}
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "server reload: shared-server channel repair failed (continuing): {}",
+                err
+            ));
+        }
+    }
+
     let request_id = client.reload_with_force(force).await?;
 
     let mut reloading = false;
@@ -2400,6 +2373,25 @@ pub async fn run_single_message_command(
         super::provider_init::init_provider_for_validation(choice, model).await?
     };
     let registry = crate::tool::Registry::new(provider.clone()).await;
+    // Load MCP servers from ~/.jcode/mcp.json so headless `jcode run` has the
+    // same `mcp__*` tools as interactive/server sessions. This is non-blocking:
+    // `register_mcp_tools` advertises cached tool schemas synchronously (so the
+    // first locked tool snapshot already contains MCP tools, for zero
+    // prompt-cache miss) and connects in the background (connect-on-first-call).
+    // For a short single-message run, startup latency is unchanged.
+    // (#390, #206 Phase 2)
+    if run_command_mcp_enabled() {
+        registry.register_mcp_tools(None, None, None).await;
+        // Cold-cache gap: when a configured MCP server has no cached schema yet
+        // (first ever use, or reconfigured), advertise-early registers nothing
+        // for it, and a single-turn `jcode run` locks its tool snapshot before
+        // the background connection finishes, so the model would never see those
+        // tools. Long-lived sessions recover on a later turn, but `jcode run`
+        // has no later turn. So, only when the cache is cold for some configured
+        // server, briefly wait for the first connection to register tools before
+        // the agent runs. Warm runs skip this entirely and stay instant. (#390)
+        wait_for_cold_cache_mcp_tools(&registry).await;
+    }
     let mut agent = crate::agent::Agent::new(provider.clone(), registry);
     restore_agent_session_if_requested(&mut agent, resume_session)?;
 
@@ -2432,6 +2424,91 @@ fn run_command_auto_poke_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether headless `jcode run` should load MCP servers from `~/.jcode/mcp.json`.
+/// Enabled by default; set `JCODE_RUN_MCP=0` (or `false`/`off`/`no`) to skip MCP
+/// registration for latency-sensitive scripting. (#390)
+fn run_command_mcp_enabled() -> bool {
+    std::env::var("JCODE_RUN_MCP")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(true)
+}
+
+/// Max time `jcode run` waits for cold-cache MCP servers to register their
+/// tools before running the single turn. Override with `JCODE_RUN_MCP_WAIT_MS`
+/// (0 disables the wait).
+fn run_command_mcp_cold_wait() -> std::time::Duration {
+    let ms = std::env::var("JCODE_RUN_MCP_WAIT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(5000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Returns the set of MCP servers configured for this run that have no usable
+/// cached schema yet (cold cache). Advertise-early can only pre-register tools
+/// for servers whose schemas are cached, so these are the servers whose tools
+/// would otherwise miss the single-turn snapshot.
+fn cold_cache_mcp_servers() -> Vec<String> {
+    let config = crate::mcp::McpConfig::load();
+    if config.servers.is_empty() {
+        return Vec::new();
+    }
+    let cache = crate::mcp::McpSchemaCache::load();
+    config
+        .servers
+        .iter()
+        .filter(|(name, cfg)| cache.tools_for(name, cfg).is_none())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Bridge the cold-cache gap for `jcode run`: if any configured MCP server has
+/// no cached schema, briefly poll the registry until its `mcp__*` tools appear
+/// (or the budget elapses) so the single turn's locked tool snapshot includes
+/// them. Warm caches return immediately because `cold_cache_mcp_servers` is
+/// empty. (#390)
+async fn wait_for_cold_cache_mcp_tools(registry: &crate::tool::Registry) {
+    let cold_servers = cold_cache_mcp_servers();
+    if cold_servers.is_empty() {
+        return;
+    }
+    let budget = run_command_mcp_cold_wait();
+    if budget.is_zero() {
+        return;
+    }
+    crate::logging::info(&format!(
+        "jcode run: waiting up to {}ms for cold-cache MCP server(s) to register tools: {}",
+        budget.as_millis(),
+        cold_servers.join(", ")
+    ));
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let names = registry.tool_names().await;
+        let covered = cold_servers.iter().all(|server| {
+            let prefix = format!("mcp__{}__", server);
+            names.iter().any(|name| name.starts_with(&prefix))
+        });
+        if covered {
+            crate::logging::info(
+                "jcode run: cold-cache MCP server(s) registered tools; proceeding",
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            crate::logging::warn(
+                "jcode run: timed out waiting for cold-cache MCP server(s); \
+                 their tools may be missing from this run",
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 fn run_command_auto_poke_max_turns() -> Option<usize> {
     std::env::var("JCODE_RUN_AUTO_POKE_MAX_TURNS")
         .ok()
@@ -2446,20 +2523,74 @@ fn run_command_auto_poke_limit_reached(turns_completed: usize, max_turns: Option
 }
 
 const RUN_TODO_CONFIDENCE_THRESHOLD: u8 = 90;
-const RUN_TODO_CONFIDENCE_SUMMARY_PREFIX: &str = "All todos are done. Todo confidence summary:";
 
+#[derive(Debug)]
 enum RunAutoPokeFollowUp {
-    Incomplete { count: usize, message: String },
-    ConfidenceSummary { total_todos: usize, message: String },
+    Incomplete {
+        count: usize,
+        message: String,
+    },
+    ConfidenceSummary {
+        total_todos: usize,
+        message: String,
+        confidence_spike_challenge: bool,
+    },
+    /// Deferred quality-check reminder for the points this turn flagged and
+    /// never resolved. Delivered once, ahead of the confidence summary.
+    GateDigest {
+        message: String,
+    },
 }
 
 fn run_todos(session_id: &str) -> Vec<crate::todo::TodoItem> {
     crate::todo::load_todos(session_id).unwrap_or_default()
 }
 
+/// Build the deferred quality-check reminder for a headless run, consuming the
+/// turn's observation log.
+///
+/// The log is cleared whether or not a reminder results, so a turn whose scores
+/// all resolved does not carry stale observations into the next turn. Returns
+/// `None` when there is nothing left worth saying.
+fn take_run_gate_digest(session_id: &str, already_delivered: bool) -> Option<String> {
+    if already_delivered {
+        return None;
+    }
+    let observations = crate::todo::load_gate_observations(session_id).unwrap_or_default();
+    if observations.is_empty() {
+        return None;
+    }
+    let plan = crate::todo::load_plan(session_id).unwrap_or_default();
+    let goals = crate::todo::load_goals(session_id).unwrap_or_default();
+    let digest = crate::todo::build_gate_digest(&observations, &plan, &goals);
+    let _ = crate::todo::clear_gate_observations(session_id);
+    digest
+}
+
+/// Consume the observation log only once the turn has actually ended.
+///
+/// `take_run_gate_digest` clears the log, so calling it while todos are still
+/// open would destroy the reminder: auto-poke iterates many times with open work
+/// on a long run, and the incomplete-todo follow-up takes precedence, so the
+/// digest string would be dropped on the floor with the log already emptied.
+fn take_run_gate_digest_if_turn_ended(
+    session_id: &str,
+    already_delivered: bool,
+    todos: &[crate::todo::TodoItem],
+) -> Option<String> {
+    let work_remains = todos
+        .iter()
+        .any(|todo| todo.status != "completed" && todo.status != "cancelled");
+    if work_remains {
+        return None;
+    }
+    take_run_gate_digest(session_id, already_delivered)
+}
+
 fn build_run_auto_poke_follow_up_from_todos(
     todos: &[crate::todo::TodoItem],
-    confidence_summary_sent: bool,
+    confidence_spike_challenged: bool,
+    gate_digest: Option<String>,
 ) -> Option<RunAutoPokeFollowUp> {
     let incomplete: Vec<_> = todos
         .iter()
@@ -2472,165 +2603,66 @@ fn build_run_auto_poke_follow_up_from_todos(
             message: build_run_poke_message(&incomplete),
         });
     }
-    if !confidence_summary_sent && !todos.is_empty() {
+    // Verify the weak points before judging completion confidence: the digest
+    // may prompt work that changes those very assessments.
+    if let Some(message) = gate_digest {
+        return Some(RunAutoPokeFollowUp::GateDigest { message });
+    }
+    if !todos.is_empty()
+        && let Some((message, confidence_spike_challenge)) =
+            build_run_todo_validation_message(todos, !confidence_spike_challenged)
+    {
         return Some(RunAutoPokeFollowUp::ConfidenceSummary {
             total_todos: todos.len(),
-            message: build_run_todo_confidence_summary_message(todos),
+            message,
+            confidence_spike_challenge,
         });
     }
     None
 }
 
 fn build_run_poke_message(incomplete: &[crate::todo::TodoItem]) -> String {
-    format!(
-        "You have {} incomplete todo{}. Continue working, or update the todo tool.",
-        incomplete.len(),
-        if incomplete.len() == 1 { "" } else { "s" },
-    )
+    crate::todo::build_auto_poke_message(incomplete.len())
 }
 
-fn run_todo_confidence_weight(priority: &str) -> u32 {
-    match priority {
-        "high" => 3,
-        "medium" => 2,
-        _ => 1,
-    }
-}
-
-fn run_weighted_confidence_average(scores: impl IntoIterator<Item = (u8, u32)>) -> Option<u8> {
-    let mut weighted_sum = 0u32;
-    let mut total_weight = 0u32;
-    for (score, weight) in scores {
-        weighted_sum += u32::from(score) * weight;
-        total_weight += weight;
-    }
-    if total_weight == 0 {
-        None
-    } else {
-        Some(((weighted_sum + total_weight / 2) / total_weight) as u8)
-    }
-}
-
-fn build_run_todo_confidence_summary_message(todos: &[crate::todo::TodoItem]) -> String {
+fn build_run_todo_validation_message(
+    todos: &[crate::todo::TodoItem],
+    allow_confidence_spike_challenge: bool,
+) -> Option<(String, bool)> {
     let completed: Vec<&crate::todo::TodoItem> = todos
         .iter()
         .filter(|todo| todo.status == "completed")
         .collect();
-    let cancelled_count = todos
-        .iter()
-        .filter(|todo| todo.status == "cancelled")
-        .count();
-
-    let planning_average = run_weighted_confidence_average(todos.iter().filter_map(|todo| {
-        todo.confidence
-            .map(|score| (score, run_todo_confidence_weight(&todo.priority)))
-    }));
-    let completion_scores: Vec<(&crate::todo::TodoItem, u8, u32)> = completed
-        .iter()
-        .filter_map(|todo| {
-            todo.completion_confidence
-                .map(|score| (*todo, score, run_todo_confidence_weight(&todo.priority)))
-        })
-        .collect();
-    let completion_average = run_weighted_confidence_average(
-        completion_scores
-            .iter()
-            .map(|(_, score, weight)| (*score, *weight)),
-    );
-    let missing_completion_confidence = completed
-        .iter()
-        .filter(|todo| todo.completion_confidence.is_none())
-        .count();
-    let below_threshold_count = completion_scores
-        .iter()
-        .filter(|(_, score, _)| *score < RUN_TODO_CONFIDENCE_THRESHOLD)
-        .count();
-    let lowest_completed = completion_scores
-        .iter()
-        .min_by_key(|(_, score, _)| *score)
-        .map(|(_, score, _)| *score);
-
-    let mut lines = vec![RUN_TODO_CONFIDENCE_SUMMARY_PREFIX.to_string()];
-    lines.push(format!(
-        "- Completed todos: {}{}.",
-        completed.len(),
-        if cancelled_count == 0 {
-            String::new()
-        } else {
-            format!(
-                " ({} cancelled todo{} skipped)",
-                cancelled_count,
-                if cancelled_count == 1 { "" } else { "s" }
-            )
-        }
-    ));
-
-    match completion_average {
-        Some(avg) => lines.push(format!("- Weighted completion confidence: {}%.", avg)),
-        None if !completed.is_empty() => lines.push(
-            "- Weighted completion confidence: unknown because no completed todo has completion_confidence."
-                .to_string(),
-        ),
-        None => lines.push("- No completed todos recorded completion confidence.".to_string()),
-    }
-    lines.push(format!(
-        "- Confidence threshold: {}%.",
-        RUN_TODO_CONFIDENCE_THRESHOLD
-    ));
-
-    match planning_average {
-        Some(avg) => lines.push(format!("- Weighted planning confidence: {}%.", avg)),
-        None => lines.push("- Weighted planning confidence: unknown.".to_string()),
+    if completed.is_empty() {
+        return None;
     }
 
-    match lowest_completed {
-        Some(score) => lines.push(format!("- Lowest completed todo confidence: {}%.", score)),
-        None => lines.push("- Lowest completed todo confidence: unknown.".to_string()),
+    let completion_confidence_needs_validation = completed.iter().any(|todo| {
+        todo.completion_confidence
+            .is_none_or(|score| score < RUN_TODO_CONFIDENCE_THRESHOLD)
+    });
+    let confidence_spike_detected =
+        allow_confidence_spike_challenge && !crate::todo::spike_completed_todos(todos).is_empty();
+
+    if !completion_confidence_needs_validation && !confidence_spike_detected {
+        // Nothing actionable: completing the loop with a generic summary just
+        // spends tokens on "all good" theater, so send nothing and end the run.
+        return None;
     }
 
-    if missing_completion_confidence > 0 {
-        lines.push(format!(
-            "- Missing completion_confidence on {} completed todo{}.",
-            missing_completion_confidence,
-            if missing_completion_confidence == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ));
-    }
-
-    if below_threshold_count > 0 {
-        lines.push(format!(
-            "- {} completed todo{} below the {}% confidence threshold.",
-            below_threshold_count,
-            if below_threshold_count == 1 {
-                " is"
-            } else {
-                "s are"
-            },
-            RUN_TODO_CONFIDENCE_THRESHOLD
-        ));
-    }
-
-    let needs_validation = completion_average
-        .map(|avg| avg < RUN_TODO_CONFIDENCE_THRESHOLD)
-        .unwrap_or(true)
-        || missing_completion_confidence > 0
-        || below_threshold_count > 0;
-    if needs_validation {
-        lines.push(
-            "- Suggested action: validate or test before finalizing. Inspect the result and update completion_confidence when the evidence changes."
-                .to_string(),
-        );
+    if completion_confidence_needs_validation {
+        crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
+        Some((
+            crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE.to_string(),
+            false,
+        ))
     } else {
-        lines.push(
-            "- Suggested action: use this confidence summary when deciding whether any further validation would materially improve certainty before finalizing."
-                .to_string(),
-        );
+        crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::ConfidenceSpike);
+        Some((
+            crate::todo::TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE.to_string(),
+            true,
+        ))
     }
-
-    lines.join("\n")
 }
 
 async fn run_single_message_command_plain_with_auto_poke(
@@ -2640,7 +2672,8 @@ async fn run_single_message_command_plain_with_auto_poke(
     let mut next_message = message.to_string();
     let max_turns = run_command_auto_poke_max_turns();
     let mut turns_completed = 0usize;
-    let mut confidence_summary_sent = false;
+    let mut confidence_spike_challenged = false;
+    let mut gate_digest_delivered = false;
     loop {
         agent.run_once(&next_message).await?;
         turns_completed += 1;
@@ -2648,12 +2681,46 @@ async fn run_single_message_command_plain_with_auto_poke(
             break;
         }
         let todos = run_todos(agent.session_id());
-        match build_run_auto_poke_follow_up_from_todos(&todos, confidence_summary_sent) {
-            Some(RunAutoPokeFollowUp::ConfidenceSummary { message, .. }) => {
-                confidence_summary_sent = true;
+        let gate_digest =
+            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
+        match build_run_auto_poke_follow_up_from_todos(
+            &todos,
+            confidence_spike_challenged,
+            gate_digest,
+        ) {
+            Some(RunAutoPokeFollowUp::GateDigest { message }) => {
+                if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
+                    if let Some(max_turns) = max_turns {
+                        eprintln!(
+                            "We stopped poking after {max_turns} turn(s); some quality-review points are still open."
+                        );
+                    }
+                    break;
+                }
+                gate_digest_delivered = true;
                 next_message = message;
                 eprintln!(
-                    "Auto-poking: todos complete; sending confidence summary follow-up. Set JCODE_RUN_AUTO_POKE=0 to disable."
+                    "We asked the agent to double-check this turn's weak points. Set JCODE_RUN_AUTO_POKE=0 to disable."
+                );
+                continue;
+            }
+            Some(RunAutoPokeFollowUp::ConfidenceSummary {
+                message,
+                confidence_spike_challenge,
+                ..
+            }) => {
+                if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
+                    if let Some(max_turns) = max_turns {
+                        eprintln!(
+                            "We stopped poking after {max_turns} turn(s); the agent's completion confidence still needs validation."
+                        );
+                    }
+                    break;
+                }
+                confidence_spike_challenged |= confidence_spike_challenge;
+                next_message = message;
+                eprintln!(
+                    "Todos are done. Asking the agent for a final confidence check. Set JCODE_RUN_AUTO_POKE=0 to disable."
                 );
                 continue;
             }
@@ -2661,7 +2728,7 @@ async fn run_single_message_command_plain_with_auto_poke(
                 if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
                     if let Some(max_turns) = max_turns {
                         eprintln!(
-                            "Auto-poke stopped after {max_turns} turn(s) with {} incomplete todo(s).",
+                            "We stopped poking after {max_turns} turn(s); {} todo(s) are still unfinished.",
                             count
                         );
                     }
@@ -2669,7 +2736,7 @@ async fn run_single_message_command_plain_with_auto_poke(
                 }
                 next_message = message;
                 eprintln!(
-                    "Auto-poking: {} incomplete todo(s). Set JCODE_RUN_AUTO_POKE=0 to disable.",
+                    "{} incomplete todo(s). We poked the agent for you. Set JCODE_RUN_AUTO_POKE=0 to disable.",
                     count
                 );
             }
@@ -2687,7 +2754,8 @@ async fn run_single_message_command_capture_with_auto_poke(
     let max_turns = run_command_auto_poke_max_turns();
     let mut outputs = Vec::new();
     let mut turns_completed = 0usize;
-    let mut confidence_summary_sent = false;
+    let mut confidence_spike_challenged = false;
+    let mut gate_digest_delivered = false;
     loop {
         outputs.push(agent.run_once_capture(&next_message).await?);
         turns_completed += 1;
@@ -2695,9 +2763,43 @@ async fn run_single_message_command_capture_with_auto_poke(
             break;
         }
         let todos = run_todos(agent.session_id());
-        match build_run_auto_poke_follow_up_from_todos(&todos, confidence_summary_sent) {
-            Some(RunAutoPokeFollowUp::ConfidenceSummary { message, .. }) => {
-                confidence_summary_sent = true;
+        let gate_digest =
+            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
+        match build_run_auto_poke_follow_up_from_todos(
+            &todos,
+            confidence_spike_challenged,
+            gate_digest,
+        ) {
+            Some(RunAutoPokeFollowUp::GateDigest { message }) => {
+                if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
+                    if let Some(max_turns) = max_turns {
+                        eprintln!(
+                            "We stopped poking after {max_turns} turn(s); some quality-review points are still open."
+                        );
+                    }
+                    break;
+                }
+                gate_digest_delivered = true;
+                next_message = message;
+                eprintln!(
+                    "We asked the agent to double-check this turn's weak points. Set JCODE_RUN_AUTO_POKE=0 to disable."
+                );
+                continue;
+            }
+            Some(RunAutoPokeFollowUp::ConfidenceSummary {
+                message,
+                confidence_spike_challenge,
+                ..
+            }) => {
+                if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
+                    if let Some(max_turns) = max_turns {
+                        outputs.push(format!(
+                            "We stopped poking after {max_turns} turn(s); the agent's completion confidence still needs validation."
+                        ));
+                    }
+                    break;
+                }
+                confidence_spike_challenged |= confidence_spike_challenge;
                 next_message = message;
                 continue;
             }
@@ -2705,7 +2807,7 @@ async fn run_single_message_command_capture_with_auto_poke(
                 if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
                     if let Some(max_turns) = max_turns {
                         outputs.push(format!(
-                            "Auto-poke stopped after {max_turns} turn(s) with {} incomplete todo(s).",
+                            "We stopped poking after {max_turns} turn(s); {} todo(s) are still unfinished.",
                             count
                         ));
                     }
@@ -2755,7 +2857,8 @@ async fn run_single_message_command_ndjson(
     let mut next_message = message.to_string();
     let mut result: Result<()> = Ok(());
     let mut turns_completed = 0usize;
-    let mut confidence_summary_sent = false;
+    let mut confidence_spike_challenged = false;
+    let mut gate_digest_delivered = false;
     loop {
         let turn_result = {
             let mut run_future = std::pin::pin!(agent.run_once_streaming_mpsc(
@@ -2796,12 +2899,49 @@ async fn run_single_message_command_ndjson(
             break;
         }
         let todos = run_todos(&session_id);
-        match build_run_auto_poke_follow_up_from_todos(&todos, confidence_summary_sent) {
+        let gate_digest =
+            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
+        match build_run_auto_poke_follow_up_from_todos(
+            &todos,
+            confidence_spike_challenged,
+            gate_digest,
+        ) {
+            Some(RunAutoPokeFollowUp::GateDigest { message }) => {
+                if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
+                    if let Some(max_turns) = max_turns {
+                        eprintln!(
+                            "We stopped poking after {max_turns} turn(s); some quality-review points are still open."
+                        );
+                    }
+                    break;
+                }
+                gate_digest_delivered = true;
+                next_message = message;
+                eprintln!(
+                    "We asked the agent to double-check this turn's weak points. Set JCODE_RUN_AUTO_POKE=0 to disable."
+                );
+                continue;
+            }
             Some(RunAutoPokeFollowUp::ConfidenceSummary {
                 total_todos,
                 message,
+                confidence_spike_challenge,
             }) => {
-                confidence_summary_sent = true;
+                if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
+                    if let Some(max_turns) = max_turns {
+                        write_json_line(
+                            &mut stdout,
+                            &serde_json::json!({
+                                "type": "auto_poke_stopped",
+                                "session_id": session_id,
+                                "completion_confidence_needs_validation": true,
+                                "max_turns": max_turns,
+                            }),
+                        )?;
+                    }
+                    break;
+                }
+                confidence_spike_challenged |= confidence_spike_challenge;
                 next_message = message;
                 write_json_line(
                     &mut stdout,
@@ -2809,6 +2949,7 @@ async fn run_single_message_command_ndjson(
                         "type": "auto_poke_confidence_summary",
                         "session_id": session_id,
                         "todos": total_todos,
+                        "confidence_spike_challenge": confidence_spike_challenge,
                         "message": next_message,
                     }),
                 )?;
@@ -2972,9 +3113,10 @@ fn emit_ndjson_event(
                 &serde_json::json!({ "type": "status_detail", "detail": detail }),
             )
         }
-        ServerEvent::MessageEnd => {
-            write_json_line(stdout, &serde_json::json!({ "type": "message_end" }))
-        }
+        ServerEvent::MessageEnd { stop_reason } => write_json_line(
+            stdout,
+            &serde_json::json!({ "type": "message_end", "stop_reason": stop_reason }),
+        ),
         ServerEvent::UpstreamProvider { provider } => {
             state.upstream_provider = Some(provider.clone());
             write_json_line(
@@ -3202,10 +3344,11 @@ fn filter_cli_model_routes_for_choice(
         ProviderChoice::Claude | ProviderChoice::ClaudeSubprocess => {
             route.api_method_kind().is_anthropic_credential_route()
         }
-        ProviderChoice::Openai => matches!(
-            route.api_method_kind(),
-            crate::provider::ModelRouteApiMethod::OpenAIOAuth
-        ),
+        ProviderChoice::Openai => {
+            let method = route.api_method_kind();
+            matches!(method, crate::provider::ModelRouteApiMethod::OpenAIOAuth)
+                || matches!(method, crate::provider::ModelRouteApiMethod::Other(ref value) if value == "chatgpt-web")
+        }
         ProviderChoice::OpenaiApi => matches!(
             route.api_method_kind(),
             crate::provider::ModelRouteApiMethod::OpenAIApiKey

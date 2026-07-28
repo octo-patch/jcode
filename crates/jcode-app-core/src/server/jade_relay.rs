@@ -512,17 +512,21 @@ impl RelayClient {
                 queue,
                 stop_signal,
             );
-            if !control.queue_soft_interrupt(interrupt, true, SoftInterruptSource::User) {
+            if !control.queue_soft_interrupt(interrupt, Vec::new(), true, SoftInterruptSource::User)
+            {
                 anyhow::bail!(
                     "session '{}' could not accept cancel interrupt",
                     self.config.session_id
                 );
             }
-            control.request_cancel();
+            let cancel_epoch = control.request_cancel();
             let reset_control = control.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(CANCEL_SIGNAL_RESET).await;
-                reset_control.reset_cancel();
+                // Epoch-guarded so a newer cancel (e.g. the user pressing Esc
+                // in an attached TUI) fired during the window is not erased
+                // before the running turn observes it (issue #428).
+                reset_control.reset_cancel_if_epoch(cancel_epoch);
             });
             ("signalled", Some(CANCEL_SIGNAL_RESET.as_millis() as u64))
         } else if live_agent {
@@ -1139,19 +1143,22 @@ fn spawn_launch_window(
         .map(|(path, _label)| path)
         .or_else(|| std::env::current_exe().ok())
         .unwrap_or_else(|| PathBuf::from("jcode"));
+    let context = crate::session_launch::SessionSpawnContext::kind("jade-relay");
     if selfdev_requested {
-        crate::session_launch::spawn_selfdev_in_new_terminal_with_provider(
+        crate::session_launch::spawn_selfdev_in_new_terminal_with_context(
             &exe,
             session_id,
             cwd,
             provider_key,
+            &context,
         )
     } else {
-        crate::session_launch::spawn_resume_in_new_terminal_with_provider(
+        crate::session_launch::spawn_resume_in_new_terminal_with_context(
             &exe,
             session_id,
             cwd,
             provider_key,
+            &context,
         )
     }
 }

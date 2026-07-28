@@ -178,7 +178,7 @@ impl App {
                             .as_deref()
                             .unwrap_or("(provider default)"),
                         AccountPickerCommand::PromptValue {
-                            prompt: "Enter OpenAI reasoning effort: none, low, medium, high, xhigh, or clear.".to_string(),
+                            prompt: "Enter OpenAI reasoning effort: none, minimal, low, medium, high, xhigh, max, or clear.".to_string(),
                             command_prefix: "/account openai effort".to_string(),
                             empty_value: Some("clear".to_string()),
                             status_notice: "Account: editing OpenAI effort...".to_string(),
@@ -1078,10 +1078,8 @@ impl App {
                 }
             }
             other => {
-                if let Some(input) = Self::account_command_for_picker(&other) {
-                    self.input = input;
-                    self.cursor_pos = self.input.len();
-                    self.submit_input();
+                if let Some(command) = crate::tui::app::auth::account_command_from_picker(&other) {
+                    crate::tui::app::auth::execute_account_command_local(self, command);
                 }
             }
         }
@@ -1106,32 +1104,6 @@ impl App {
             provider_id: provider_id.to_string(),
             display_name: display_name.to_string(),
         });
-    }
-
-    pub(crate) fn account_command_for_picker(
-        command: &crate::tui::account_picker::AccountPickerCommand,
-    ) -> Option<String> {
-        use crate::tui::account_picker::{AccountPickerCommand, AccountProviderKind};
-
-        match command {
-            AccountPickerCommand::SubmitInput(input) => Some(input.clone()),
-            AccountPickerCommand::OpenAccountCenter { .. }
-            | AccountPickerCommand::OpenAddReplaceFlow { .. }
-            | AccountPickerCommand::PromptValue { .. }
-            | AccountPickerCommand::PromptNew { .. } => None,
-            AccountPickerCommand::Switch { provider, label } => Some(match provider {
-                AccountProviderKind::Anthropic => format!("/account switch {}", label),
-                AccountProviderKind::OpenAi => format!("/account openai switch {}", label),
-            }),
-            AccountPickerCommand::Login { provider, label } => Some(match provider {
-                AccountProviderKind::Anthropic => format!("/account claude add {}", label),
-                AccountProviderKind::OpenAi => format!("/account openai add {}", label),
-            }),
-            AccountPickerCommand::Remove { provider, label } => Some(match provider {
-                AccountProviderKind::Anthropic => format!("/account claude remove {}", label),
-                AccountProviderKind::OpenAi => format!("/account openai remove {}", label),
-            }),
-        }
     }
 
     pub(crate) fn prompt_account_value(

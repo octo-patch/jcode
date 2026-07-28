@@ -1,206 +1,103 @@
-import SwiftUI
 import AVFoundation
+import SwiftUI
 
-#if canImport(UIKit)
-import UIKit
+/// Camera-based QR scanner for pairing codes.
+struct QRScannerView: UIViewControllerRepresentable {
+    let onScan: (String) -> Void
 
-struct QRScannerView: View {
-    @Binding var isPresented: Bool
-    let onScanned: (String, UInt16, String) -> Void
-
-    @State private var cameraPermissionGranted = false
-    @State private var showPermissionDenied = false
-
-    var body: some View {
-        NavigationStack {
-            ZStack {
-                JC.Colors.background.ignoresSafeArea()
-
-                if cameraPermissionGranted {
-                    QRCameraView { uri in
-                        if let parsed = parseJCodeURI(uri) {
-                            onScanned(parsed.host, parsed.port, parsed.code)
-                            isPresented = false
-                        }
-                    }
-                    .ignoresSafeArea()
-                    .overlay(alignment: .bottom) {
-                        VStack(spacing: JC.Spacing.sm) {
-                            Image(systemName: "viewfinder")
-                                .font(.system(size: 24))
-                                .foregroundStyle(JC.Colors.accent)
-                            Text("Point at the QR code from **jcode pair**")
-                                .font(JC.Fonts.callout)
-                                .foregroundStyle(JC.Colors.textPrimary)
-                        }
-                        .padding(JC.Spacing.lg)
-                        .background(.ultraThinMaterial)
-                        .clipShape(RoundedRectangle(cornerRadius: JC.Radius.md))
-                        .padding(.bottom, 40)
-                    }
-                } else if showPermissionDenied {
-                    VStack(spacing: JC.Spacing.lg) {
-                        Image(systemName: "camera.fill")
-                            .font(.system(size: 40))
-                            .foregroundStyle(JC.Colors.textTertiary)
-                        Text("Camera Access Required")
-                            .font(JC.Fonts.title2)
-                            .foregroundStyle(JC.Colors.textPrimary)
-                        Text("Grant camera access in Settings to scan QR codes.")
-                            .font(JC.Fonts.callout)
-                            .foregroundStyle(JC.Colors.textSecondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .padding(JC.Spacing.xxl)
-                } else {
-                    VStack(spacing: JC.Spacing.md) {
-                        ProgressView()
-                            .tint(JC.Colors.accent)
-                        Text("Requesting camera access...")
-                            .font(JC.Fonts.callout)
-                            .foregroundStyle(JC.Colors.textSecondary)
-                    }
-                }
-            }
-            .navigationTitle("Scan QR Code")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { isPresented = false }
-                        .foregroundStyle(JC.Colors.textSecondary)
-                }
-            }
-        }
-        .presentationBackground(JC.Colors.background)
-        .task {
-            await requestCameraAccess()
-        }
-    }
-
-    private func requestCameraAccess() async {
-        let status = AVCaptureDevice.authorizationStatus(for: .video)
-        switch status {
-        case .authorized:
-            cameraPermissionGranted = true
-        case .notDetermined:
-            let granted = await AVCaptureDevice.requestAccess(for: .video)
-            cameraPermissionGranted = granted
-            showPermissionDenied = !granted
-        default:
-            showPermissionDenied = true
-        }
-    }
-
-    private func parseJCodeURI(_ string: String) -> (host: String, port: UInt16, code: String)? {
-        guard let url = URL(string: string),
-              url.scheme == "jcode",
-              url.host == "pair",
-              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let items = components.queryItems else {
-            return nil
-        }
-
-        let host = items.first(where: { $0.name == "host" })?.value
-        let portStr = items.first(where: { $0.name == "port" })?.value
-        let code = items.first(where: { $0.name == "code" })?.value
-
-        guard let host, !host.isEmpty,
-              let portStr, let port = UInt16(portStr),
-              let code, !code.isEmpty else {
-            return nil
-        }
-
-        return (host, port, code)
-    }
-}
-
-struct QRCameraView: UIViewControllerRepresentable {
-    let onCodeScanned: (String) -> Void
-
-    func makeUIViewController(context: Context) -> QRScannerController {
-        let controller = QRScannerController()
-        controller.onCodeScanned = onCodeScanned
+    func makeUIViewController(context: Context) -> ScannerViewController {
+        let controller = ScannerViewController()
+        controller.onScan = onScan
         return controller
     }
 
-    func updateUIViewController(_ uiViewController: QRScannerController, context: Context) {}
+    func updateUIViewController(_ controller: ScannerViewController, context: Context) {}
 }
 
-private final class CaptureSessionWrapper: @unchecked Sendable {
-    let session = AVCaptureSession()
+final class ScannerViewController: UIViewController, @preconcurrency AVCaptureMetadataOutputObjectsDelegate {
+    var onScan: ((String) -> Void)?
 
-    func start() { session.startRunning() }
-    func stop() { session.stopRunning() }
-}
-
-final class QRScannerController: UIViewController {
-    var onCodeScanned: ((String) -> Void)?
-    private let wrapper = CaptureSessionWrapper()
-    private let delegateHandler = MetadataDelegate()
+    private let session = AVCaptureSession()
+    private var previewLayer: AVCaptureVideoPreviewLayer?
+    private var didScan = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        view.backgroundColor = .black
 
         guard let device = AVCaptureDevice.default(for: .video),
-              let input = try? AVCaptureDeviceInput(device: device) else {
+            let input = try? AVCaptureDeviceInput(device: device),
+            session.canAddInput(input)
+        else {
+            showUnavailableLabel()
             return
         }
-
-        let session = wrapper.session
         session.addInput(input)
 
         let output = AVCaptureMetadataOutput()
-        session.addOutput(output)
-
-        delegateHandler.onDetected = { [weak self] value in
-            self?.handleDetection(value)
+        guard session.canAddOutput(output) else {
+            showUnavailableLabel()
+            return
         }
-        output.setMetadataObjectsDelegate(delegateHandler, queue: .main)
+        session.addOutput(output)
+        output.setMetadataObjectsDelegate(self, queue: .main)
         output.metadataObjectTypes = [.qr]
 
-        let previewLayer = AVCaptureVideoPreviewLayer(session: session)
-        previewLayer.frame = view.layer.bounds
-        previewLayer.videoGravity = .resizeAspectFill
-        view.layer.addSublayer(previewLayer)
+        let preview = AVCaptureVideoPreviewLayer(session: session)
+        preview.videoGravity = .resizeAspectFill
+        preview.frame = view.bounds
+        view.layer.addSublayer(preview)
+        previewLayer = preview
+    }
 
-        Task.detached { [wrapper] in
-            wrapper.start()
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.bounds
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        didScan = false
+        let session = session
+        DispatchQueue.global(qos: .userInitiated).async {
+            if !session.isRunning {
+                session.startRunning()
+            }
         }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        Task.detached { [wrapper] in
-            wrapper.stop()
+        let session = session
+        DispatchQueue.global(qos: .userInitiated).async {
+            if session.isRunning {
+                session.stopRunning()
+            }
         }
     }
-
-    private func handleDetection(_ value: String) {
-        Task.detached { [wrapper] in
-            wrapper.stop()
-        }
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        onCodeScanned?(value)
-    }
-}
-
-private final class MetadataDelegate: NSObject, AVCaptureMetadataOutputObjectsDelegate {
-    var onDetected: ((String) -> Void)?
-    private var fired = false
 
     func metadataOutput(
         _ output: AVCaptureMetadataOutput,
         didOutput metadataObjects: [AVMetadataObject],
         from connection: AVCaptureConnection
     ) {
-        guard !fired,
-              let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
-              let value = object.stringValue,
-              value.hasPrefix("jcode://") else {
-            return
-        }
-        fired = true
-        onDetected?(value)
+        guard !didScan,
+            let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+            object.type == .qr,
+            let value = object.stringValue
+        else { return }
+        didScan = true
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        onScan?(value)
+    }
+
+    private func showUnavailableLabel() {
+        let label = UILabel()
+        label.text = "Camera unavailable"
+        label.textColor = .white
+        label.textAlignment = .center
+        label.frame = view.bounds
+        label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(label)
     }
 }
-#endif

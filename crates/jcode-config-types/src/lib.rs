@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+pub mod keybindings;
+pub use keybindings::{
+    KEYBINDING_DEFAULTS, KeybindingDefault, KeybindingIssue, KeybindingIssueKind,
+    KeybindingPlatform, KeybindingProvenance, PlatformDefault, default_binding, default_binding_or,
+    keybinding_default, keybinding_defaults_report, validate_keybinding_defaults,
+};
+
 /// Compaction mode
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +126,30 @@ impl DiffDisplayMode {
     }
 }
 
+/// When to show the overscroll status line (model/provider/context info below
+/// the input).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverscrollStatusMode {
+    /// Never show the status line.
+    Off,
+    /// Always show the status line below the input.
+    On,
+    /// Elastic reveal: show it briefly when scrolling past the bottom (default).
+    #[default]
+    Overscroll,
+}
+
+impl OverscrollStatusMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Overscroll => "overscroll",
+        }
+    }
+}
+
 /// How to display mermaid diagrams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -151,6 +182,38 @@ pub enum MarkdownSpacingMode {
     Document,
 }
 
+/// How LaTeX math is rendered in terminal markdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LatexRenderingMode {
+    /// Preserve the original LaTeX source and delimiters.
+    None,
+    /// Convert supported notation to terminal-friendly Unicode text.
+    Unicode,
+    /// Typeset formulas to PNG and display them with the terminal image protocol.
+    #[default]
+    Image,
+}
+
+impl LatexRenderingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unicode => "unicode",
+            Self::Image => "image",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "raw" | "off" => Some(Self::None),
+            "unicode" | "terminal" | "text" => Some(Self::Unicode),
+            "image" | "images" | "png" => Some(Self::Image),
+            _ => None,
+        }
+    }
+}
+
 impl MarkdownSpacingMode {
     pub fn label(self) -> &'static str {
         match self {
@@ -160,8 +223,49 @@ impl MarkdownSpacingMode {
     }
 }
 
+/// How to display the model's reasoning/thinking content in the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningDisplayMode {
+    /// Never display reasoning content.
+    #[default]
+    Off,
+    /// Keep every reasoning trace in the transcript (classic behavior).
+    Full,
+    /// Show only the *current* reasoning live; collapse it once the model
+    /// commits an assistant message or tool call, then show the next one.
+    Current,
+}
+
+impl ReasoningDisplayMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Full => "Full",
+            Self::Current => "Current",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::Current,
+            Self::Current => Self::Full,
+            Self::Full => Self::Off,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "off" | "none" | "false" | "0" | "no" => Some(Self::Off),
+            "full" | "all" | "true" | "1" | "yes" | "on" => Some(Self::Full),
+            "current" | "live" | "ephemeral" | "collapse" => Some(Self::Current),
+            _ => None,
+        }
+    }
+}
+
 /// Update channel: how aggressively to receive updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateChannel {
     /// Only update from tagged GitHub Releases (default).
@@ -169,6 +273,33 @@ pub enum UpdateChannel {
     Stable,
     /// Update from latest commit on main branch (bleeding edge).
     Main,
+}
+
+impl UpdateChannel {
+    /// Parse a channel name, returning `None` for unknown values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stable" | "release" => Some(Self::Stable),
+            "main" | "nightly" | "edge" => Some(Self::Main),
+            _ => None,
+        }
+    }
+}
+
+/// Config deserialization is deliberately lenient: an unknown or removed
+/// channel name (e.g. a stale `update_channel = "manual"` left in
+/// config.toml) falls back to the default channel instead of failing the
+/// entire config parse. A strict enum here once made the freshly exec'd
+/// server die during the reload handoff, leaving the handoff marker stuck
+/// in `starting` and clients re-requesting the reload forever (issue #349).
+impl<'de> Deserialize<'de> for UpdateChannel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::parse(&value).unwrap_or_default())
+    }
 }
 
 impl std::fmt::Display for UpdateChannel {
@@ -295,7 +426,7 @@ pub struct NamedProviderModelConfig {
     pub input: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NamedProviderConfig {
     #[serde(rename = "type")]
@@ -317,6 +448,25 @@ pub struct NamedProviderConfig {
     pub allow_provider_pinning: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<NamedProviderModelConfig>,
+    /// Extra top-level JSON fields merged into every chat/completions request
+    /// body sent to this provider. Lets users inject non-standard parameters
+    /// some OpenAI-compatible backends require (e.g. NVIDIA NIM DeepSeek-V4
+    /// needs `chat_template_kwargs = { thinking = true, reasoning_effort = "high" }`).
+    /// Must be a JSON object; keys here override jcode-generated body fields.
+    #[serde(default, alias = "extra-body", skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Value>,
+    /// Whether this endpoint accepts the DeepSeek-style top-level
+    /// `reasoning_effort` request field (`/effort` support). When unset, jcode
+    /// auto-detects it from the active model id (DeepSeek-family models
+    /// support it regardless of which gateway serves them). Set `false` to
+    /// suppress auto-detection for strict-schema endpoints.
+    #[serde(
+        default,
+        alias = "supports-reasoning-effort",
+        alias = "reasoning_effort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supports_reasoning_effort: Option<bool>,
 }
 
 impl Default for NamedProviderConfig {
@@ -336,6 +486,8 @@ impl Default for NamedProviderConfig {
             model_catalog: false,
             allow_provider_pinning: false,
             models: Vec::new(),
+            extra_body: None,
+            supports_reasoning_effort: None,
         }
     }
 }
@@ -352,7 +504,7 @@ pub struct AuthConfig {
 }
 
 /// Agent-specific model defaults.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsConfig {
     /// Optional default model override for spawned swarm/subagent sessions.
@@ -364,21 +516,134 @@ pub struct AgentsConfig {
     pub swarm_model: Option<String>,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
+    /// Maximum percentage (1-90) of the chat column height the inline swarm
+    /// gallery band may occupy. Leave unset to use the built-in default (40%).
+    /// Lower values keep more of the transcript visible; set near the minimum
+    /// to effectively collapse the gallery to a thin strip.
+    pub swarm_gallery_max_pct: Option<u8>,
+    /// Layout of the inline swarm strip above the status line:
+    /// `"vertical"` (default) lists one agent per row (session icon + status
+    /// glyph + task), capped to a few lines; `"horizontal"` packs all agents
+    /// as chips on a single row.
+    #[serde(default)]
+    pub swarm_strip_layout: SwarmStripLayout,
     /// Optional default model override for the memory sidecar.
     pub memory_model: Option<String>,
     /// Whether memory should use the sidecar for relevance/extraction.
+    ///
+    /// Defaults to `true`: the LLM precision-judge path is the only memory mode
+    /// that is reliably productive (injection precision ~1.0), so memory uses it
+    /// by default. Set to `false` only to deliberately opt into the lower-
+    /// precision no-LLM hybrid path. When sidecar mode is on but no LLM backend
+    /// is reachable, the memory runtime goes dormant instead of degrading to the
+    /// no-LLM path.
+    #[serde(default = "default_memory_sidecar_enabled")]
     pub memory_sidecar_enabled: bool,
+    /// Minimum turns between Mode-2 memory reranks (cadence floor). The
+    /// expensive listwise LLM rerank runs at most once per this many turns;
+    /// skipped turns fall back to hybrid-ordered surfacing. A topic change or
+    /// the first turn always forces a rerank regardless of cadence. 0 or 1 =
+    /// rerank every turn (no gating). Default 3.
+    #[serde(default = "default_memory_rerank_cadence")]
+    pub memory_rerank_cadence: usize,
+    /// Number of independent LLM rerank "judges" to run per fired rerank. Their
+    /// votes are combined and only memories meeting `memory_rerank_min_agree`
+    /// agreement are injected. 1 = single judge (cheapest). 2 = two judges must
+    /// agree, which lifts injection precision to ~1.0 with ~100% clean-rate on
+    /// no-memory turns (offline adjudication), at 2 LLM calls per fired turn.
+    #[serde(default = "default_memory_rerank_votes")]
+    pub memory_rerank_votes: usize,
+    /// Minimum judge agreement (of `memory_rerank_votes`) required to inject a
+    /// memory. Clamped to 1..=votes. Higher = stricter precision, lower recall.
+    #[serde(default = "default_memory_rerank_min_agree")]
+    pub memory_rerank_min_agree: usize,
+    /// Which embedding backend memory dense-retrieval uses: `"local"` (bundled
+    /// all-MiniLM-L6-v2 ONNX, default, no network) or `"openai"` (remote
+    /// OpenAI/openai-compatible `/v1/embeddings`, opt-in, requires an
+    /// `OPENAI_API_KEY`). A keyless `"openai"` setting silently degrades to
+    /// local. Env override: `JCODE_MEMORY_EMBEDDING_BACKEND`.
+    #[serde(default = "default_memory_embedding_backend")]
+    pub memory_embedding_backend: String,
+    /// OpenAI embedding model name when `memory_embedding_backend = "openai"`.
+    /// Unset = `text-embedding-3-small`. Env: `JCODE_MEMORY_EMBEDDING_MODEL`.
+    #[serde(default)]
+    pub memory_embedding_model: Option<String>,
+    /// Optional override for the embeddings API base URL (no trailing slash),
+    /// for OpenAI-compatible gateways. Unset = `https://api.openai.com/v1`.
+    /// Env: `JCODE_MEMORY_EMBEDDING_BASE_URL`.
+    #[serde(default)]
+    pub memory_embedding_base_url: Option<String>,
+    /// Optional override for the remote embedding dimensionality (vector-space
+    /// metadata / sanity checks). Unset = inferred from the model name.
+    #[serde(default)]
+    pub memory_embedding_dim: Option<usize>,
+    /// Maximum number of live swarm worker agents in one swarm. This is the RAM
+    /// safety budget for both recursive ad hoc spawning and deep-mode `run_plan`
+    /// parallelism. Completed/stopped workers do not consume slots. Light mode
+    /// still uses a smaller fixed fan-out. `0` disables this configurable guard,
+    /// leaving only the absolute `MAX_SWARM_MEMBERS` hard cap.
+    /// Env override: `JCODE_SWARM_MAX_CONCURRENT_AGENTS`.
+    #[serde(default = "default_swarm_max_concurrent_agents")]
+    pub swarm_max_concurrent_agents: usize,
+}
+
+fn default_swarm_max_concurrent_agents() -> usize {
+    32
+}
+
+fn default_memory_embedding_backend() -> String {
+    "local".to_string()
+}
+
+fn default_memory_sidecar_enabled() -> bool {
+    true
+}
+
+fn default_memory_rerank_cadence() -> usize {
+    3
+}
+
+fn default_memory_rerank_votes() -> usize {
+    2
+}
+
+fn default_memory_rerank_min_agree() -> usize {
+    2
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            swarm_model: None,
+            swarm_spawn_mode: SwarmSpawnMode::default(),
+            swarm_gallery_max_pct: None,
+            swarm_strip_layout: SwarmStripLayout::default(),
+            memory_model: None,
+            memory_sidecar_enabled: default_memory_sidecar_enabled(),
+            memory_rerank_cadence: default_memory_rerank_cadence(),
+            memory_rerank_votes: default_memory_rerank_votes(),
+            memory_rerank_min_agree: default_memory_rerank_min_agree(),
+            memory_embedding_backend: default_memory_embedding_backend(),
+            memory_embedding_model: None,
+            memory_embedding_base_url: None,
+            memory_embedding_dim: None,
+            swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
+        }
+    }
 }
 
 /// How swarm-created agents should be spawned.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SwarmSpawnMode {
-    /// Open a visible/headed terminal window. This preserves historical behavior.
-    #[default]
+    /// Open a visible/headed terminal window. This was the historical default.
     Visible,
     /// Create the worker in-process without opening a terminal window.
     Headless,
+    /// Like headless (no terminal window), but the coordinator renders a live
+    /// inline gallery viewport of each worker's streaming output.
+    #[default]
+    Inline,
     /// Try visible first and fall back to headless if a window cannot be opened.
     Auto,
 }
@@ -388,8 +653,155 @@ impl SwarmSpawnMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "visible" | "headed" => Some(Self::Visible),
             "headless" => Some(Self::Headless),
+            "inline" => Some(Self::Inline),
             "auto" => Some(Self::Auto),
             _ => None,
+        }
+    }
+
+    /// Canonical lowercase string for this mode (matches the config/env values).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Headless => "headless",
+            Self::Inline => "inline",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// Layout of the inline swarm strip shown above the status line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SwarmStripLayout {
+    /// One agent per row: session icon + status glyph + task label, capped to
+    /// a few lines with a `+N more` overflow marker.
+    #[default]
+    Vertical,
+    /// All agents packed as chips on a single row (the historical layout).
+    Horizontal,
+}
+
+impl SwarmStripLayout {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "vertical" | "list" => Some(Self::Vertical),
+            "horizontal" | "chips" | "strip" => Some(Self::Horizontal),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase string for this layout (matches config/env values).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vertical => "vertical",
+            Self::Horizontal => "horizontal",
+        }
+    }
+}
+
+/// Terminal window/pane spawning configuration.
+///
+/// Without a `spawn_hook`, Unix clients inside tmux are opened in a right-side
+/// pane by the built-in launcher. `JCODE_TERMINAL` explicitly selects a terminal
+/// emulator instead.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TerminalConfig {
+    /// External command that takes over headed session spawns (new terminal
+    /// windows for swarm agents, resume-in-new-terminal, self-dev, restarts).
+    ///
+    /// When set, jcode runs `<spawn_hook> <jcode-binary> <args...>` instead of
+    /// opening a terminal emulator itself, with `JCODE_SPAWN_*` metadata env
+    /// vars describing the spawn (kind, session id, title, cwd, full command).
+    /// This lets multiplexers and wrappers (tmux, kitty remote, zellij, herd
+    /// runners, window managers) decide where and how the session appears.
+    ///
+    /// Example: `spawn_hook = "tmux new-window"` opens each headed spawn as a
+    /// tmux window in the current server. If the hook fails to launch, jcode
+    /// falls back to its built-in terminal detection.
+    ///
+    /// Env override: `JCODE_SPAWN_HOOK` (set empty to disable a config hook).
+    pub spawn_hook: Option<String>,
+    /// External command used to focus/raise an existing session window.
+    ///
+    /// When set, jcode runs the hook (instead of wmctrl/xdotool) whenever it
+    /// wants to bring a session's window to the foreground, with
+    /// `JCODE_FOCUS_SESSION_ID` and `JCODE_FOCUS_TITLE` env vars. Pair this
+    /// with `spawn_hook` so wrappers that own placement (tmux, kitty remote,
+    /// herd) also own focus (e.g. `tmux select-window`, Wayland compositor
+    /// IPC like `niri msg`).
+    ///
+    /// Env override: `JCODE_FOCUS_HOOK` (set empty to disable a config hook).
+    pub focus_hook: Option<String>,
+    /// Terminal used by the macOS Cmd+; launch hotkey and in-app session spawns.
+    ///
+    /// One of: `ghostty`, `iterm2`, `wezterm`, `warp`, `alacritty`, `vscode`,
+    /// `terminal` (Apple Terminal). When set, this is the source of truth for
+    /// which terminal jcode launches into and is preferred over the legacy
+    /// `~/.jcode/preferred_terminal.json` file. Re-run `jcode setup-hotkey`
+    /// after changing it so the generated launcher script picks up the change.
+    ///
+    /// macOS only; ignored on other platforms.
+    pub preferred: Option<String>,
+}
+
+/// Lifecycle hooks: external commands jcode runs at well-defined points.
+///
+/// Hook commands are parsed shell-style (quotes work) but executed directly,
+/// with `JCODE_HOOK_*` env vars describing the event (`JCODE_HOOK_EVENT`,
+/// `JCODE_HOOK_SESSION_ID`, `JCODE_HOOK_CWD`, event-specific fields, and a
+/// `JCODE_HOOK_PAYLOAD` JSON mirror). Hook processes get
+/// `JCODE_HOOKS_DISABLED=1` so nested jcode invocations don't recurse.
+///
+/// All hooks except `pre_tool` are observers: detached, fire-and-forget,
+/// failures only logged. `pre_tool` is a gate: jcode waits for it and exit
+/// code 2 blocks the tool call (stderr becomes the error shown to the model);
+/// exit 0 allows; anything else fails open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    /// Runs when an agent turn begins (after the user message is added and
+    /// before the model starts generating). Fires before the first `pre_tool`,
+    /// so integrations can detect that the agent is actively working even while
+    /// it is only thinking/streaming text. Fields: MODEL, SOURCE
+    /// ("chat"/"resume"/"ambient"). Env override: JCODE_HOOK_TURN_START.
+    pub turn_start: Option<String>,
+    /// Runs when an agent turn completes.
+    /// Fields: STATUS ("ok"/"error"), DURATION_MS, MODEL, LAST_ASSISTANT_TEXT.
+    /// Env override: JCODE_HOOK_TURN_END.
+    pub turn_end: Option<String>,
+    /// Runs when a session becomes active (created or resumed).
+    /// Fields: SOURCE ("create"/"resume").
+    /// Env override: JCODE_HOOK_SESSION_START.
+    pub session_start: Option<String>,
+    /// Runs when a session closes normally.
+    /// Env override: JCODE_HOOK_SESSION_END.
+    pub session_end: Option<String>,
+    /// Gate hook before each tool call. Receives TOOL_NAME and the tool input
+    /// JSON on stdin (also truncated in TOOL_INPUT). Exit 0 allows, exit 2
+    /// blocks (stderr is fed back to the model), anything else fails open.
+    /// Env override: JCODE_HOOK_PRE_TOOL.
+    pub pre_tool: Option<String>,
+    /// Runs after each tool call completes.
+    /// Fields: TOOL_NAME, STATUS ("ok"/"error"), DURATION_MS, OUTPUT_BYTES.
+    /// Env override: JCODE_HOOK_POST_TOOL.
+    pub post_tool: Option<String>,
+    /// Max milliseconds to wait for the pre_tool gate before failing open
+    /// (default: 5000). Env override: JCODE_HOOK_PRE_TOOL_TIMEOUT_MS.
+    pub pre_tool_timeout_ms: u64,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            turn_start: None,
+            turn_end: None,
+            session_start: None,
+            session_end: None,
+            pre_tool: None,
+            post_tool: None,
+            pre_tool_timeout_ms: 5000,
         }
     }
 }
@@ -402,6 +814,36 @@ pub struct AutoReviewConfig {
     pub enabled: bool,
     /// Optional model override for autoreview reviewer sessions.
     pub model: Option<String>,
+}
+
+/// Tool partner discovery configuration.
+///
+/// Partner discovery makes third-party developer tools discoverable to the
+/// agent via a `discover_tools` tool backed by a hosted directory. Some
+/// partners may share revenue with Jcode when a referred user becomes a
+/// customer, but partnership status never influences recommendations. Each
+/// session's first use of `discover_tools` shows a concise disclosure with a
+/// learn-more link.
+/// See <https://jcode.sh/discovery-tools>.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SponsorsConfig {
+    /// Enable tool partner discovery. Enabled by default; set to false to opt
+    /// out. When false, no discovery categories are added to the prompt, the
+    /// `discover_tools` tool is not registered, and jcode never contacts the
+    /// discovery endpoint.
+    pub enabled: bool,
+    /// Base URL of the discovery endpoint.
+    pub endpoint: String,
+}
+
+impl Default for SponsorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: "https://api.jcode.sh/v1/discovery".to_string(),
+        }
+    }
 }
 
 /// Automatic end-of-turn execution judging configuration.
@@ -430,9 +872,12 @@ pub struct KeybindingsConfig {
     pub model_switch_next: String,
     /// Model switch previous key (default: "ctrl+shift+tab")
     pub model_switch_prev: String,
-    /// Effort increase key (default: "alt+right")
+    /// Accept the post-error fallback offer: switch to the next best
+    /// model/auth-method and resend the failed turn (default: "ctrl+y").
+    pub fallback_switch: String,
+    /// Effort increase key (default: "cmd+right" on macOS, "alt+right" elsewhere)
     pub effort_increase: String,
-    /// Effort decrease key (default: "alt+left")
+    /// Effort decrease key (default: "cmd+left" on macOS, "alt+left" elsewhere)
     pub effort_decrease: String,
     /// Centered mode toggle key (default: "alt+c")
     pub centered_toggle: String,
@@ -466,6 +911,20 @@ pub struct KeybindingsConfig {
     pub diff_mode_cycle: String,
     /// Toggle the info widget (default: "alt+i")
     pub info_widget_toggle: String,
+    /// Show/dismiss the session todo list as an inline card in the chat
+    /// transcript (default: "alt+x")
+    pub todo_card_toggle: String,
+    /// Focus/unfocus the inline swarm panel for keyboard navigation (default:
+    /// "alt+n"; alt+↑/↓ select, alt+o pops out, alt+shift+p opens the swarm
+    /// prompt, esc exits). Active only when `agents.swarm_spawn_mode = "inline"`
+    /// and the session manages swarm agents.
+    pub swarm_panel_focus: String,
+    /// Spawn a fresh jcode session in a new terminal window (default: unbound).
+    /// Example: "alt+enter".
+    pub new_terminal: String,
+    /// Open the `/resume` session picker (default: "cmd+b" on macOS, "alt+r"
+    /// elsewhere). Set "" to disable.
+    pub open_resume: String,
     /// Session picker Enter action: "current-terminal" (default) or "new-terminal".
     /// Ctrl+Enter performs the alternate action.
     pub session_picker_enter: SessionPickerResumeAction,
@@ -473,37 +932,54 @@ pub struct KeybindingsConfig {
 
 impl Default for KeybindingsConfig {
     fn default() -> Self {
+        // Pull platform-appropriate defaults from the single source of truth in
+        // `keybindings.rs`. This is where the macOS vs Windows/Linux split takes
+        // effect: each field resolves to its own platform's default binding.
+        let p = KeybindingPlatform::current();
+        let get = |id: &str, fallback: &'static str| {
+            default_binding(id, p).unwrap_or(fallback).to_string()
+        };
         Self {
-            scroll_up: "ctrl+k".to_string(),
-            scroll_down: "ctrl+j".to_string(),
-            scroll_page_up: "alt+u".to_string(),
-            scroll_page_down: "alt+d".to_string(),
-            model_switch_next: "ctrl+tab".to_string(),
-            model_switch_prev: "ctrl+shift+tab".to_string(),
-            effort_increase: "alt+right".to_string(),
-            effort_decrease: "alt+left".to_string(),
-            centered_toggle: "alt+c".to_string(),
-            scroll_prompt_up: "ctrl+[".to_string(),
-            scroll_prompt_down: "ctrl+]".to_string(),
-            scroll_bookmark: "ctrl+g".to_string(),
-            scroll_up_fallback: String::new(),
-            scroll_down_fallback: String::new(),
-            workspace_left: "alt+h".to_string(),
-            workspace_down: "alt+j".to_string(),
-            workspace_up: "alt+k".to_string(),
-            workspace_right: "alt+l".to_string(),
-            side_panel_toggle: "alt+m".to_string(),
-            copy_selection_toggle: "alt+y".to_string(),
-            diagram_pane_toggle: "alt+t".to_string(),
-            typing_scroll_lock_toggle: "alt+s".to_string(),
-            diff_mode_cycle: "alt+g".to_string(),
-            info_widget_toggle: "alt+i".to_string(),
+            scroll_up: get("scroll_up", "ctrl+k"),
+            scroll_down: get("scroll_down", "ctrl+j"),
+            scroll_page_up: get("scroll_page_up", "alt+u"),
+            scroll_page_down: get("scroll_page_down", "alt+d"),
+            model_switch_next: get("model_switch_next", "ctrl+tab"),
+            model_switch_prev: get("model_switch_prev", "ctrl+shift+tab"),
+            fallback_switch: get("fallback_switch", "ctrl+y"),
+            effort_increase: get("effort_increase", "alt+right"),
+            effort_decrease: get("effort_decrease", "alt+left"),
+            centered_toggle: get("centered_toggle", "alt+c"),
+            scroll_prompt_up: get("scroll_prompt_up", "ctrl+["),
+            scroll_prompt_down: get("scroll_prompt_down", "ctrl+]"),
+            scroll_bookmark: get("scroll_bookmark", "ctrl+g"),
+            scroll_up_fallback: get("scroll_up_fallback", ""),
+            scroll_down_fallback: get("scroll_down_fallback", ""),
+            workspace_left: get("workspace_left", "alt+h"),
+            workspace_down: get("workspace_down", "alt+j"),
+            workspace_up: get("workspace_up", "alt+k"),
+            workspace_right: get("workspace_right", "alt+l"),
+            side_panel_toggle: get("side_panel_toggle", "alt+m"),
+            copy_selection_toggle: get("copy_selection_toggle", "alt+y"),
+            diagram_pane_toggle: get("diagram_pane_toggle", "alt+t"),
+            typing_scroll_lock_toggle: get("typing_scroll_lock_toggle", "alt+s"),
+            diff_mode_cycle: get("diff_mode_cycle", "alt+g"),
+            info_widget_toggle: get("info_widget_toggle", "alt+i"),
+            todo_card_toggle: get("todo_card_toggle", "alt+x"),
+            swarm_panel_focus: get("swarm_panel_focus", "alt+n"),
+            new_terminal: get("new_terminal", ""),
+            open_resume: get(
+                "open_resume",
+                if cfg!(target_os = "macos") {
+                    "cmd+b"
+                } else {
+                    "alt+r"
+                },
+            ),
             session_picker_enter: SessionPickerResumeAction::CurrentTerminal,
         }
     }
 }
-
-/// How to display file diffs from edit/write tools
 /// Display/UI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -513,7 +989,6 @@ pub struct NativeScrollbarConfig {
     /// Show a native terminal scrollbar in the side panel (default: true)
     pub side_panel: bool,
 }
-
 impl Default for NativeScrollbarConfig {
     fn default() -> Self {
         Self {
@@ -522,7 +997,9 @@ impl Default for NativeScrollbarConfig {
         }
     }
 }
-
+fn default_true() -> bool {
+    true
+}
 /// Display/UI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -540,15 +1017,24 @@ pub struct DisplayConfig {
     pub mouse_capture: bool,
     /// Enable debug socket for external control (default: false)
     pub debug_socket: bool,
+    /// Render emoji in terminal-facing TUI and CLI output (default: true)
+    pub emoji: bool,
     /// Center all content (default: false)
     pub centered: bool,
     /// Show thinking/reasoning content by default (default: false)
     pub show_thinking: bool,
+    /// How to display reasoning/thinking content (off/full/current).
+    /// When unset, falls back to `show_thinking` (true => full, false => off).
+    #[serde(default)]
+    reasoning_display: Option<ReasoningDisplayMode>,
     /// How to display mermaid diagrams (none/margin/pinned, default: none).
-    /// Mermaid rendering is temporarily disabled for users unless JCODE_ENABLE_MERMAID=1.
+    /// `none` still renders diagrams inline in the transcript via the inline
+    /// image pipeline; `margin`/`pinned` add dedicated widget placements.
     pub diagram_mode: DiagramDisplayMode,
     /// Markdown block spacing style (compact/document, default: compact)
     pub markdown_spacing: MarkdownSpacingMode,
+    /// LaTeX rendering style (none/unicode/image, default: image)
+    pub latex_rendering: LatexRenderingMode,
     /// Pin read images to side pane (default: true)
     pub pin_images: bool,
     /// Show idle animation before first prompt (default: true)
@@ -567,12 +1053,45 @@ pub struct DisplayConfig {
     pub redraw_fps: u32,
     /// Show a truncated preview of the previous prompt at the top when it scrolls out of view (default: true)
     pub prompt_preview: bool,
+    /// Render swarm/file-activity notifications in a compact single-line form
+    /// instead of the full multi-line card with diff preview (default: false)
+    pub compact_notifications: bool,
     /// Override the Alt/Option label shown in copy badges. Empty = auto (⌥ on macOS, Alt elsewhere).
     pub copy_badge_alt_label: String,
+    /// Show the full agentgrep tool output inline in the transcript instead of
+    /// just the one-line summary (default: false)
+    #[serde(default)]
+    pub show_agentgrep_output: bool,
+    /// Show the dimmed technical detail (command, path, args) after the
+    /// model-provided intent on tool rows (default: false). When off, rows
+    /// that have an intent show only the intent; rows without an intent
+    /// always fall back to the technical detail.
+    #[serde(default)]
+    pub tool_call_details: bool,
     /// Native terminal scrollbar configuration for scrollable panes
     pub native_scrollbars: NativeScrollbarConfig,
+    /// Surface occasional "learn this keybinding" nudges when the user keeps
+    /// performing an action the slow way (slash command) instead of using its
+    /// configured shortcut (default: true). Set false to disable all such hints.
+    #[serde(default = "default_true")]
+    pub keybinding_hints: bool,
+    /// Color theme: "auto" (detect terminal background), "dark", or "light".
+    /// Auto queries the terminal's background color (OSC 11) at startup and
+    /// adapts jcode's palette for light backgrounds. Default: auto.
+    #[serde(default)]
+    pub theme: String,
+    /// Opt-in active sessions manager: pressing Left arrow on an empty input
+    /// opens a picker scoped to live (open) sessions, showing which are still
+    /// working and which are ready for input (default: false). The `/active`
+    /// command works regardless of this setting.
+    #[serde(default)]
+    pub active_sessions_manager: bool,
+    /// When to show the overscroll status line below the input
+    /// (off/on/overscroll, default: overscroll). "overscroll" is the elastic
+    /// reveal when scrolling past the bottom, "on" keeps it always visible.
+    #[serde(default)]
+    pub overscroll_status: OverscrollStatusMode,
 }
-
 impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
@@ -583,10 +1102,13 @@ impl Default for DisplayConfig {
             auto_server_reload: true,
             mouse_capture: true,
             debug_socket: false,
+            emoji: true,
             centered: false,
             show_thinking: false,
+            reasoning_display: Some(ReasoningDisplayMode::Off),
             diagram_mode: DiagramDisplayMode::default(),
             markdown_spacing: MarkdownSpacingMode::default(),
+            latex_rendering: LatexRenderingMode::default(),
             idle_animation: true,
             prompt_entry_animation: true,
             disabled_animations: Vec::new(),
@@ -595,12 +1117,18 @@ impl Default for DisplayConfig {
             animation_fps: 60,
             redraw_fps: 60,
             prompt_preview: true,
+            compact_notifications: false,
             copy_badge_alt_label: String::new(),
+            show_agentgrep_output: false,
+            tool_call_details: false,
             native_scrollbars: NativeScrollbarConfig::default(),
+            keybinding_hints: true,
+            theme: String::new(),
+            active_sessions_manager: false,
+            overscroll_status: OverscrollStatusMode::default(),
         }
     }
 }
-
 impl DisplayConfig {
     pub fn apply_legacy_compat(&mut self) {
         if let Some(show) = self.show_diffs.take() {
@@ -610,6 +1138,37 @@ impl DisplayConfig {
                 DiffDisplayMode::Off
             };
         }
+    }
+
+    /// Resolve the effective reasoning display mode. Prefers the explicit
+    /// `reasoning_display` field, falling back to the legacy `show_thinking`
+    /// boolean (true => Full, false => Off) when unset.
+    pub fn reasoning_display(&self) -> ReasoningDisplayMode {
+        self.reasoning_display.unwrap_or(if self.show_thinking {
+            ReasoningDisplayMode::Full
+        } else {
+            ReasoningDisplayMode::Off
+        })
+    }
+
+    /// Whether the user explicitly chose a reasoning display mode, as opposed
+    /// to inheriting the legacy `show_thinking` fallback. Front-ends use this
+    /// to apply their own default without overriding a deliberate choice.
+    pub fn has_explicit_reasoning_display(&self) -> bool {
+        self.reasoning_display.is_some()
+    }
+
+    /// Set the reasoning display mode and keep `show_thinking` in sync so the
+    /// provider request path (which still keys off `show_thinking`) requests
+    /// reasoning whenever any display mode is active.
+    pub fn set_reasoning_display(&mut self, mode: ReasoningDisplayMode) {
+        self.reasoning_display = Some(mode);
+        self.show_thinking = !matches!(mode, ReasoningDisplayMode::Off);
+    }
+
+    /// Whether reasoning content should be generated/requested at all.
+    pub fn reasoning_enabled(&self) -> bool {
+        !matches!(self.reasoning_display(), ReasoningDisplayMode::Off)
     }
 }
 
@@ -621,11 +1180,20 @@ pub struct FeatureConfig {
     pub memory: bool,
     /// Enable swarm coordination features (default: true)
     pub swarm: bool,
+    /// Enable Mermaid rendering and Mermaid-specific model guidance (default: true)
+    pub mermaid: bool,
     /// Inject timestamps into user messages and tool results sent to the model (default: true)
     pub message_timestamps: bool,
     /// Persist auto-recalled memory injections into normal session history instead of sending
     /// them as request-only ephemeral suffix messages (default: false)
     pub persist_memory_injections: bool,
+    /// Surface an in-chat system message whenever a request misses the KV cache
+    /// for a harness-caused (avoidable) reason: the system prompt, tool set, or
+    /// message prefix changed without the conversation legitimately growing.
+    /// These should essentially never happen, so the notice acts as a loud alarm
+    /// that something in the harness silently invalidated the prefix cache
+    /// (default: true).
+    pub kv_cache_miss_notices: bool,
     /// Update channel: "stable" (releases only) or "main" (latest commits)
     pub update_channel: UpdateChannel,
 }
@@ -635,8 +1203,10 @@ impl Default for FeatureConfig {
         Self {
             memory: true,
             swarm: true,
+            mermaid: true,
             message_timestamps: true,
             persist_memory_injections: false,
+            kv_cache_miss_notices: true,
             update_channel: UpdateChannel::default(),
         }
     }
@@ -719,7 +1289,7 @@ pub struct ProviderConfig {
     pub default_model: Option<String>,
     /// Default provider to use (claude|openai|copilot|openrouter)
     pub default_provider: Option<String>,
-    /// Reasoning effort for OpenAI Responses API (none|low|medium|high|xhigh)
+    /// Reasoning effort for OpenAI Responses API (none|minimal|low|medium|high|xhigh|max)
     pub openai_reasoning_effort: Option<String>,
     /// Reasoning effort for Anthropic Messages API output_config (none|low|medium|high|xhigh; max aliases to strongest supported)
     pub anthropic_reasoning_effort: Option<String>,
@@ -741,10 +1311,16 @@ pub struct ProviderConfig {
     /// Copilot premium request mode: "normal", "one", or "zero"
     /// "zero" means all requests are free (no premium requests consumed)
     pub copilot_premium: Option<String>,
+    /// When set (non-empty), /model only lists routes from these providers.
+    /// Entries match provider labels ("openai", "anthropic", "copilot",
+    /// "openrouter", ...), api methods ("claude-oauth",
+    /// "openai-compatible:myprofile", ...), or openai-compatible profile ids
+    /// ("myprofile"). The active model's routes always stay visible.
+    pub model_picker_providers: Option<Vec<String>>,
     /// Max seconds to wait for streaming data before timing out a request with
-    /// no data received. Raise this for slow reasoning models (e.g. DeepSeek)
-    /// that think silently for minutes before emitting tokens. Default: 180.
-    /// Overridable per-launch via `JCODE_STREAM_IDLE_TIMEOUT_SECS`.
+    /// no data received. Base budget only: high reasoning efforts scale it up
+    /// automatically (see `jcode_base::provider::stream_idle_timeout_for_effort`).
+    /// Default: 180. Overridable via `JCODE_STREAM_IDLE_TIMEOUT_SECS`.
     pub stream_idle_timeout_secs: u64,
 }
 
@@ -763,6 +1339,7 @@ impl Default for ProviderConfig {
             cross_provider_failover: CrossProviderFailoverMode::Countdown,
             same_provider_account_failover: true,
             copilot_premium: None,
+            model_picker_providers: None,
             stream_idle_timeout_secs: 180,
         }
     }
@@ -810,6 +1387,45 @@ impl Default for AmbientConfig {
             proactive_work: true,
             work_branch_prefix: "ambient/".to_string(),
             visible: true,
+        }
+    }
+}
+
+/// Desktop notification configuration for interactive sessions.
+///
+/// Unlike `[safety]` (ambient-mode ntfy/email/channel notifications), this
+/// section controls lightweight local desktop notifications for the normal
+/// interactive TUI, e.g. "agent finished a long turn".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Send a desktop notification when an agent turn completes (default: true).
+    /// Notifications fire only for long turns (see thresholds below) and, by
+    /// default, only while the terminal window is unfocused.
+    pub turn_complete: bool,
+    /// Minimum turn duration, in seconds, before a completed turn notifies
+    /// (default: 120).
+    pub turn_complete_min_secs: u64,
+    /// Lower duration threshold, in seconds, used when the session has todos
+    /// recorded, since todos indicate longer task-style work (default: 30).
+    pub turn_complete_todo_min_secs: u64,
+    /// Only notify while the terminal window is unfocused (default: true).
+    /// Requires a terminal that reports focus events (most modern terminals).
+    pub turn_complete_only_when_unfocused: bool,
+    /// macOS Notification Center sound name played on turn completion
+    /// (e.g. "Glass", "Ping", "Hero"). Empty string disables the sound.
+    /// Ignored on non-macOS platforms. Default: "Glass".
+    pub turn_complete_sound: String,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            turn_complete: true,
+            turn_complete_min_secs: 120,
+            turn_complete_todo_min_secs: 30,
+            turn_complete_only_when_unfocused: true,
+            turn_complete_sound: "Glass".to_string(),
         }
     }
 }
@@ -936,5 +1552,105 @@ impl Default for GatewayConfig {
             port: 7643,
             bind_addr: "0.0.0.0".to_string(),
         }
+    }
+}
+
+/// Power-management configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PowerConfig {
+    /// Prevent automatic system sleep while any jcode session is actively
+    /// streaming/processing. Linux also asks logind to block lid-switch suspend.
+    /// Windows cannot override a user-initiated lid close or power-button action;
+    /// those remain controlled by the active Windows power plan. The display is
+    /// still allowed to sleep. Default: true.
+    ///
+    /// Honored by the shared `jcode serve` daemon. The `JCODE_DISABLE_POWER_INHIBIT`
+    /// environment variable forces this off regardless of the config value.
+    pub prevent_sleep_while_streaming: bool,
+}
+
+impl Default for PowerConfig {
+    fn default() -> Self {
+        Self {
+            prevent_sleep_while_streaming: true,
+        }
+    }
+}
+
+/// A single global launch hotkey: a chord plus the directory it opens jcode in.
+///
+/// `dir` is usually an absolute path, but a few sentinels keep dynamic targets
+/// working without rewriting config on every launch:
+/// - `$HOME` -> the user's home directory.
+/// - `$LAST_DIR` -> the most recent non-home project directory jcode ran in.
+/// - `$LAST_REPO` -> the most recent jcode repo (for self-dev).
+///
+/// `self_dev = true` opens the directory as a self-dev session (passes the
+/// `self-dev` subcommand). `label` is an optional human name used in notices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchHotkeyEntry {
+    /// jcode-style chord string, e.g. `cmd+;`, `cmd+[`, `cmd+shift+'`.
+    pub chord: String,
+    /// Directory to open (absolute path or a `$HOME`/`$LAST_DIR`/`$LAST_REPO`
+    /// sentinel).
+    pub dir: String,
+    /// Optional short label (e.g. the repo's directory name) for notices.
+    #[serde(default)]
+    pub label: String,
+    /// Open as a self-dev session instead of a normal session.
+    #[serde(default)]
+    pub self_dev: bool,
+}
+
+/// Configuration for the global "launch a new jcode" hotkeys (macOS).
+///
+/// When `entries` is empty, jcode uses its built-in defaults (`Cmd+;` -> home,
+/// `Cmd+'` -> last project, `Cmd+Shift+'` -> self-dev). Auto-import can bake a
+/// richer, per-repo mapping here once: the top repo on `Cmd+;`, home on
+/// `Cmd+'`, and the next repos on `Cmd+[` / `Cmd+]` / `Cmd+\`. Once baked the
+/// mapping is static and does not move around as the user's activity changes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LaunchHotkeysConfig {
+    /// Whether the global launch hotkeys are installed at all. `None` means
+    /// "not decided yet" (fall back to the legacy auto-install gating); `Some`
+    /// is an explicit user/import choice.
+    pub enabled: Option<bool>,
+    /// Explicit chord -> directory mapping. Empty = use built-in defaults.
+    pub entries: Vec<LaunchHotkeyEntry>,
+    /// Set true once auto-import has populated `entries`, so we only bake the
+    /// per-repo mapping a single time and never clobber later user edits.
+    pub imported: bool,
+}
+
+#[cfg(test)]
+mod reasoning_display_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_reasoning_display_is_distinguishable_from_the_legacy_fallback() {
+        // Front-ends (the desktop) apply their own default only when the user
+        // has not chosen one, so this flag must not be true just because
+        // `show_thinking` happens to be set.
+        let mut display = DisplayConfig {
+            reasoning_display: None,
+            show_thinking: true,
+            ..DisplayConfig::default()
+        };
+        assert!(!display.has_explicit_reasoning_display());
+        assert_eq!(display.reasoning_display(), ReasoningDisplayMode::Full);
+
+        display.set_reasoning_display(ReasoningDisplayMode::Current);
+        assert!(display.has_explicit_reasoning_display());
+        assert_eq!(display.reasoning_display(), ReasoningDisplayMode::Current);
+        assert!(
+            display.show_thinking,
+            "any active display mode must keep reasoning requested from the provider"
+        );
+
+        display.set_reasoning_display(ReasoningDisplayMode::Off);
+        assert!(display.has_explicit_reasoning_display());
+        assert!(!display.show_thinking);
     }
 }

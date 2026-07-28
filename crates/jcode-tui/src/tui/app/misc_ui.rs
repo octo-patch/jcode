@@ -1,41 +1,122 @@
 use super::*;
 
+/// Resolved per-million-token pricing for the active model, used to turn a
+/// single API call's token usage into a dollar cost. Shared by the local
+/// (`update_cost_impl`) and remote (`accrue_remote_call_cost`) billing paths so
+/// they cannot drift apart.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolvedTokenPricing {
+    /// Fresh (uncached) input price in $/1M tokens.
+    pub prompt_price: f32,
+    /// Output/completion price in $/1M tokens.
+    pub completion_price: f32,
+    /// Cache-read price in $/1M tokens when known; falls back to `prompt_price`.
+    pub cache_read_price: Option<f32>,
+    /// Whether the active model is Anthropic/Claude (drives split-accounting and
+    /// the cache-write premium).
+    pub is_anthropic: bool,
+}
+
+impl ResolvedTokenPricing {
+    /// Dollar cost of one API call's reported usage.
+    ///
+    /// Providers report usage with two different conventions:
+    ///   - Split accounting (Anthropic): `input_tokens` already EXCLUDES the
+    ///     cache-read and cache-creation counts, which are reported separately.
+    ///     Subtracting cache-read from input again would double count it and bill
+    ///     fresh input at ~$0 on cache-hit turns.
+    ///   - Subset accounting (OpenAI-style): cached tokens are counted INSIDE
+    ///     `input_tokens`, so we subtract the cache-read portion to bill it at the
+    ///     cheaper cache rate.
+    ///
+    /// Mirrors the heuristic the cache/context paths use (see
+    /// `effective_prompt_tokens` / `effective_context_tokens_from_usage`).
+    pub fn cost_for_usage(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+    ) -> f32 {
+        let split_accounting =
+            self.is_anthropic || cache_creation_tokens > 0 || cache_read_tokens > input_tokens;
+
+        let fresh_input_tokens = if split_accounting {
+            input_tokens
+        } else {
+            input_tokens.saturating_sub(cache_read_tokens.min(input_tokens))
+        };
+
+        let prompt_cost = (fresh_input_tokens as f32 * self.prompt_price) / 1_000_000.0;
+        let completion_cost = (output_tokens as f32 * self.completion_price) / 1_000_000.0;
+        // Cache-read tokens are billed at the (cheaper) cache-read rate when we
+        // know it; otherwise treat them as regular input tokens.
+        let cache_read_cost = match self.cache_read_price {
+            Some(price) => (cache_read_tokens as f32 * price) / 1_000_000.0,
+            None => (cache_read_tokens as f32 * self.prompt_price) / 1_000_000.0,
+        };
+        // Cache *writes* (cache-creation) are billed at a premium over the base
+        // input rate. Anthropic charges 1.25x for the 5-minute TTL and 2x for the
+        // 1-hour TTL; other split-accounting providers we approximate at the base
+        // input rate. Subset-accounting providers fold writes into `input_tokens`
+        // (and rarely report a creation count), so we only add this for split
+        // accounting to avoid double counting.
+        let cache_write_cost = if split_accounting && cache_creation_tokens > 0 {
+            let multiplier = if self.is_anthropic {
+                if crate::provider::anthropic::is_cache_ttl_1h() {
+                    2.0
+                } else {
+                    1.25
+                }
+            } else {
+                1.0
+            };
+            (cache_creation_tokens as f32 * self.prompt_price * multiplier) / 1_000_000.0
+        } else {
+            0.0
+        };
+
+        prompt_cost + completion_cost + cache_read_cost + cache_write_cost
+    }
+}
+
 /// Update cost calculation based on token usage (for API-key providers)
 impl App {
     pub(super) fn current_streaming_tps_elapsed(&self) -> Duration {
-        let mut elapsed = self.streaming_tps_elapsed;
-        if let Some(start) = self.streaming_tps_start {
+        let mut elapsed = self.streaming.streaming_tps_elapsed;
+        if let Some(start) = self.streaming.streaming_tps_start {
             elapsed += start.elapsed();
         }
         elapsed
     }
 
     pub(super) fn snapshot_streaming_tps(&mut self) {
-        self.streaming_tps_observed_output_tokens = self.streaming_total_output_tokens;
-        self.streaming_tps_observed_elapsed = self.current_streaming_tps_elapsed();
+        self.streaming.streaming_tps_observed_output_tokens =
+            self.streaming.streaming_total_output_tokens;
+        self.streaming.streaming_tps_observed_elapsed = self.current_streaming_tps_elapsed();
     }
 
     pub(super) fn resume_streaming_tps(&mut self) {
-        self.streaming_tps_collect_output = true;
-        if self.streaming_tps_start.is_none() {
-            self.streaming_tps_start = Some(Instant::now());
+        self.streaming.streaming_tps_collect_output = true;
+        if self.streaming.streaming_tps_start.is_none() {
+            self.streaming.streaming_tps_start = Some(Instant::now());
         }
     }
 
     pub(super) fn pause_streaming_tps(&mut self, keep_collecting_output: bool) {
-        if let Some(start) = self.streaming_tps_start.take() {
-            self.streaming_tps_elapsed += start.elapsed();
+        if let Some(start) = self.streaming.streaming_tps_start.take() {
+            self.streaming.streaming_tps_elapsed += start.elapsed();
         }
-        self.streaming_tps_collect_output = keep_collecting_output;
+        self.streaming.streaming_tps_collect_output = keep_collecting_output;
     }
 
     pub(super) fn reset_streaming_tps(&mut self) {
-        self.streaming_tps_start = None;
-        self.streaming_tps_elapsed = Duration::ZERO;
-        self.streaming_tps_collect_output = false;
-        self.streaming_total_output_tokens = 0;
-        self.streaming_tps_observed_output_tokens = 0;
-        self.streaming_tps_observed_elapsed = Duration::ZERO;
+        self.streaming.streaming_tps_start = None;
+        self.streaming.streaming_tps_elapsed = Duration::ZERO;
+        self.streaming.streaming_tps_collect_output = false;
+        self.streaming.streaming_total_output_tokens = 0;
+        self.streaming.streaming_tps_observed_output_tokens = 0;
+        self.streaming.streaming_tps_observed_elapsed = Duration::ZERO;
     }
 
     pub(super) fn open_usage_inline_loading(&mut self) {
@@ -79,16 +160,27 @@ impl App {
         let runtime_provider = active_runtime_provider_key();
         let auth_status = crate::auth::AuthStatus::check_fast();
 
-        let is_explicit_anthropic_api = matches!(
+        let pinned_anthropic = jcode_provider_core::pinned_mode_for(
+            jcode_provider_core::DualAuthProvider::Anthropic,
             runtime_provider.as_deref(),
-            Some("claude-api" | "anthropic-api")
+        );
+        let pinned_openai = jcode_provider_core::pinned_mode_for(
+            jcode_provider_core::DualAuthProvider::OpenAI,
+            runtime_provider.as_deref(),
+        );
+        let is_explicit_anthropic_api = matches!(
+            pinned_anthropic,
+            Some(jcode_provider_core::AuthMode::ApiKey)
         );
         let is_explicit_anthropic_oauth =
-            matches!(runtime_provider.as_deref(), Some("claude" | "anthropic"));
-        let is_explicit_openai_api = matches!(runtime_provider.as_deref(), Some("openai-api"));
-        let is_explicit_openai_oauth = matches!(runtime_provider.as_deref(), Some("openai"));
+            matches!(pinned_anthropic, Some(jcode_provider_core::AuthMode::Oauth));
+        let is_explicit_openai_api =
+            matches!(pinned_openai, Some(jcode_provider_core::AuthMode::ApiKey));
+        let is_explicit_openai_oauth =
+            matches!(pinned_openai, Some(jcode_provider_core::AuthMode::Oauth));
 
         let is_anthropic = provider_name.contains("anthropic") || provider_name.contains("claude");
+        let is_openai = provider_name.contains("openai");
 
         // Whether the user is billed per token for this turn (direct API key).
         let billed_per_token = if provider_name.contains("openrouter") {
@@ -104,91 +196,261 @@ impl App {
                 || (!is_explicit_anthropic_oauth
                     && auth_status.anthropic.has_api_key
                     && !auth_status.anthropic.has_oauth)
-        } else if provider_name.contains("openai") {
+        } else if is_openai {
             is_explicit_openai_api
                 || (!is_explicit_openai_oauth
                     && auth_status.openai_has_api_key
                     && !auth_status.openai_has_oauth)
-        } else if provider_name.contains("bedrock")
-            || provider_name.contains("azure-openai")
-            || crate::provider_catalog::openai_compatible_profile_by_id(provider_name.trim())
-                .is_some_and(|profile| profile.requires_api_key)
-        {
-            true
         } else {
-            false
+            provider_name.contains("bedrock")
+                || provider_name.contains("azure-openai")
+                || crate::provider_catalog::openai_compatible_profile_by_id(provider_name.trim())
+                    .is_some_and(|profile| profile.requires_api_key)
         };
 
-        // For Anthropic OAuth / Claude subscription users there is no per-token
-        // billing, but we can still surface an estimated equivalent API cost so
-        // the info widget shows a dollar figure (like OpenRouter does).
-        let estimate_only = !billed_per_token && is_anthropic;
-
-        if !billed_per_token && !estimate_only {
+        if !billed_per_token {
             return;
         }
 
-        self.refresh_cached_pricing(is_anthropic);
+        let model = self.provider.model().to_string();
+        self.refresh_cached_pricing(&model, is_anthropic, is_openai);
 
         // Pricing in $/1M tokens. Anthropic resolves real per-model pricing in
         // refresh_cached_pricing; other providers fall back to the generic
         // defaults cached here.
-        let prompt_price = *self.cached_prompt_price.get_or_insert(15.0);
-        let completion_price = *self.cached_completion_price.get_or_insert(60.0);
-        let cache_read_price = self.cached_cache_read_price;
+        let prompt_price = *self.cost.cached_prompt_price.get_or_insert(15.0);
+        let completion_price = *self.cost.cached_completion_price.get_or_insert(60.0);
+        let cache_read_price = self.cost.cached_cache_read_price;
 
-        // Cache-read tokens are billed at the (cheaper) cache-read rate when we
-        // know it; otherwise treat them as regular input tokens.
-        let cache_read_tokens = self.streaming_cache_read_tokens.unwrap_or(0);
-        let full_input_tokens = self
-            .streaming_input_tokens
-            .saturating_sub(cache_read_tokens.min(self.streaming_input_tokens));
-
-        let prompt_cost = (full_input_tokens as f32 * prompt_price) / 1_000_000.0;
-        let completion_cost =
-            (self.streaming_output_tokens as f32 * completion_price) / 1_000_000.0;
-        let cache_read_cost = match cache_read_price {
-            Some(price) => (cache_read_tokens as f32 * price) / 1_000_000.0,
-            None => (cache_read_tokens as f32 * prompt_price) / 1_000_000.0,
+        let pricing = ResolvedTokenPricing {
+            prompt_price,
+            completion_price,
+            cache_read_price,
+            is_anthropic,
         };
-        let turn_cost = prompt_cost + completion_cost + cache_read_cost;
 
-        if estimate_only {
-            *self.estimated_cost.get_or_insert(0.0) += turn_cost;
-        } else {
-            self.total_cost += turn_cost;
+        let call_cost = pricing.cost_for_usage(
+            self.streaming.streaming_input_tokens,
+            self.streaming.streaming_output_tokens,
+            self.streaming.streaming_cache_read_tokens.unwrap_or(0),
+            self.streaming.streaming_cache_creation_tokens.unwrap_or(0),
+        );
+        self.cost.total_cost += call_cost;
+        self.record_api_key_spend(call_cost);
+    }
+
+    /// Accrue the dollar cost of a single completed remote API call.
+    ///
+    /// Local turns bill once at `finish_turn` via [`App::update_cost_impl`], but
+    /// the default interactive TUI is a *remote* client: it receives per-call
+    /// `ServerEvent::TokenUsage` and never runs the local cost path, so without
+    /// this the cost figure was stuck at `$0`. The server does not report a
+    /// dollar cost, only tokens, so the client prices each call itself.
+    ///
+    /// `input`/`output` are this call's totals and `*_delta` are the new tokens
+    /// since the previous usage snapshot for the same call, so a streaming call
+    /// that reports usage multiple times is billed exactly once overall.
+    pub(super) fn accrue_remote_call_cost(
+        &mut self,
+        input_delta: u64,
+        output_delta: u64,
+        cache_read_delta: u64,
+        cache_creation_delta: u64,
+    ) {
+        if input_delta == 0
+            && output_delta == 0
+            && cache_read_delta == 0
+            && cache_creation_delta == 0
+        {
+            return;
+        }
+        let Some(pricing) = self.resolve_remote_cost_pricing() else {
+            return;
+        };
+        let call_cost = pricing.cost_for_usage(
+            input_delta,
+            output_delta,
+            cache_read_delta,
+            cache_creation_delta,
+        );
+        self.cost.total_cost += call_cost;
+        self.record_api_key_spend(call_cost);
+    }
+
+    /// Seed `cost.total_cost` from token totals restored when resuming a
+    /// session, so the cost widget reflects prior spend instead of showing `$0`
+    /// until a new call happens.
+    ///
+    /// The live path (`accrue_remote_call_cost`) only ever observes per-call
+    /// usage events for calls that happen *during* this client's lifetime. When
+    /// an older session is reopened, its historical token totals are restored
+    /// from the server but the dollar cost was never reconstructed, leaving the
+    /// widget stuck at `$0`. This prices the restored totals once, the same way
+    /// a single completed call is priced, and overwrites `total_cost` (rather
+    /// than accruing) so it is idempotent across repeated history snapshots.
+    pub(super) fn seed_cost_from_history_totals(
+        &mut self,
+        totals: &crate::protocol::TokenUsageTotals,
+    ) {
+        if totals.input_tokens == 0 && totals.output_tokens == 0 {
+            return;
+        }
+        let Some(pricing) = self.resolve_remote_cost_pricing() else {
+            return;
+        };
+        let cost = pricing.cost_for_usage(
+            totals.input_tokens,
+            totals.output_tokens,
+            totals.cache_read_input_tokens,
+            totals.cache_creation_input_tokens,
+        );
+        if cost.is_finite() {
+            self.cost.total_cost = cost;
         }
     }
 
-    /// Resolve and cache per-model pricing for the active provider. For
-    /// Anthropic/Claude models we use the published API pricing (input, output
-    /// and cache-read), which lets us show an accurate dollar estimate even on
-    /// the subscription/OAuth plan. Re-resolves when the active model changes.
-    fn refresh_cached_pricing(&mut self, is_anthropic: bool) {
-        let model = self.provider.model().to_string();
-        if self.cached_price_model.as_deref() == Some(model.as_str()) {
+    /// Persist an API-key call cost into the cross-provider activity ledger so
+    /// `/usage` can show per-login spend (today / month / all-time). Only ever
+    /// called from the billed-per-token paths, so every dollar recorded here
+    /// is real API-key spend rather than subscription usage.
+    fn record_api_key_spend(&self, call_cost: f32) {
+        if !call_cost.is_finite() || call_cost <= 0.0 {
+            return;
+        }
+        use crate::tui::TuiState;
+        let label = <Self as TuiState>::provider_name(self);
+        let runtime = active_runtime_provider_key();
+        let source_key =
+            crate::provider_activity::source_key_for_provider_label(&label, runtime.as_deref());
+        let cost = call_cost as f64;
+        // Ledger writes hit the filesystem; never block the render/input loop.
+        std::thread::spawn(move || {
+            crate::provider_activity::record_spend(&source_key, cost);
+        });
+    }
+
+    /// Resolve per-token pricing for the active *remote* session, or `None` when
+    /// the session is not billed per token (e.g. an OAuth subscription, or a
+    /// provider we cannot price). Mirrors the cost-based decision the info widget
+    /// uses so the displayed `$` total and the widget stay consistent.
+    fn resolve_remote_cost_pricing(&mut self) -> Option<ResolvedTokenPricing> {
+        use crate::tui::TuiState;
+        if !self.is_remote {
+            return None;
+        }
+
+        let model = <Self as TuiState>::provider_model(self);
+        let provider_name = <Self as TuiState>::provider_name(self).to_lowercase();
+        let is_anthropic = provider_name.contains("anthropic") || provider_name.contains("claude");
+        let is_openai = provider_name.contains("openai");
+
+        // The server resolves the active credential authoritatively; only bill
+        // when it is an API key (OAuth subscriptions are not metered per token).
+        let api_key_billed = matches!(
+            self.remote_resolved_credential,
+            Some(jcode_provider_core::ResolvedCredential::ApiKey)
+        );
+
+        // For dual-auth providers (Anthropic/OpenAI) we require an API-key
+        // credential. Other cost-based providers (OpenCode, OpenRouter direct,
+        // bedrock-style API-key profiles) always meter per token when remote.
+        let billed = if is_anthropic || is_openai {
+            api_key_billed
+        } else {
+            // Providers that are inherently cost-based when proxied remotely.
+            provider_name.contains("opencode")
+                || provider_name.contains("openrouter")
+                || provider_name.contains("bedrock")
+                || provider_name.contains("cerebras")
+                || provider_name.contains("compatible")
+        };
+        if !billed {
+            return None;
+        }
+
+        self.refresh_cached_pricing(&model, is_anthropic, is_openai);
+        Some(ResolvedTokenPricing {
+            prompt_price: *self.cost.cached_prompt_price.get_or_insert(15.0),
+            completion_price: *self.cost.cached_completion_price.get_or_insert(60.0),
+            cache_read_price: self.cost.cached_cache_read_price,
+            is_anthropic,
+        })
+    }
+
+    /// Resolve and cache per-model pricing for the active provider. Uses the
+    /// unified resolver (curated static tables, then the OpenRouter caches,
+    /// then the live models.dev catalog) so any metered provider gets real
+    /// per-model prices instead of the generic defaults. Honors the active
+    /// service tier (`/fast on` priority, OpenAI flex), which changes
+    /// per-token rates on premium models. Re-resolves when the model or tier
+    /// changes.
+    fn refresh_cached_pricing(&mut self, model: &str, is_anthropic: bool, is_openai: bool) {
+        let service_tier = self.active_service_tier_for_pricing();
+        // Tier is part of the memo key so toggling `/fast on` re-prices.
+        let price_key = match service_tier.as_deref() {
+            Some(tier) => format!("{model}|{tier}"),
+            None => model.to_string(),
+        };
+        if self.cost.cached_price_model.as_deref() == Some(price_key.as_str()) {
             return;
         }
 
-        if is_anthropic {
-            if let Some(estimate) = jcode_provider_core::pricing::anthropic_api_pricing(&model) {
-                let per_mtok = |micros: Option<u64>| micros.map(|m| m as f32 / 1_000_000.0);
-                self.cached_prompt_price = per_mtok(estimate.input_price_per_mtok_micros);
-                self.cached_completion_price = per_mtok(estimate.output_price_per_mtok_micros);
-                self.cached_cache_read_price = per_mtok(estimate.cache_read_price_per_mtok_micros);
-                self.cached_price_model = Some(model);
-                return;
-            }
+        let per_mtok = |micros: Option<u64>| micros.map(|m| m as f32 / 1_000_000.0);
+        let source_key = if is_anthropic {
+            "claude:api-key".to_string()
+        } else if is_openai {
+            "openai:api-key".to_string()
+        } else {
+            use crate::tui::TuiState;
+            let label = <Self as TuiState>::provider_name(self);
+            let runtime = active_runtime_provider_key();
+            crate::provider_activity::source_key_for_provider_label(&label, runtime.as_deref())
+        };
+        let estimate = crate::provider::pricing::metered_pricing_for_source_with_tier(
+            &source_key,
+            model,
+            service_tier.as_deref(),
+        );
+
+        if let Some(estimate) = estimate {
+            self.cost.cached_prompt_price = per_mtok(estimate.input_price_per_mtok_micros);
+            self.cost.cached_completion_price = per_mtok(estimate.output_price_per_mtok_micros);
+            self.cost.cached_cache_read_price = per_mtok(estimate.cache_read_price_per_mtok_micros);
+            self.cost.cached_price_model = Some(price_key);
+            return;
         }
 
-        // Unknown model: leave existing defaults in place but remember the model
-        // so we do not repeatedly attempt resolution for it.
-        self.cached_price_model = Some(model);
+        // Unknown model/provider: clear any prices cached for a previous model
+        // so the generic defaults apply instead of another model's rates, and
+        // do NOT memoize the miss. The models.dev catalog refreshes in the
+        // background, so a later call can succeed (e.g. first run with an empty
+        // pricing cache); the retry is a cheap in-memory lookup per API call.
+        if self.cost.cached_price_model.is_some() {
+            self.cost.cached_prompt_price = None;
+            self.cost.cached_completion_price = None;
+            self.cost.cached_cache_read_price = None;
+            self.cost.cached_price_model = None;
+        }
+    }
+
+    /// Active service tier for pricing purposes: the server-reported tier for
+    /// remote sessions, the local provider's tier otherwise. `None` means the
+    /// standard tier.
+    fn active_service_tier_for_pricing(&self) -> Option<String> {
+        if self.is_remote {
+            self.remote_service_tier
+                .as_deref()
+                .map(str::trim)
+                .filter(|tier| !tier.is_empty())
+                .map(str::to_string)
+        } else {
+            self.provider.service_tier()
+        }
     }
 
     pub(super) fn compute_streaming_tps(&self) -> Option<f32> {
-        let elapsed_secs = self.streaming_tps_observed_elapsed.as_secs_f32();
-        let total_tokens = self.streaming_tps_observed_output_tokens;
+        let elapsed_secs = self.streaming.streaming_tps_observed_elapsed.as_secs_f32();
+        let total_tokens = self.streaming.streaming_tps_observed_output_tokens;
         if elapsed_secs > 0.1 && total_tokens > 0 {
             Some(total_tokens as f32 / elapsed_secs)
         } else {

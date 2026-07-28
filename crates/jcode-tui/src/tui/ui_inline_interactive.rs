@@ -37,20 +37,6 @@ fn pad_left_display(text: &str, width: usize) -> String {
     format!("{}{}", truncated, " ".repeat(padding))
 }
 
-fn pad_center_display(text: &str, width: usize) -> String {
-    let truncated = truncate_display(text, width);
-    let rendered = display_width(truncated.as_str());
-    let total_padding = width.saturating_sub(rendered);
-    let left_padding = total_padding / 2;
-    let right_padding = total_padding.saturating_sub(left_padding);
-    format!(
-        "{}{}{}",
-        " ".repeat(left_padding),
-        truncated,
-        " ".repeat(right_padding)
-    )
-}
-
 fn api_method_display(raw: &str) -> String {
     crate::provider::ModelRouteApiMethod::parse(raw).display_label()
 }
@@ -67,6 +53,7 @@ fn route_provider_display(provider: &str, api_method: &str) -> String {
 }
 
 fn picker_entry_display_name(entry: &crate::tui::PickerEntry) -> String {
+    let base = picker_entry_pretty_name(entry);
     let default_marker = if entry.is_default { " default" } else { "" };
     let is_new = entry
         .options
@@ -94,7 +81,35 @@ fn picker_entry_display_name(entry: &crate::tui::PickerEntry) -> String {
         default_marker.to_string()
     };
 
-    format!("{}{}", entry.name, suffix)
+    format!("{}{}", base, suffix)
+}
+
+/// Human-friendly rendering of a model picker row's model name.
+///
+/// `/model` rows historically showed the raw provider model id
+/// (`claude-opus-4-8`, `gpt-5.5 (high)`), which reads worse than the pretty
+/// names every other surface uses (header, status line, info widgets). We
+/// prettify only the well-known families so unfamiliar or namespaced ids
+/// (OpenRouter `vendor/model`, local profiles) keep their exact spelling and
+/// stay copy-pasteable. Effort suffixes such as ` (high)` are preserved.
+fn picker_entry_pretty_name(entry: &crate::tui::PickerEntry) -> String {
+    if !matches!(
+        entry.action,
+        crate::tui::PickerAction::Model | crate::tui::PickerAction::AgentModelChoice { .. }
+    ) {
+        return entry.name.clone();
+    }
+    let (base, suffix) = match entry.effort.as_deref() {
+        Some(_) => match entry.name.rsplit_once(" (") {
+            Some((base, rest)) => (base, format!(" ({rest}")),
+            None => (entry.name.as_str(), String::new()),
+        },
+        None => (entry.name.as_str(), String::new()),
+    };
+    match crate::tui::app::helpers::model_names::pretty_known_model_family(base) {
+        Some(pretty) => format!("{pretty}{suffix}"),
+        None => entry.name.clone(),
+    }
 }
 
 fn picker_row_marker(is_row_selected: bool, unavailable: bool, limited: bool) -> &'static str {
@@ -160,7 +175,23 @@ fn selected_route_notice_text(
     None
 }
 
-fn model_picker_keybind_hint(picker: &crate::tui::InlineInteractiveState) -> Option<&'static str> {
+fn model_picker_top_hint(picker: &crate::tui::InlineInteractiveState) -> Option<&'static str> {
+    let is_swarm_agent_model_picker = picker.kind == crate::tui::PickerKind::Model
+        && picker.entries.iter().any(|entry| {
+            matches!(
+                entry.action,
+                crate::tui::PickerAction::AgentModelChoice {
+                    target: crate::tui::AgentModelTarget::Swarm,
+                    ..
+                }
+            )
+        });
+    if is_swarm_agent_model_picker {
+        return Some(
+            " swarm routing is configured by a prompt · /swarm-prompt to edit the active file",
+        );
+    }
+
     // The favorite/default hotkeys now work in both the focused picker and the
     // as-you-type preview, so the hint is shown whenever this is a runtime model
     // picker (i.e. it has selectable model rows).
@@ -171,7 +202,7 @@ fn model_picker_keybind_hint(picker: &crate::tui::InlineInteractiveState) -> Opt
             .any(|entry| matches!(entry.action, crate::tui::PickerAction::Model));
     if is_runtime_model_picker {
         Some(
-            " keys: Ctrl+D set default · Ctrl+F toggle favorite · Shift+Tab switch active model to next favorite",
+            " keys: Ctrl+O set default · Ctrl+N favorite · Shift+Tab switch active model to next favorite",
         )
     } else {
         None
@@ -319,28 +350,7 @@ pub(super) fn format_elapsed(secs: f32) -> String {
 }
 
 fn fuzzy_match_positions(pattern: &str, text: &str) -> Vec<usize> {
-    let pat: Vec<char> = pattern
-        .to_lowercase()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if pat.is_empty() {
-        return Vec::new();
-    }
-    let txt: Vec<char> = text.to_lowercase().chars().collect();
-    let mut pi = 0;
-    let mut positions = Vec::new();
-    for (ti, &tc) in txt.iter().enumerate() {
-        if pi < pat.len() && tc == pat[pi] {
-            positions.push(ti);
-            pi += 1;
-        }
-    }
-    if pi == pat.len() {
-        positions
-    } else {
-        Vec::new()
-    }
+    jcode_fuzzy::fuzzy_match_positions(pattern, text)
 }
 
 pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, area: Rect) {
@@ -401,7 +411,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
 
     // Hotkey hint sits ABOVE the picker box (outside its border) so the
     // shortcuts are always visible without competing with the column headers.
-    let keybind_hint = model_picker_keybind_hint(picker);
+    let keybind_hint = model_picker_top_hint(picker);
     let hint_rows: u16 = if keybind_hint.is_some() && area.height > 3 {
         1
     } else {
@@ -502,7 +512,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
     };
     header_spans.push(Span::styled(
         if is_preview {
-            format!("{:^w$}", second_label, w = second_w)
+            format!(" {:<w$}", second_label, w = second_w.saturating_sub(1))
         } else {
             format!("{:<w$}", second_label, w = second_w)
         },
@@ -543,7 +553,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         ));
         if picker.shows_default_shortcut_hint() {
             header_spans.push(Span::styled(
-                "  Ctrl-D=set default",
+                "  Ctrl-O=set default",
                 Style::default().fg(rgb(60, 60, 80)).italic(),
             ));
         }
@@ -733,21 +743,19 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         }
 
         let padded_model = if is_preview {
-            pad_center_display(display_name.as_str(), model_width)
+            format!(
+                " {}",
+                pad_left_display(display_name.as_str(), model_width.saturating_sub(1))
+            )
         } else {
             pad_left_display(display_name.as_str(), model_width)
         };
 
         let match_positions = if !picker.filter.is_empty() {
-            let raw = fuzzy_match_positions(&picker.filter, &entry.name);
+            let raw = fuzzy_match_positions(&picker.filter, display_name.as_str());
             if is_preview && !raw.is_empty() {
-                let name_len = display_width(display_name.as_str());
-                let pad = if name_len < model_width {
-                    (model_width - name_len) / 2
-                } else {
-                    0
-                };
-                raw.into_iter().map(|p| p + pad).collect()
+                // Account for the single leading space in the preview model column.
+                raw.into_iter().map(|p| p + 1).collect()
             } else {
                 raw
             }
@@ -1015,8 +1023,11 @@ mod tests {
     fn picker_row_marker_uses_explicit_unavailable_marker() {
         assert_eq!(picker_row_marker(true, true, false), "×");
         assert_eq!(picker_row_marker(false, true, false), "×");
-        assert_eq!(picker_row_marker(true, false, true), "▸");
+        // Limited routes keep their warning marker even when selected, so the
+        // fallback/limited signal never disappears while navigating.
+        assert_eq!(picker_row_marker(true, false, true), "⚠");
         assert_eq!(picker_row_marker(false, false, true), "⚠");
+        assert_eq!(picker_row_marker(true, false, false), "▸");
         assert_eq!(picker_row_marker(false, false, false), " ");
     }
 
@@ -1073,9 +1084,20 @@ mod tests {
             width < 120,
             "model picker should fit content, not fill the window"
         );
-        assert!(
-            width >= 40,
-            "model picker should still fit its visible columns"
+        // Content-fit: marker + the widths of the model/provider/via columns.
+        // Each column is at least as wide as its header label, then grows to
+        // fit the widest row (the sample entry: "gpt-5.4 ★" / "openai" / OAuth).
+        let model = display_width(picker_entry_display_name(&picker.entries[0]).as_str())
+            .max(display_width(picker.primary_label()));
+        let provider =
+            display_width("openai").max(display_width(picker.secondary_label(false))) + 1;
+        let via = display_width(api_method_display("oauth").as_str())
+            .max(display_width(picker.tertiary_label()))
+            + 1;
+        assert_eq!(
+            width,
+            3 + model + provider + via,
+            "model picker width should equal its content-fit column widths"
         );
     }
 
@@ -1145,11 +1167,57 @@ mod tests {
     #[test]
     fn model_picker_keybind_hint_mentions_default_and_favorites() {
         let picker = sample_picker();
-        let hint =
-            model_picker_keybind_hint(&picker).expect("active model picker should show hint");
+        let hint = model_picker_top_hint(&picker).expect("active model picker should show hint");
 
-        assert!(hint.contains("Ctrl+D default"));
-        assert!(hint.contains("Ctrl+F favorite"));
+        assert!(hint.contains("Ctrl+O set default"));
+        assert!(hint.contains("Ctrl+N favorite"));
+    }
+
+    #[test]
+    fn swarm_agent_model_picker_permanently_links_to_swarm_prompt_command() {
+        let mut picker = sample_picker();
+        for entry in &mut picker.entries {
+            entry.action = crate::tui::PickerAction::AgentModelChoice {
+                target: crate::tui::AgentModelTarget::Swarm,
+                clear_override: false,
+            };
+        }
+
+        let hint = model_picker_top_hint(&picker).expect("swarm picker should show prompt hint");
+        assert!(hint.contains("/swarm-prompt"));
+        assert!(hint.contains("configured by a prompt"));
+    }
+
+    #[test]
+    fn picker_entry_display_name_prettifies_known_model_families() {
+        let mut picker = sample_picker();
+        let entry = &mut picker.entries[0];
+        entry.recommended = false;
+        entry.is_current = false;
+        entry.name = "claude-opus-4-8".to_string();
+        assert_eq!(picker_entry_display_name(entry), "Claude Opus 4.8");
+
+        entry.name = "gpt-5.5 (high)".to_string();
+        entry.effort = Some("high".to_string());
+        assert_eq!(picker_entry_display_name(entry), "GPT-5.5 (high)");
+    }
+
+    #[test]
+    fn picker_entry_display_name_keeps_unknown_and_namespaced_ids_verbatim() {
+        let mut picker = sample_picker();
+        let entry = &mut picker.entries[0];
+        entry.recommended = false;
+        entry.is_current = false;
+        for raw in [
+            "deepseek-ai/DeepSeek-V3",
+            "qwen3-coder-plus",
+            "openai/gpt-5.5",
+            "gpt-oss-120b",
+            "GLM-5.1",
+        ] {
+            entry.name = raw.to_string();
+            assert_eq!(picker_entry_display_name(entry), raw);
+        }
     }
 
     #[test]

@@ -51,7 +51,47 @@ impl Config {
             anyhow::anyhow!("Failed to parse config file {}: {}", path.display(), e)
         })?;
         config.display.apply_legacy_compat();
+        config.repair_frozen_sponsors_optout(&content);
         Ok(Some(config))
+    }
+
+    /// Undo a machine-frozen partner-discovery opt-out.
+    ///
+    /// Discovery shipped opt-in (`enabled = false`), and because [`Self::save`]
+    /// serializes the whole struct, any config write during that window baked
+    /// the old default into the user's file. Those users keep discovery
+    /// permanently disabled even after the default flipped to opt-out, and
+    /// telemetry shows this is the single largest discovery blocker.
+    ///
+    /// A machine-written section is exactly `enabled` plus `endpoint` with a
+    /// known default endpoint. A hand-written opt-out (`enabled = false` alone,
+    /// or paired with a custom endpoint) is always respected. Repair happens in
+    /// memory only; the section then disappears on the next save because it
+    /// serializes back to the default.
+    pub(crate) fn repair_frozen_sponsors_optout(&mut self, raw: &str) {
+        if self.sponsors.enabled {
+            return;
+        }
+        let Ok(doc) = raw.parse::<toml::Value>() else {
+            return;
+        };
+        let Some(table) = doc.get("sponsors").and_then(toml::Value::as_table) else {
+            return;
+        };
+        let machine_written = table.len() == 2
+            && table.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+            && table
+                .get("endpoint")
+                .and_then(toml::Value::as_str)
+                .is_some_and(super::is_default_discovery_endpoint);
+        if !machine_written {
+            return;
+        }
+        self.sponsors = SponsorsConfig::default();
+        crate::logging::info(
+            "config: restored partner discovery default (legacy opt-in value was frozen by an \
+             earlier config save)",
+        );
     }
 
     /// Save config to file
@@ -157,6 +197,274 @@ impl Config {
         cfg.save()?;
         crate::logging::info(&format!("Saved display.centered to config: {}", centered));
         Ok(())
+    }
+
+    /// Update the persisted reasoning display mode preference.
+    pub fn set_reasoning_display(mode: ReasoningDisplayMode) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.display.set_reasoning_display(mode);
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved display.reasoning_display to config: {}",
+            mode.label()
+        ));
+        Ok(())
+    }
+
+    /// Update the persisted compact-notifications preference.
+    pub fn set_compact_notifications(compact: bool) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.display.compact_notifications = compact;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved display.compact_notifications to config: {}",
+            compact
+        ));
+        Ok(())
+    }
+
+    /// Update the persisted show-agentgrep-output preference.
+    pub fn set_show_agentgrep_output(show: bool) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.display.show_agentgrep_output = show;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved display.show_agentgrep_output to config: {}",
+            show
+        ));
+        Ok(())
+    }
+
+    /// Update the persisted tool-call-details preference.
+    pub fn set_tool_call_details(show: bool) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.display.tool_call_details = show;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved display.tool_call_details to config: {}",
+            show
+        ));
+        Ok(())
+    }
+
+    /// Persist the baked global launch-hotkey mapping.
+    ///
+    /// Auto-import calls this once with the per-repo chord -> directory layout it
+    /// inferred. `imported` is set so the bake never runs twice and later manual
+    /// edits are not clobbered.
+    pub fn set_launch_hotkeys(
+        entries: Vec<jcode_config_types::LaunchHotkeyEntry>,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.launch_hotkeys.entries = entries;
+        cfg.launch_hotkeys.enabled = Some(enabled);
+        cfg.launch_hotkeys.imported = true;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved {} launch hotkey(s) to config (enabled={enabled})",
+            cfg.launch_hotkeys.entries.len()
+        ));
+        Ok(())
+    }
+
+    /// One-time bake of per-repo launch hotkeys from session history.
+    ///
+    /// Scans `~/.jcode/sessions` for the directories the user works in most,
+    /// ranks them (recency-weighted, git-root folded, home excluded), and writes
+    /// a static chord -> directory mapping into config: top repo on `Cmd+;`, home
+    /// on `Cmd+'`, and the next repos on `Cmd+[` / `Cmd+]` / `Cmd+\`.
+    ///
+    /// Idempotent and side-effect-light:
+    /// - Runs only on platforms with global launch hotkeys (macOS, Linux,
+    ///   Windows).
+    /// - No-ops once `launch_hotkeys.imported` is set, so it bakes exactly once
+    ///   and never overwrites later manual edits.
+    /// - No-ops when there are not at least two rankable repos, so we do not
+    ///   commit a degenerate "everything is home" layout on a fresh machine; the
+    ///   built-in 3 hotkeys keep working until there is real history.
+    ///
+    /// Returns `true` when it wrote a baked mapping (so the caller can trigger a
+    /// hotkey reinstall), `false` otherwise. Best-effort: errors are logged and
+    /// swallowed.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub fn bake_launch_hotkeys_once() -> bool {
+        use jcode_import_core::repo_ranking;
+
+        let cfg = Self::load();
+        if cfg.launch_hotkeys.imported {
+            return false;
+        }
+        let Ok(jcode_dir) = jcode_dir() else {
+            return false;
+        };
+        let sessions_dir = jcode_dir.join("sessions");
+        let Some(home) = dirs::home_dir() else {
+            return false;
+        };
+
+        // Cheap gate: count session files without reading them. Skip the full
+        // scan until there is at least a little history, so brand-new installs do
+        // not pay the read cost (and we do not bake a degenerate layout).
+        let session_count = std::fs::read_dir(&sessions_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".json")))
+                    .count()
+            })
+            .unwrap_or(0);
+        const MIN_SESSIONS_TO_BAKE: usize = 3;
+        const GIVE_UP_SESSION_COUNT: usize = 50;
+        if session_count < MIN_SESSIONS_TO_BAKE {
+            return false;
+        }
+
+        let plan = repo_ranking::plan_launch_hotkeys_from_sessions(
+            &sessions_dir,
+            &home,
+            chrono::Utc::now(),
+        );
+
+        // `plan` always contains the home slot; a length of 1 means no rankable
+        // repos were found.
+        if plan.len() < 2 {
+            // If the user has lots of history but still no rankable repos, stop
+            // re-scanning on every launch: mark imported with no custom entries
+            // (the built-in 3 hotkeys keep working).
+            if session_count >= GIVE_UP_SESSION_COUNT
+                && let Err(err) = Self::set_launch_hotkeys(Vec::new(), true)
+            {
+                crate::logging::warn(&format!("launch hotkey bake give-up persist failed: {err}"));
+            }
+            crate::logging::info(
+                "launch hotkey bake: not enough repo history yet; keeping defaults",
+            );
+            return false;
+        }
+
+        let entries: Vec<jcode_config_types::LaunchHotkeyEntry> = plan
+            .into_iter()
+            .map(|p| jcode_config_types::LaunchHotkeyEntry {
+                chord: p.chord,
+                // Home keeps the dynamic sentinel so it tracks `$HOME`; repos are
+                // baked to absolute paths.
+                dir: if p.label == "home" {
+                    "$HOME".to_string()
+                } else {
+                    p.dir
+                },
+                label: p.label,
+                self_dev: false,
+            })
+            .collect();
+
+        match Self::set_launch_hotkeys(entries, true) {
+            Ok(()) => {
+                crate::logging::info("launch hotkey bake: wrote per-repo mapping to config");
+                true
+            }
+            Err(err) => {
+                crate::logging::warn(&format!("launch hotkey bake failed to persist: {err}"));
+                false
+            }
+        }
+    }
+
+    /// No-op bake on platforms without global launch hotkeys.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    pub fn bake_launch_hotkeys_once() -> bool {
+        false
+    }
+
+    /// One-time migration: flip a persisted legacy `swarm_spawn_mode =
+    /// "visible"` to the current `"inline"` default.
+    ///
+    /// Historically `visible` was the default, and any full-config
+    /// `Config::save()` (model switches, display toggles, ...) baked that
+    /// then-default into the user's config.toml. When the default changed to
+    /// `inline`, those users stayed pinned to `visible` forever. This rewrites
+    /// exactly that one line (preserving the rest of the file byte-for-byte)
+    /// and drops a marker so it runs at most once. A user who explicitly sets
+    /// `visible` after the migration is never flipped again.
+    ///
+    /// Returns `true` when it rewrote the config. Best-effort: errors are
+    /// logged and swallowed.
+    pub fn migrate_legacy_swarm_spawn_mode_once() -> bool {
+        let Ok(dir) = jcode_dir() else {
+            return false;
+        };
+        let marker = dir.join("migrations").join("swarm-spawn-mode-inline");
+        if marker.exists() {
+            return false;
+        }
+        let write_marker = || {
+            if let Some(parent) = marker.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &marker,
+                "swarm_spawn_mode default migration: visible -> inline\n",
+            );
+        };
+
+        let path = dir.join("config.toml");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            // No config file (fresh install): nothing to migrate.
+            write_marker();
+            return false;
+        };
+
+        let mut changed = false;
+        let migrated: Vec<String> = content
+            .lines()
+            .map(|line| {
+                if changed {
+                    return line.to_string();
+                }
+                let trimmed = line.trim_start();
+                let Some(rest) = trimmed.strip_prefix("swarm_spawn_mode") else {
+                    return line.to_string();
+                };
+                let Some(value) = rest.trim_start().strip_prefix('=') else {
+                    return line.to_string();
+                };
+                let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+                if matches!(value, "visible" | "headed") {
+                    changed = true;
+                    let indent = &line[..line.len() - trimmed.len()];
+                    format!("{indent}swarm_spawn_mode = \"inline\"")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+
+        if !changed {
+            write_marker();
+            return false;
+        }
+
+        let mut new_content = migrated.join("\n");
+        if content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        match std::fs::write(&path, new_content) {
+            Ok(()) => {
+                Self::invalidate_cache();
+                write_marker();
+                crate::logging::info(
+                    "Migrated legacy swarm_spawn_mode \"visible\" to \"inline\" in config.toml",
+                );
+                true
+            }
+            Err(err) => {
+                crate::logging::warn(&format!(
+                    "swarm_spawn_mode migration failed to write config: {err}"
+                ));
+                false
+            }
+        }
     }
 
     fn normalize_external_auth_source_id(source_id: &str) -> String {
@@ -300,6 +608,28 @@ impl Config {
             crate::logging::info(&format!(
                 "Removed trusted external auth source path: {}",
                 entry
+            ));
+        }
+        Ok(())
+    }
+
+    /// Remove a source-level (non-path) trust decision, e.g. for credentials
+    /// that have no stable on-disk path (macOS Keychain items).
+    pub fn revoke_external_auth_source(source_id: &str) -> anyhow::Result<()> {
+        let source_id = Self::normalize_external_auth_source_id(source_id);
+        if source_id.is_empty() {
+            return Ok(());
+        }
+        let mut cfg = Self::load();
+        let before = cfg.auth.trusted_external_sources.len();
+        cfg.auth
+            .trusted_external_sources
+            .retain(|value| !value.trim().eq_ignore_ascii_case(&source_id));
+        if cfg.auth.trusted_external_sources.len() != before {
+            cfg.save()?;
+            crate::logging::info(&format!(
+                "Removed trusted external auth source: {}",
+                source_id
             ));
         }
         Ok(())

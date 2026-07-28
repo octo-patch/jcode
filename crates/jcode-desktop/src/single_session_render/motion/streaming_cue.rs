@@ -82,7 +82,7 @@ impl StreamingActivityCueMotionRegistry {
         app: &SingleSessionApp,
         now: Instant,
     ) -> StreamingActivityCueMotionFrame {
-        self.frame_for_visible(app.has_activity_indicator(), now)
+        self.frame_for_visible(app.streaming_activity_pill_visible(), now)
     }
 
     pub(crate) fn frame_for_visible(

@@ -1,6 +1,8 @@
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
+
 use super::{
     FileAccess, Server, SessionInterruptQueues, SwarmMember, dispatch_background_task_completion,
-    file_activity_scope_label, persist_swarm_state_snapshot,
+    file_activity_scope_label, persist_swarm_state_snapshot, remove_session_entry,
 };
 use crate::agent::Agent;
 use crate::bus::{
@@ -19,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::time::timeout;
 
 struct EnvGuard {
@@ -73,6 +75,74 @@ fn file_activity_scope_label_classifies_overlap() {
 
     let current = file_touch_with_summary(None);
     assert_eq!(file_activity_scope_label(&previous, &current), "same file");
+}
+
+#[tokio::test]
+async fn removing_server_session_clears_active_pid_marker() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("create temporary JCODE_HOME");
+    let _home_guard = ScopedEnvVar::set("JCODE_HOME", home.path());
+    let session_id = "session_marker_cleanup_test";
+    crate::storage::register_active_pid(session_id, std::process::id());
+
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        session_id.to_string(),
+        "agent",
+    )])));
+    let removed = remove_session_entry(&sessions, session_id).await;
+
+    assert_eq!(removed, Some("agent"));
+    assert!(!sessions.read().await.contains_key(session_id));
+    assert!(
+        !crate::storage::active_session_ids()
+            .iter()
+            .any(|id| id == session_id),
+        "removing a live server session must also remove its presence marker"
+    );
+}
+
+#[test]
+fn configured_server_name_normalizes_operator_labels() {
+    assert_eq!(
+        super::normalize_configured_server_name(" Mount Cloud/Fabian ").as_deref(),
+        Some("mount-cloud-fabian")
+    );
+    assert_eq!(
+        super::normalize_configured_server_name("john@example.com").as_deref(),
+        Some("john-example.com")
+    );
+    assert_eq!(super::normalize_configured_server_name(" 🫥 "), None);
+}
+
+#[test]
+fn server_identity_uses_configured_name() {
+    let _guard = crate::storage::lock_test_env();
+    let _server_name_guard = ScopedEnvVar::set("JCODE_SERVER_NAME", "env-name");
+    let _server_display_name_guard = ScopedEnvVar::set("JCODE_SERVER_DISPLAY_NAME", "display-name");
+
+    let server = Server::new_with_name(
+        Arc::new(StreamingMockProvider::default()),
+        Some("Mount Cloud/Fabian".to_string()),
+    );
+
+    assert_eq!(server.identity().name, "mount-cloud-fabian");
+    assert!(
+        server
+            .identity()
+            .id
+            .starts_with("server_mount-cloud-fabian_")
+    );
+}
+
+#[test]
+fn server_identity_reads_name_from_env() {
+    let _guard = crate::storage::lock_test_env();
+    let _server_name_guard = ScopedEnvVar::set("JCODE_SERVER_NAME", "mount-cloud/john");
+    let _server_display_name_guard = ScopedEnvVar::set("JCODE_SERVER_DISPLAY_NAME", "ignored");
+
+    let server = Server::new_with_name(Arc::new(StreamingMockProvider::default()), None);
+
+    assert_eq!(server.identity().name, "mount-cloud-john");
 }
 
 impl Drop for EnvGuard {
@@ -176,6 +246,22 @@ async fn test_agent(provider: Arc<dyn Provider>) -> Arc<Mutex<Agent>> {
     Arc::new(Mutex::new(Agent::new(provider, registry)))
 }
 
+#[allow(clippy::type_complexity)]
+fn empty_swarm_status_state() -> (
+    Arc<RwLock<HashMap<String, std::collections::HashSet<String>>>>,
+    Arc<RwLock<std::collections::VecDeque<super::SwarmEvent>>>,
+    Arc<std::sync::atomic::AtomicU64>,
+    broadcast::Sender<super::SwarmEvent>,
+) {
+    let (swarm_event_tx, _) = broadcast::channel(16);
+    (
+        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(std::collections::VecDeque::new())),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        swarm_event_tx,
+    )
+}
+
 fn attached_swarm_member(
     session_id: &str,
     event_tx: mpsc::UnboundedSender<ServerEvent>,
@@ -196,6 +282,11 @@ fn attached_swarm_member(
         joined_at: Instant::now(),
         last_status_change: Instant::now(),
         is_headless: false,
+        output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        runtime: crate::protocol::SwarmMemberRuntime::default(),
+        task_label: None,
     }
 }
 
@@ -222,6 +313,11 @@ fn persisted_headless_member(
         joined_at: Instant::now(),
         last_status_change: Instant::now(),
         is_headless: true,
+        output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        runtime: crate::protocol::SwarmMemberRuntime::default(),
+        task_label: None,
     }
 }
 
@@ -259,8 +355,18 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
         wake: true,
     };
 
-    dispatch_background_task_completion(&task, &sessions, &soft_interrupt_queues, &swarm_members)
-        .await;
+    let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    dispatch_background_task_completion(
+        &task,
+        &sessions,
+        &soft_interrupt_queues,
+        &swarm_members,
+        &swarms_by_id,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+    )
+    .await;
 
     let notification = timeout(Duration::from_secs(2), async {
         loop {
@@ -279,7 +385,7 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
     .expect("background task notification should arrive promptly");
 
     match notification.0 {
-        NotificationType::Message { scope, channel } => {
+        NotificationType::Message { scope, channel, .. } => {
             assert_eq!(scope.as_deref(), Some("background_task"));
             assert!(channel.is_none());
         }
@@ -311,6 +417,111 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
                 .content_preview()
                 .contains("**Background task** `bgwake`")
     }));
+}
+
+#[tokio::test]
+async fn wake_turn_tracks_member_status_and_emits_terminal_done() {
+    let provider = Arc::new(StreamingMockProvider::default());
+    provider.queue_response(vec![
+        StreamEvent::TextDelta("Wake turn finished.".to_string()),
+        StreamEvent::MessageEnd { stop_reason: None },
+    ]);
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+    let agent = test_agent(provider_dyn).await;
+    let session_id = agent.lock().await.session_id().to_string();
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        session_id.clone(),
+        agent.clone(),
+    )])));
+    let (member_event_tx, mut member_event_rx) = mpsc::unbounded_channel();
+    let mut member = attached_swarm_member(&session_id, member_event_tx);
+    member.swarm_id = Some("test-swarm".to_string());
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([(session_id.clone(), member)])));
+    let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    {
+        let mut swarms = swarms_by_id.write().await;
+        swarms.insert(
+            "test-swarm".to_string(),
+            std::collections::HashSet::from([session_id.clone()]),
+        );
+    }
+
+    let started = super::live_turn::run_live_turn_if_idle(
+        &session_id,
+        "DM from coordinator: please respond",
+        Some("You received a direct swarm message.".to_string()),
+        &sessions,
+        super::live_turn::LiveTurnSwarmContext::new(
+            &swarm_members,
+            &swarms_by_id,
+            &event_history,
+            &event_counter,
+            &swarm_event_tx,
+        ),
+    )
+    .await;
+    assert!(started, "idle live session should accept the wake turn");
+
+    // Member status must flip to running while the wake turn streams.
+    let observed_running = timeout(Duration::from_secs(2), async {
+        loop {
+            {
+                let members = swarm_members.read().await;
+                if members
+                    .get(&session_id)
+                    .is_some_and(|member| member.status == "running")
+                {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    // Attached clients must see a terminal Done event so the UI can settle.
+    let saw_done = timeout(Duration::from_secs(2), async {
+        loop {
+            match member_event_rx.recv().await {
+                Some(ServerEvent::Done { .. }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .expect("wake turn should emit a terminal event promptly");
+    assert!(saw_done, "wake turn must emit Done to attached clients");
+    assert!(
+        observed_running,
+        "member status should be running while the wake turn streams"
+    );
+
+    // After completion the member returns to ready with a completion report.
+    let (final_status, report) = timeout(Duration::from_secs(2), async {
+        loop {
+            {
+                let members = swarm_members.read().await;
+                if let Some(member) = members.get(&session_id)
+                    && member.status == "ready"
+                {
+                    return (
+                        member.status.clone(),
+                        member.latest_completion_report.clone(),
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("member should return to ready after the wake turn");
+    assert_eq!(final_status, "ready");
+    assert!(
+        report.is_some_and(|report| report.contains("Wake turn finished.")),
+        "completion report should capture the wake turn's assistant text"
+    );
 }
 
 #[tokio::test]
@@ -346,8 +557,18 @@ async fn background_task_notify_without_wake_does_not_queue_soft_interrupt() {
         wake: false,
     };
 
-    dispatch_background_task_completion(&task, &sessions, &soft_interrupt_queues, &swarm_members)
-        .await;
+    let (swarms_by_id, event_history, event_counter, swarm_event_tx) = empty_swarm_status_state();
+    dispatch_background_task_completion(
+        &task,
+        &sessions,
+        &soft_interrupt_queues,
+        &swarm_members,
+        &swarms_by_id,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+    )
+    .await;
 
     let notification = timeout(Duration::from_secs(2), member_event_rx.recv())
         .await
@@ -408,7 +629,7 @@ async fn background_task_progress_notifies_attached_clients() {
             ..
         } => {
             match notification_type {
-                NotificationType::Message { scope, channel } => {
+                NotificationType::Message { scope, channel, .. } => {
                     assert_eq!(scope.as_deref(), Some("background_task"));
                     assert!(channel.is_none());
                 }
@@ -724,12 +945,19 @@ async fn startup_ready_signal_is_not_blocked_by_headless_recovery_delay() -> Res
         "startup task should still be blocked on delayed recovery even though ready was already signaled"
     );
 
-    let (main_handle, debug_handle) = timeout(Duration::from_secs(2), startup)
+    let (runtime, main_handle, debug_handle) = timeout(Duration::from_secs(2), startup)
         .await
         .expect("startup should finish after delayed recovery")
         .expect("startup task should succeed");
-    main_handle.abort();
-    debug_handle.abort();
+    timeout(Duration::from_secs(1), runtime.shutdown())
+        .await
+        .expect("runtime should shut down");
+    timeout(Duration::from_secs(1), async {
+        main_handle.await.expect("main accept loop");
+        debug_handle.await.expect("debug accept loop");
+    })
+    .await
+    .expect("accept loops should observe runtime cancellation");
 
     Ok(())
 }

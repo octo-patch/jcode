@@ -5,6 +5,9 @@ pub struct ProviderUsage {
     pub extra_info: Vec<(String, String)>,
     pub hard_limit_reached: bool,
     pub error: Option<String>,
+    /// When jcode last successfully used this login/credential (unix seconds).
+    /// Drives most-recently-used-first ordering in `/usage`. `None` sorts last.
+    pub last_used_unix_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +73,7 @@ pub enum TelemetryToolCategory {
     Email,
     SidePanel,
     Goal,
+    Todo,
     Mcp,
     Other,
 }
@@ -92,6 +96,9 @@ pub fn classify_telemetry_tool_category(name: &str) -> TelemetryToolCategory {
         "gmail" => TelemetryToolCategory::Email,
         "side_panel" => TelemetryToolCategory::SidePanel,
         "initiative" => TelemetryToolCategory::Goal,
+        "todo" | "todowrite" | "todo_write" | "todoread" | "todo_read" => {
+            TelemetryToolCategory::Todo
+        }
         "mcp" => TelemetryToolCategory::Mcp,
         other if other.starts_with("mcp__") => TelemetryToolCategory::Mcp,
         _ => TelemetryToolCategory::Other,
@@ -245,6 +252,8 @@ pub struct InstallEvent {
     pub is_git_checkout: bool,
     pub is_ci: bool,
     pub ran_from_cargo: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_conversion_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +363,47 @@ pub struct FeedbackEvent {
     pub ran_from_cargo: bool,
 }
 
+/// One completed sponsored-discovery attempt. Free-text query and reason
+/// content are deliberately excluded. Only coarse presence flags and bounded
+/// service-controlled labels are emitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryEvent {
+    pub event_id: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub event: &'static str,
+    pub version: String,
+    pub os: &'static str,
+    pub arch: &'static str,
+    pub request_id: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_tool: Option<String>,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_count: Option<u32>,
+    pub query_present: bool,
+    pub reason_present: bool,
+    #[serde(default)]
+    pub benchmark_run: bool,
+    pub custom_endpoint: bool,
+    pub schema_version: u32,
+    pub build_channel: String,
+    pub is_git_checkout: bool,
+    pub is_ci: bool,
+    pub ran_from_cargo: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionLifecycleEvent {
     pub event_id: String,
@@ -405,6 +455,8 @@ pub struct SessionLifecycleEvent {
     pub feature_selfdev_used: bool,
     pub feature_background_used: bool,
     pub feature_subagent_used: bool,
+    #[serde(default)]
+    pub feature_todo_used: bool,
     pub unique_mcp_servers: u32,
     pub session_success: bool,
     pub abandoned_before_response: bool,
@@ -444,6 +496,20 @@ pub struct SessionLifecycleEvent {
     pub tool_cat_goal: u32,
     pub tool_cat_mcp: u32,
     pub tool_cat_other: u32,
+    #[serde(default)]
+    pub tool_cat_todo: u32,
+    #[serde(default)]
+    pub todo_gate_ownership_count: u32,
+    #[serde(default)]
+    pub todo_gate_hill_count: u32,
+    #[serde(default)]
+    pub todo_gate_alignment_count: u32,
+    #[serde(default)]
+    pub todo_gate_intent_count: u32,
+    #[serde(default)]
+    pub todo_gate_completion_count: u32,
+    #[serde(default)]
+    pub todo_gate_spike_count: u32,
     pub command_login_used: bool,
     pub command_model_used: bool,
     pub command_usage_used: bool,
@@ -546,6 +612,8 @@ pub struct TurnEndEvent {
     pub feature_selfdev_used: bool,
     pub feature_background_used: bool,
     pub feature_subagent_used: bool,
+    #[serde(default)]
+    pub feature_todo_used: bool,
     pub unique_mcp_servers: u32,
     pub tool_cat_read_search: u32,
     pub tool_cat_write: u32,
@@ -559,6 +627,20 @@ pub struct TurnEndEvent {
     pub tool_cat_goal: u32,
     pub tool_cat_mcp: u32,
     pub tool_cat_other: u32,
+    #[serde(default)]
+    pub tool_cat_todo: u32,
+    #[serde(default)]
+    pub todo_gate_ownership_count: u32,
+    #[serde(default)]
+    pub todo_gate_hill_count: u32,
+    #[serde(default)]
+    pub todo_gate_alignment_count: u32,
+    #[serde(default)]
+    pub todo_gate_intent_count: u32,
+    #[serde(default)]
+    pub todo_gate_completion_count: u32,
+    #[serde(default)]
+    pub todo_gate_spike_count: u32,
     pub workflow_chat_only: bool,
     pub workflow_coding_used: bool,
     pub workflow_research_used: bool,
@@ -655,6 +737,14 @@ mod telemetry_helper_tests {
         assert_eq!(
             classify_telemetry_tool_category("apply_patch"),
             TelemetryToolCategory::Write
+        );
+        assert_eq!(
+            classify_telemetry_tool_category("todo"),
+            TelemetryToolCategory::Todo
+        );
+        assert_eq!(
+            classify_telemetry_tool_category("todowrite"),
+            TelemetryToolCategory::Todo
         );
         assert_eq!(
             classify_telemetry_tool_category("mcp__github__issue"),

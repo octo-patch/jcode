@@ -173,6 +173,30 @@ fn test_wrapped_input_line_count_respects_two_digit_prompt_width() {
 }
 
 #[test]
+fn test_compute_visible_margins_left_aligned_respects_centered_header() {
+    // Regression: the header lines are always centered even in left-aligned mode.
+    // The right margin reported for a centered line must be the true right pad
+    // (~half the slack), not the full `width - used`, otherwise a right-side info
+    // widget is placed on top of the centered header text.
+    let lines = vec![
+        ratatui::text::Line::from("centered header").centered(),
+        ratatui::text::Line::from("left body").left_aligned(),
+    ];
+    let area = Rect::new(0, 0, 40, 2);
+    let margins = compute_visible_margins(&lines, &[], area, false);
+
+    // centered: used=15 => total_margin=25 => left=12, right=13. Left-aligned mode
+    // never places left-side widgets, so left is reported as 0, but the right gap
+    // must stay at the true 13 columns so widgets clear the centered text.
+    assert_eq!(margins.left_widths[0], 0);
+    assert_eq!(margins.right_widths[0], 13);
+
+    // left-aligned body is unchanged: full slack on the right.
+    assert_eq!(margins.left_widths[1], 0);
+    assert_eq!(margins.right_widths[1], 31);
+}
+
+#[test]
 fn test_compute_visible_margins_centered_respects_line_alignment() {
     let lines = vec![
         ratatui::text::Line::from("centered").centered(),
@@ -201,14 +225,40 @@ fn test_copy_badge_reserves_right_margin_for_info_widgets() {
         right_widths: vec![30, 30, 30],
         left_widths: vec![0, 0, 0],
         centered: false,
+        right_reliable: Vec::new(),
+        left_reliable: Vec::new(),
+        ..Default::default()
     };
     let copy_badge_ui = crate::tui::app::CopyBadgeUiState::default();
 
     reserve_copy_badge_margins(&mut margins, 10, 13, &[(11, 'a')], &copy_badge_ui, Instant::now());
 
     assert_eq!(margins.right_widths[0], 30);
-    assert_eq!(margins.right_widths[1], 17);
+    assert_eq!(margins.right_widths[1], 16);
     assert_eq!(margins.right_widths[2], 30);
+}
+
+#[test]
+fn test_expand_badge_reserves_right_margin_for_info_widgets() {
+    // The inline `[Alt] [⇧] [E] expand` badge is appended to a transcript row at
+    // render time. Without reserving its width in the margin profile, a floating
+    // info widget (e.g. the KV cache panel) would dock right up against the badge
+    // and get squeezed into a too-narrow slot that wraps/collides with it. The
+    // badge width must be carved out of the row's free width.
+    let collapsed = expand_badge_reserved_width(" expand");
+    let expanded = expand_badge_reserved_width(" ✓ Expanded");
+    assert!(
+        collapsed > 0 && expanded > 0,
+        "expand badge must reserve some width"
+    );
+
+    let mut width = 40u16;
+    width = width.saturating_sub(collapsed as u16);
+    assert_eq!(
+        width as usize,
+        40 - collapsed,
+        "reservation should shrink the row's free width by exactly the badge width"
+    );
 }
 
 #[test]
@@ -219,10 +269,54 @@ fn test_copy_badge_truncates_full_width_line_before_appending_shortcut() {
     let mut line = Line::from("x".repeat(viewport_width));
 
     truncate_copy_badge_line_to_width(&mut line, viewport_width.saturating_sub(reserved));
+    // Matches the render path: one separator space, then the shortcut badges.
+    line.spans.push(Span::raw(" "));
     line.spans.push(Span::raw("[Alt] [⇧] [A]"));
 
     assert_eq!(line.width(), viewport_width);
     assert!(line.width() <= viewport_width);
+}
+
+#[test]
+fn test_copy_badge_line_prefers_row_with_free_width_over_truncation() {
+    // A blockquote whose first line fills the viewport but whose second line
+    // is short: the badge must move to the short line instead of cutting off
+    // the first line's words.
+    let full = Line::from("│ ".to_string() + &"x".repeat(60));
+    let short = Line::from("│ short".to_string());
+    let visible_lines = vec![full, short];
+    let reserved = 14usize; // " [Alt] [⇧] [S]"
+
+    let picked = pick_copy_badge_line(0, 0, 2, 0, 2, &visible_lines, 62, reserved);
+    assert_eq!(picked, 1, "badge should move to the line with free width");
+
+    // When no line in the block fits, keep the natural badge line.
+    let picked_none = pick_copy_badge_line(0, 0, 1, 0, 1, &visible_lines, 62, reserved);
+    assert_eq!(picked_none, 0);
+}
+
+#[test]
+fn test_copy_badge_truncation_marks_cut_content_with_ellipsis() {
+    // Content wider than the allowance must end in a visible ellipsis.
+    let mut line = Line::from("y".repeat(30));
+    truncate_line_for_copy_badge(&mut line, 10);
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(text.ends_with('…'), "cut content must show ellipsis: {text:?}");
+    assert!(line.width() <= 10);
+
+    // Content that fits is left intact (trailing spaces trimmed only).
+    let mut fits = Line::from("short  ");
+    truncate_line_for_copy_badge(&mut fits, 10);
+    let fits_text: String = fits
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert_eq!(fits_text, "short");
 }
 
 #[test]
@@ -247,4 +341,21 @@ fn test_estimate_pinned_diagram_pane_width_respects_minimum() {
     };
     let width = estimate_pinned_diagram_pane_width_with_font(&diagram, 10, 24, Some((8, 16)));
     assert_eq!(width, 24);
+}
+
+#[test]
+fn test_idle_donut_reserved_height_absorbs_composer_growth() {
+    // No donut: nothing reserved regardless of composer size.
+    assert_eq!(idle_donut_reserved_height(false, 1), 0);
+    assert_eq!(idle_donut_reserved_height(false, 9), 0);
+
+    // Resting composer (1 row input, no hints): full donut reservation.
+    assert_eq!(idle_donut_reserved_height(true, 1), 14);
+
+    // Slash menu open (1 input row + 8 suggestion rows = 9): the extra 8 rows
+    // come out of the donut so the transcript above does not shift.
+    assert_eq!(idle_donut_reserved_height(true, 9), 6);
+
+    // Pathologically tall composer: reservation bottoms out at zero.
+    assert_eq!(idle_donut_reserved_height(true, 40), 0);
 }

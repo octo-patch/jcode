@@ -19,6 +19,38 @@ pub fn needs_catchup(session_id: &str, updated_at: DateTime<Utc>, status: &Sessi
     needs_catchup_with_seen(updated_at.timestamp_millis(), seen, status)
 }
 
+/// Snapshot of the persisted catch-up "seen" state, so callers that need to
+/// evaluate many sessions at once (e.g. the session picker building its list)
+/// can avoid re-reading and re-parsing `catchup_seen.json` once per session.
+#[derive(Clone, Default)]
+pub struct CatchupSeenSnapshot {
+    state: PersistedCatchupState,
+}
+
+impl CatchupSeenSnapshot {
+    /// Load the persisted seen-state once from disk.
+    pub fn load() -> Self {
+        Self {
+            state: load_seen_state(),
+        }
+    }
+
+    /// Same semantics as [`needs_catchup`] but uses this preloaded snapshot
+    /// instead of re-reading the state file for every call.
+    pub fn needs_catchup(
+        &self,
+        session_id: &str,
+        updated_at: DateTime<Utc>,
+        status: &SessionStatus,
+    ) -> bool {
+        if !is_attention_status(status) {
+            return false;
+        }
+        let seen = self.state.seen_at_ms_by_session.get(session_id).copied();
+        needs_catchup_with_seen(updated_at.timestamp_millis(), seen, status)
+    }
+}
+
 pub(crate) fn needs_catchup_with_seen(
     updated_at_ms: i64,
     seen_at_ms: Option<i64>,
@@ -99,7 +131,7 @@ pub fn render_markdown(
     }
     out.push_str(&format!("- Session: `{}`\n\n", session.id));
 
-    if !brief.activity_steps.is_empty() {
+    if crate::config::config().features.mermaid && !brief.activity_steps.is_empty() {
         out.push_str("```mermaid\nflowchart TD\n");
         out.push_str(&format!(
             "    A[\"Why<br/>{}\"]:::status --> B[\"Your last prompt\"]:::user\n",
@@ -597,6 +629,7 @@ mod tests {
                 id: "tool_1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({"file_path": "src/tui/session_picker.rs"}),
+                thought_signature: None,
             }],
         );
         session.add_message(

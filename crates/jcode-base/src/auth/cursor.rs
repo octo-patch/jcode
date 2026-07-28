@@ -9,7 +9,11 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CURSOR_API_BASE: &str = "https://api2.cursor.sh";
-const CURSOR_DIRECT_CLIENT_VERSION_DEFAULT: &str = "2.4.0";
+// Cursor's server rejects stale client versions for chat ("Update Required").
+// This must track a real, currently-served Cursor IDE release (e.g. 3.8.x),
+// not the Composer model number. Override at runtime with
+// `JCODE_CURSOR_CLIENT_VERSION` if Cursor moves the floor again.
+const CURSOR_DIRECT_CLIENT_VERSION_DEFAULT: &str = "3.8.24";
 const CURSOR_OAUTH_CLIENT_ID: &str = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
 const CURSOR_EXTERNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CURSOR_AUTH_FILE_SOURCE_ID: &str = "cursor_auth_json";
@@ -245,6 +249,12 @@ fn cursor_vscdb_paths() -> Vec<PathBuf> {
         "AppData/Roaming/Cursor/User/globalStorage/state.vscdb",
         "AppData/Roaming/cursor/User/globalStorage/state.vscdb",
     ];
+    // Other Unix platforms (e.g. FreeBSD) follow the XDG-style layout like Linux.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let relatives = [
+        ".config/Cursor/User/globalStorage/state.vscdb",
+        ".config/cursor/User/globalStorage/state.vscdb",
+    ];
 
     relatives
         .into_iter()
@@ -300,9 +310,9 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Resu
 /// 2. Saved key in `~/.config/jcode/cursor.env`
 pub fn load_api_key() -> Result<String> {
     if let Ok(key) = std::env::var("CURSOR_API_KEY") {
-        let trimmed = key.trim().to_string();
+        let trimmed = jcode_provider_env::sanitize_secret_value(&key);
         if !trimmed.is_empty() {
-            return Ok(trimmed);
+            return Ok(trimmed.to_string());
         }
     }
 
@@ -314,7 +324,7 @@ pub fn load_api_key() -> Result<String> {
         for line in content.lines() {
             let line = line.trim();
             if let Some(key) = line.strip_prefix("CURSOR_API_KEY=") {
-                let key = key.trim().trim_matches('"').trim_matches('\'');
+                let key = jcode_provider_env::sanitize_secret_value(key);
                 if !key.is_empty() {
                     return Ok(key.to_string());
                 }

@@ -1,8 +1,9 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::{
-    App, ContentBlock, DisplayMessage, Message, ProcessingStatus, Role, SendAction, SkillRegistry,
-    commands, ctrl_bracket_fallback_to_esc, is_context_limit_error, remote,
+    App, ContentBlock, DisplayMessage, Message, ProcessingStatus, Role, SendAction, commands,
+    ctrl_bracket_fallback_to_esc, is_context_limit_error, is_request_payload_too_large_error,
+    remote,
 };
 use crate::bus::{
     Bus, BusEvent, ClipboardPasteCompleted, ClipboardPasteContent, ClipboardPasteKind,
@@ -10,73 +11,44 @@ use crate::bus::{
 };
 use crate::util::truncate_str;
 use anyhow::Result;
+use base64::Engine;
 use crossterm::event::{EventStream, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::DefaultTerminal;
-use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const INPUT_SHELL_MAX_OUTPUT_LEN: usize = 30_000;
 
-pub(super) fn edit_input_in_external_editor(app: &mut App) {
-    match edit_text_in_external_editor(&app.input) {
-        Ok(edited) => {
-            if edited != app.input {
-                app.remember_input_undo_state();
-                app.input = edited;
-                app.cursor_pos = app.input.len();
-                app.sync_model_picker_preview_from_input();
-            }
-            app.set_status_notice("Prompt edited in $EDITOR");
+/// Remove reasoning-marked lines from committed transcript text. Reasoning lines
+/// are wrapped in emphasis containing the invisible [`REASONING_SENTINEL`]
+/// (see `jcode_tui_markdown::reasoning_line_markup`). Trailing blank lines left
+/// behind are trimmed so the remaining answer renders cleanly.
+pub(super) fn strip_reasoning_lines(content: &str) -> String {
+    let sentinel = jcode_tui_markdown::REASONING_SENTINEL;
+    let mut out_lines: Vec<&str> = Vec::new();
+    for line in content.split('\n') {
+        if line.contains(sentinel) {
+            continue;
         }
-        Err(err) => app.set_status_notice(&format!("Failed to open $EDITOR: {err}")),
+        out_lines.push(line);
     }
-}
-
-fn edit_text_in_external_editor(initial_text: &str) -> Result<String> {
-    let mut file = tempfile::Builder::new()
-        .prefix("jcode-prompt-")
-        .suffix(".md")
-        .tempfile()?;
-    file.write_all(initial_text.as_bytes())?;
-    file.flush()?;
-    let path = file.path().to_path_buf();
-
-    let raw_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-    if raw_was_enabled {
-        let _ = crossterm::terminal::disable_raw_mode();
+    // Collapse runs of blank lines created by removed reasoning blocks, and trim
+    // leading/trailing blank lines.
+    let mut result = String::with_capacity(content.len());
+    let mut prev_blank = true; // suppress leading blanks
+    for line in out_lines {
+        let is_blank = line.trim().is_empty();
+        if is_blank && prev_blank {
+            continue;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(line);
+        prev_blank = is_blank;
     }
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    );
-
-    let status_result = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("exec ${VISUAL:-${EDITOR:-vi}} \"$@\"")
-        .arg("jcode-editor")
-        .arg(&path)
-        .status();
-
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        EnterAlternateScreen,
-        crossterm::cursor::Hide
-    );
-    if raw_was_enabled {
-        let _ = crossterm::terminal::enable_raw_mode();
-    }
-
-    let status = status_result?;
-    if !status.success() {
-        anyhow::bail!("editor exited with status {status}");
-    }
-
-    let mut edited = String::new();
-    std::fs::File::open(&path)?.read_to_string(&mut edited)?;
-    Ok(edited)
+    result.trim_end().to_string()
 }
 
 fn mission_turn_reminder(session_id: &str) -> Option<String> {
@@ -350,7 +322,11 @@ where
 {
     match kind {
         ClipboardPasteKind::Smart => {
-            if let Some(text) = read_text() {
+            // Only treat the clipboard as text when it has *non-empty* text.
+            // Image-only clipboards (especially on Wayland/arboard) frequently
+            // expose an empty text target, which previously short-circuited the
+            // image path and produced a silent "0 char" paste.
+            if let Some(text) = read_text().filter(|t| !t.trim().is_empty()) {
                 if let Some(url) = super::extract_image_url(&text)
                     && let Some(content) = download_image_url(&url)
                 {
@@ -391,11 +367,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardPasteContent, ClipboardPasteKind, is_clipboard_paste_shortcut,
-        preferred_wayland_text_type, read_clipboard_for_paste_with, shifted_printable_fallback,
-        text_input_for_key,
+        ClipboardPasteContent, ClipboardPasteKind, dropped_image_files,
+        is_clipboard_paste_shortcut, parse_dropped_paths, preferred_wayland_text_type,
+        read_clipboard_for_paste_with, shifted_printable_fallback, text_input_for_key,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn dropped_paths_accept_quotes_shell_escapes_and_file_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first image.png");
+        let second = dir.path().join("second.jpg");
+        std::fs::write(&first, b"png").unwrap();
+        std::fs::write(&second, b"jpeg").unwrap();
+
+        let quoted = parse_dropped_paths(&format!("'{}'", first.display())).unwrap();
+        assert_eq!(quoted, vec![first.clone()]);
+        let escaped =
+            parse_dropped_paths(&first.display().to_string().replace(' ', "\\ ")).unwrap();
+        assert_eq!(escaped, vec![first.clone()]);
+        let url = url::Url::from_file_path(&second).unwrap();
+        assert_eq!(parse_dropped_paths(url.as_str()).unwrap(), vec![second]);
+    }
+
+    #[test]
+    fn dropped_images_load_all_supported_files_and_reject_mixed_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        let jpeg = dir.path().join("b.jpeg");
+        std::fs::write(&png, b"png bytes").unwrap();
+        std::fs::write(&jpeg, b"jpeg bytes").unwrap();
+
+        let images =
+            dropped_image_files(&format!("'{}' '{}'", png.display(), jpeg.display())).unwrap();
+        assert_eq!(images[0], ("image/png".to_string(), b"png bytes".to_vec()));
+        assert_eq!(
+            images[1],
+            ("image/jpeg".to_string(), b"jpeg bytes".to_vec())
+        );
+        assert!(dropped_image_files("ordinary pasted text").is_none());
+    }
 
     #[test]
     fn smart_paste_prefers_normal_text_when_clipboard_has_text() {
@@ -442,6 +453,29 @@ mod tests {
             matches!(content, ClipboardPasteContent::Empty),
             "expected empty paste, got {content:?}"
         );
+    }
+
+    #[test]
+    fn smart_paste_uses_image_when_text_target_is_blank() {
+        // Image-only clipboards can advertise an empty text target; the image
+        // must still be pasted instead of producing a silent empty text paste.
+        let content = read_clipboard_for_paste_with(
+            &ClipboardPasteKind::Smart,
+            || Some("   ".to_string()),
+            || Some(("image/png".to_string(), "base64".to_string())),
+            |_| None,
+        );
+
+        match content {
+            ClipboardPasteContent::Image {
+                media_type,
+                base64_data,
+            } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(base64_data, "base64");
+            }
+            other => panic!("expected image paste, got {other:?}"),
+        }
     }
 
     #[test]
@@ -568,13 +602,58 @@ where
     true
 }
 
+pub(in crate::tui::app) mod newline;
+mod paste_guard;
+#[cfg(test)]
+pub(in crate::tui::app) use paste_guard::expire_for_test as paste_guard_expire_for_test;
+use paste_guard::image_media_type;
+
 pub(super) fn handle_paste(app: &mut App, text: String) {
+    paste_guard::note_paste();
     // Note: clipboard_image() is NOT checked here. Bracketed paste events from the
     // terminal always deliver text. Checking clipboard_image() here caused a bug where
     // text pastes were misidentified as images when the clipboard also had image data
     // (common on Wayland where apps advertise multiple MIME types). Image pasting is
     // handled by explicit clipboard shortcuts instead (Ctrl+V/Alt+V/Cmd+V smart-paste).
-    if let Some(url) = super::extract_image_url(&text) {
+    if let Some(paths) = parse_dropped_paths(&text) {
+        let item_count = paths.len();
+        let mut image_count = 0;
+        let mut file_count = 0;
+
+        for (index, path) in paths.into_iter().enumerate() {
+            if index > 0 {
+                insert_input_text(app, " ");
+            }
+
+            if let Some(media_type) = image_media_type(&path)
+                && let Ok(data) = std::fs::read(&path)
+            {
+                attach_image(
+                    app,
+                    media_type.to_string(),
+                    base64::engine::general_purpose::STANDARD.encode(data),
+                );
+                image_count += 1;
+            } else {
+                insert_input_text(app, &format_dropped_path(&path, item_count > 1));
+                file_count += 1;
+            }
+        }
+
+        let notice = match (image_count, file_count) {
+            (images, 0) => format!(
+                "Dropped {images} image{}",
+                if images == 1 { "" } else { "s" }
+            ),
+            (0, files) => format!("Dropped {files} file{}", if files == 1 { "" } else { "s" }),
+            (images, files) => format!(
+                "Dropped {images} image{} and {files} file{}",
+                if images == 1 { "" } else { "s" },
+                if files == 1 { "" } else { "s" }
+            ),
+        };
+        app.set_status_notice(notice);
+    } else if let Some(url) = super::extract_image_url(&text) {
         crate::logging::info(&format!("Downloading image from pasted URL: {}", url));
         app.set_status_notice("Downloading image...");
         let session_id = active_clipboard_session_id(app);
@@ -590,10 +669,111 @@ pub(super) fn handle_paste(app: &mut App, text: String) {
                 content,
             );
         });
-        return;
+    } else {
+        handle_text_paste(app, text);
+    }
+}
+
+fn format_dropped_path(path: &std::path::Path, quote_whitespace: bool) -> String {
+    let value = path.to_string_lossy();
+    if quote_whitespace && value.chars().any(char::is_whitespace) {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.into_owned()
+    }
+}
+
+fn dropped_image_files(text: &str) -> Option<Vec<(String, Vec<u8>)>> {
+    let paths = parse_dropped_paths(text)?;
+    paths
+        .into_iter()
+        .map(|path| {
+            let media_type = image_media_type(&path)?;
+            let data = std::fs::read(path).ok()?;
+            Some((media_type.to_string(), data))
+        })
+        .collect()
+}
+
+/// Terminal emulators normally send file drops as bracketed paste, but some send
+/// the path as ordinary key events. Promote a complete image-path-only composer
+/// value before command/skill routing so an absolute `/...` path is never treated
+/// as a slash command.
+pub(super) fn promote_dropped_images(app: &mut App) -> bool {
+    let Some(images) = dropped_image_files(&app.input) else {
+        return false;
+    };
+    let count = images.len();
+    app.input.clear();
+    app.cursor_pos = 0;
+    for (media_type, data) in images {
+        attach_image(
+            app,
+            media_type,
+            base64::engine::general_purpose::STANDARD.encode(data),
+        );
+    }
+    app.set_status_notice(format!(
+        "Dropped {count} image{}",
+        if count == 1 { "" } else { "s" }
+    ));
+    true
+}
+
+pub(super) fn parse_dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
+    let trimmed = text.trim();
+    let literal_path = PathBuf::from(trimmed);
+    if literal_path.is_file() {
+        return Some(vec![literal_path]);
     }
 
-    handle_text_paste(app, text);
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in trimmed.chars() {
+        if escaped {
+            token.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                token.push(ch);
+            }
+        } else if ch.is_whitespace() && quote.is_none() {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(ch);
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+
+    tokens
+        .into_iter()
+        .map(|token| {
+            let path = if token.starts_with("file://") {
+                url::Url::parse(&token).ok()?.to_file_path().ok()?
+            } else {
+                PathBuf::from(token)
+            };
+            path.is_file().then_some(path)
+        })
+        .collect()
 }
 
 pub(super) fn handle_text_paste(app: &mut App, text: String) {
@@ -672,14 +852,202 @@ impl App {
     }
 }
 
+/// Strip terminal escape-sequence remnants from text headed for the composer.
+///
+/// Mouse reporting, bracketed paste, and focus events all arrive as CSI
+/// sequences. When a read is torn mid-sequence (a fast wheel flick split across
+/// two reads, a loaded machine, a slow SSH link), the terminal-event parser can
+/// resynchronize partway through and hand the tail of the sequence back as
+/// ordinary text, which then lands in the draft as noise like `[<65;50;24M`
+/// (issue #540). Whether that happens depends on the terminal and on timing, so
+/// rather than rely on the parser never mis-syncing, drop the remnants at the
+/// single insertion boundary every input path shares.
+///
+/// Deliberately conservative: only ESC-introduced sequences and bare CSI-shaped
+/// runs are removed, plus C0 control characters other than tab and newline.
+///
+/// A *bare* run (one whose ESC introducer was consumed by the torn read) is only
+/// stripped when it looks unmistakably like a terminal report: `[`, at least one
+/// parameter byte, and a final byte that terminals actually emit for the
+/// sequences we enable (`M`/`m` mouse, `~` bracketed paste and special keys,
+/// `R` cursor position, `I`/`O` focus). This is what keeps ordinary typed text
+/// such as `array[0]`, `list[1]`, or `[TODO]` intact, since `]` and letters like
+/// `O` only qualify with a preceding numeric parameter for the specific finals
+/// listed. Anything else is left alone: a missed remnant is cosmetic, whereas
+/// eating a user's real characters is not.
+pub(super) fn strip_terminal_control_sequences(text: &str) -> std::borrow::Cow<'_, str> {
+    let looks_suspicious = text
+        .chars()
+        .any(|ch| ch == '\x1b' || ch == '\u{9b}' || (ch.is_control() && ch != '\t' && ch != '\n'));
+    let has_csi_run = text.contains("\x1b[") || text.contains('\u{9b}') || {
+        let bytes = text.as_bytes();
+        bytes.iter().enumerate().any(|(index, byte)| {
+            *byte == b'[' && bare_terminal_report_length(&bytes[index..]).is_some()
+        })
+    };
+    if !looks_suspicious && !has_csi_run {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let bytes = text.as_bytes();
+    let mut cleaned = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        // ESC-introduced sequence: skip the introducer, then the body.
+        if byte == 0x1b {
+            index += 1;
+            if index < bytes.len() && bytes[index] == b'[' {
+                match csi_run_length(&bytes[index..]) {
+                    Some(len) => index += len,
+                    // Unterminated: the rest is a truncated sequence, drop it.
+                    None => index = bytes.len(),
+                }
+            } else if index < bytes.len() {
+                // Two-character escape such as ESC O or ESC ].
+                index += 1;
+            }
+            continue;
+        }
+        // 8-bit CSI introducer (UTF-8 encoded U+009B).
+        if byte == 0xc2 && bytes.get(index + 1) == Some(&0x9b) {
+            index += 2;
+            if bytes.get(index) == Some(&b'[') {
+                match csi_run_length(&bytes[index..]) {
+                    Some(len) => index += len,
+                    None => index = bytes.len(),
+                }
+            }
+            continue;
+        }
+        // A bare report-shaped run left behind by a torn read.
+        if byte == b'['
+            && let Some(len) = bare_terminal_report_length(&bytes[index..])
+        {
+            index += len;
+            continue;
+        }
+        // Drop stray C0 controls; keep tab and newline, which are meaningful.
+        if byte < 0x20 && byte != b'\t' && byte != b'\n' {
+            index += 1;
+            continue;
+        }
+        // Copy one whole UTF-8 character.
+        let char_len = text[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+        cleaned.push_str(&text[index..index + char_len]);
+        index += char_len;
+    }
+
+    std::borrow::Cow::Owned(cleaned)
+}
+
+/// Length of a CSI run starting at `bytes[0]` (the `[`), including its final
+/// byte, or `None` when the run is unterminated.
+///
+/// A CSI body is parameter bytes `0x30..=0x3f`, then intermediate bytes
+/// `0x20..=0x2f`, then one final byte `0x40..=0x7e`.
+fn csi_run_length(bytes: &[u8]) -> Option<usize> {
+    debug_assert_eq!(bytes.first(), Some(&b'['));
+    let mut index = 1usize;
+    while index < bytes.len() && (0x30..=0x3f).contains(&bytes[index]) {
+        index += 1;
+    }
+    while index < bytes.len() && (0x20..=0x2f).contains(&bytes[index]) {
+        index += 1;
+    }
+    let final_byte = *bytes.get(index)?;
+    if (0x40..=0x7e).contains(&final_byte) {
+        Some(index + 1)
+    } else {
+        None
+    }
+}
+
+/// Length of a bare (ESC-less) run that is unmistakably a terminal report, or
+/// `None` when the run could plausibly be text the user typed.
+///
+/// Requires at least one parameter byte and one of the final bytes emitted by
+/// the reporting modes jcode enables, so `array[0]` and `[TODO]` are left alone
+/// while `[<65;50;24M` and `[200~` are recognized.
+fn bare_terminal_report_length(bytes: &[u8]) -> Option<usize> {
+    debug_assert_eq!(bytes.first(), Some(&b'['));
+    let len = csi_run_length(bytes)?;
+    let params = &bytes[1..len - 1];
+    if params.is_empty() {
+        return None;
+    }
+    // Mouse/paste/cursor/focus reports carry digits, `;`, and an optional
+    // leading `<`. Reject anything with other parameter bytes.
+    if !params
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || *byte == b';' || *byte == b'<')
+    {
+        return None;
+    }
+    const REPORT_FINALS: [u8; 6] = *b"Mm~RIO";
+    REPORT_FINALS.contains(&bytes[len - 1]).then_some(len)
+}
+
 pub(super) fn insert_input_text(app: &mut App, text: &str) {
     if text.is_empty() {
         return;
     }
 
+    // Drop terminal escape remnants before they can land in the draft (#540).
+    let sanitized = strip_terminal_control_sequences(text);
+    let text: &str = &sanitized;
+    if text.is_empty() {
+        return;
+    }
+
+    // Composer insertions should behave the same in local and remote modes.
+    // Unless the user explicitly enabled typing scroll lock, beginning or
+    // continuing a draft resumes tail-follow before the input height can change.
+    // Keeping this at the shared insertion boundary also covers paste and
+    // Shift+Enter, rather than relying on individual key dispatchers to remember
+    // to reconcile the transcript viewport.
+    app.follow_chat_bottom_for_typing();
+
+    let at_end = app.cursor_pos == app.input.len();
+
+    // A habitual space typed after an auto-inserted picker separator would
+    // only add noise. Swallow it so command + space + filter still produces
+    // a single separator.
+    if text == " " && at_end && matches!(app.input.trim_start(), "/login " | "/model " | "/models ")
+    {
+        return;
+    }
+
     app.remember_input_undo_state();
+
+    // After a picker command is fully typed (or completed without a trailing
+    // space), the next printable character starts its filter. Insert the
+    // separator instead of extending the command token and closing the picker.
+    if at_end
+        && matches!(app.input.trim_start(), "/login" | "/model" | "/models")
+        && !text.starts_with(char::is_whitespace)
+    {
+        app.input.push(' ');
+        app.cursor_pos = app.input.len();
+    }
+
     app.input.insert_str(app.cursor_pos, text);
     app.cursor_pos += text.len();
+
+    // Typing the final command character immediately arms picker filtering.
+    // Without this, users can keep typing the command token or press Enter
+    // without realizing the visible picker is ready to filter.
+    if app.cursor_pos == app.input.len()
+        && matches!(app.input.trim_start(), "/login" | "/model" | "/models")
+    {
+        app.input.push(' ');
+        app.cursor_pos = app.input.len();
+    }
+
     app.reset_tab_completion();
     app.sync_model_picker_preview_from_input();
 }
@@ -718,6 +1086,7 @@ pub(super) fn handle_text_input(app: &mut App, text: &str) -> bool {
     }
 
     insert_input_text(app, text);
+    promote_dropped_images(app);
     true
 }
 
@@ -795,6 +1164,17 @@ pub(super) fn handle_multiline_input_navigation(
 
     app.cursor_pos = target;
     true
+}
+
+/// True when `modifiers` is exactly one of Ctrl, Alt(Option) or Cmd(Super),
+/// the set of single modifiers we treat as "recall queued prompts / browse
+/// history" when combined with Up/Down. Shift or any combination is excluded so
+/// it doesn't shadow selection-extension or other chords.
+pub(super) fn is_prompt_recall_modifier(modifiers: KeyModifiers) -> bool {
+    matches!(
+        modifiers,
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER
+    )
 }
 
 pub(super) fn handle_prompt_history_navigation(
@@ -961,6 +1341,7 @@ pub(super) fn retrieve_pending_message_for_edit(app: &mut App) -> bool {
     if let Some(msg) = app.interleave_message.take()
         && !msg.is_empty()
     {
+        app.pending_images.append(&mut app.interleave_images);
         parts.push(msg);
         had_pending = true;
     }
@@ -1006,10 +1387,6 @@ pub(super) fn send_action(app: &App, alternate_shortcut: bool) -> SendAction {
     }
 }
 
-pub(super) fn handle_shift_enter(app: &mut App) {
-    insert_input_text(app, "\n");
-}
-
 impl App {
     pub(super) fn has_queued_followups(&self) -> bool {
         self.interleave_message.is_some()
@@ -1029,6 +1406,93 @@ impl App {
             && (!self.input.trim().is_empty() || !self.pending_images.is_empty())
     }
 
+    /// Folds this turn's guardrail-stop flag into the consecutive counter.
+    /// Call once per finished turn, before scheduling automatic follow-ups.
+    /// Returns true when automatic continuation (auto-poke/overnight poke)
+    /// must stop because the provider keeps refusing: a guardrail refusal is
+    /// deterministic for the same request, so re-poking loops forever
+    /// (observed live as one refused API call per auto-poke, every ~7s).
+    pub(super) fn guardrail_stops_exhausted_at_turn_end(&mut self) -> bool {
+        let stopped = std::mem::take(&mut self.turn_guardrail_stopped);
+        if !stopped {
+            self.consecutive_guardrail_stops = 0;
+            return false;
+        }
+        self.consecutive_guardrail_stops = self.consecutive_guardrail_stops.saturating_add(1);
+        self.consecutive_guardrail_stops >= Self::GUARDRAIL_STOP_MAX_CONSECUTIVE
+    }
+
+    /// Disarm auto-poke and overnight poke after repeated guardrail refusals
+    /// and tell the user why, instead of silently re-sending the refused
+    /// request on every turn end.
+    pub(super) fn stop_auto_continuation_after_guardrail(&mut self) {
+        let had_overnight = self.overnight_auto_poke.take().is_some();
+        if !self.auto_poke_incomplete_todos && !had_overnight {
+            return;
+        }
+        let cleared = super::commands::disable_auto_poke(self);
+        crate::logging::warn(&format!(
+            "Stopping auto-poke after {} consecutive provider guardrail stops (cleared {} queued poke message(s), overnight={})",
+            self.consecutive_guardrail_stops, cleared, had_overnight
+        ));
+        self.push_display_message(DisplayMessage::system(format!(
+            "🛑 The provider refused {} turns in a row, so we stopped poking. The same request will keep getting refused. Rephrase or narrow the task, then /poke to resume.",
+            self.consecutive_guardrail_stops
+        )));
+        self.set_status_notice("Poke stopped: provider guardrail");
+    }
+
+    /// Turn-end entry point for automatic continuations. Applies the
+    /// guardrail circuit breaker first, then tries auto-poke and overnight
+    /// poke scheduling. Returns true when a follow-up was queued.
+    pub(super) fn schedule_turn_end_followups(&mut self) -> bool {
+        if self.guardrail_stops_exhausted_at_turn_end() {
+            self.stop_auto_continuation_after_guardrail();
+            return false;
+        }
+        self.schedule_auto_poke_followup_if_needed()
+            || self.schedule_overnight_poke_followup_if_needed()
+    }
+
+    /// Deliver this turn's deferred quality-check reminder, if anything is
+    /// still unresolved. Returns true when a continuation was queued.
+    ///
+    /// Delivered at most once per turn: the reminder asks the model to verify
+    /// weak points, and re-asking after it has done so would loop. The
+    /// observation log is cleared either way, so the next turn starts clean.
+    fn deliver_deferred_gate_digest_if_needed(&mut self) -> bool {
+        if self.todo_gate_digest_delivered {
+            return false;
+        }
+        let session_id = self.session_id().to_string();
+        let observations = crate::todo::load_gate_observations(&session_id).unwrap_or_default();
+        if observations.is_empty() {
+            return false;
+        }
+        let plan = crate::todo::load_plan(&session_id).unwrap_or_default();
+        let goals = crate::todo::load_goals(&session_id).unwrap_or_default();
+        let digest = crate::todo::build_gate_digest(&observations, &plan, &goals);
+        let _ = crate::todo::clear_gate_observations(&session_id);
+        let Some(digest) = digest else {
+            crate::logging::info(&format!(
+                "TODO_GATE_DIGEST action=skip reason=all_resolved observations={}",
+                observations.len()
+            ));
+            return false;
+        };
+        self.todo_gate_digest_delivered = true;
+        crate::logging::info(&format!(
+            "TODO_GATE_DIGEST action=queue observations={}",
+            observations.len()
+        ));
+        self.push_display_message(DisplayMessage::system(
+            "🔎 We asked the agent to double-check this turn's weak points.",
+        ));
+        self.queued_messages.push(digest);
+        self.pending_queued_dispatch = true;
+        true
+    }
+
     pub(super) fn schedule_auto_poke_followup_if_needed(&mut self) -> bool {
         if !self.auto_poke_incomplete_todos
             || self.pending_queued_dispatch
@@ -1045,33 +1509,105 @@ impl App {
             .cloned()
             .collect();
         if incomplete.is_empty() {
-            self.auto_poke_incomplete_todos = false;
             if todos.is_empty() {
+                crate::logging::info(
+                    "AUTO_POKE_DECISION action=disarm reason=no_todos incomplete=0",
+                );
+                self.auto_poke_incomplete_todos = false;
                 return false;
+            }
+            // Deferred quality checks land here, once, instead of interrupting
+            // every todo write during the turn. Points whose scores rose while
+            // the agent worked are filtered out, so this stays silent in the
+            // common case where exploration resolved them on its own.
+            if self.deliver_deferred_gate_digest_if_needed() {
+                return true;
             }
             let confidence_summary = super::commands::todo_confidence_summary(&todos);
             let confidence_label =
                 super::commands::format_todo_completion_confidence(confidence_summary);
-            self.push_display_message(DisplayMessage::system(format!(
-                "✅ Todos complete. Auto-poke finished. Cumulative confidence: {}.",
-                confidence_label
-            )));
-            if confidence_summary.needs_more_work {
-                self.hidden_queued_system_messages.push(
-                    super::commands::build_todo_confidence_summary_message(&todos),
-                );
+            let needs_spike_challenge = confidence_summary.confidence_spike_detected
+                && !self.todo_confidence_spike_challenged;
+            let gate_budget_left =
+                self.todo_completion_gate_attempts < Self::TODO_COMPLETION_GATE_MAX_ATTEMPTS;
+            if (confidence_summary.completion_confidence_needs_validation || needs_spike_challenge)
+                && gate_budget_left
+            {
+                self.todo_completion_gate_attempts =
+                    self.todo_completion_gate_attempts.saturating_add(1);
+                let notice = if confidence_summary.completion_confidence_needs_validation {
+                    crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
+                    "🛑 The agent marked its work done without strong enough validation. We asked it to double-check."
+                } else {
+                    self.todo_confidence_spike_challenged = true;
+                    crate::telemetry::record_todo_gate(
+                        crate::telemetry::TodoGateKind::ConfidenceSpike,
+                    );
+                    "🛑 The agent's confidence jumped suddenly. We asked it to verify that independently."
+                };
+                self.push_display_message(DisplayMessage::system(notice));
+                // User-role content: reminder-only turns read as empty user
+                // messages and models answer instead of re-validating.
+                let summary = super::commands::build_todo_confidence_summary_message(&todos);
+                self.queued_messages.push(summary);
                 self.pending_queued_dispatch = true;
                 return true;
             }
+            if (confidence_summary.completion_confidence_needs_validation || needs_spike_challenge)
+                && !gate_budget_left
+            {
+                // The gate keeps failing but the model is no longer making
+                // progress on it. Nudging again would loop forever, burning an
+                // API call per turn (observed live: an unattended session
+                // resent the same continuation every ~5s). Stop the cycle and
+                // surface the stall instead.
+                crate::logging::warn(&format!(
+                    "Todo completion gate exhausted after {} attempts; stopping auto-poke to avoid an infinite continuation loop",
+                    self.todo_completion_gate_attempts
+                ));
+                self.push_display_message(DisplayMessage::system(
+                    "⚠️ We nudged the agent several times but its validation still isn't holding up. We stopped poking; review the remaining todos yourself.",
+                ));
+                self.auto_poke_incomplete_todos = false;
+                self.todo_confidence_spike_challenged = false;
+                self.todo_completion_gate_attempts = 0;
+                self.todo_gate_digest_delivered = false;
+                self.pending_queued_dispatch = false;
+                return false;
+            }
+            self.auto_poke_incomplete_todos = false;
+            self.todo_confidence_spike_challenged = false;
+            // A finished cycle re-arms the review for whatever work comes next;
+            // without this a session could only ever deliver one digest.
+            self.todo_gate_digest_delivered = false;
+            self.todo_completion_gate_attempts = 0;
+            self.push_display_message(DisplayMessage::system(format!(
+                "✅ All todos done. Completion confidence: {}.",
+                confidence_label
+            )));
             self.pending_queued_dispatch = false;
             return false;
         }
 
         self.push_display_message(DisplayMessage::system(format!(
-            "👉 Auto-poking: {} incomplete todo{}. /poke off to stop.",
+            "👉 {} incomplete todo{}. We poked it for you. /poke off to stop.",
             incomplete.len(),
             if incomplete.len() == 1 { "" } else { "s" },
         )));
+        // Auto-poke previously had no log trail, so a continuation that was
+        // queued but never dispatched looked identical in the logs to a silent
+        // model. Emit a decision line on every arm so the queue -> send handoff
+        // can be correlated with "Sending queued continuation message".
+        crate::logging::info(&format!(
+            "AUTO_POKE_DECISION action=queue_continuation incomplete={} queued_before={} is_processing={} pending_turn={}",
+            incomplete.len(),
+            self.queued_messages.len(),
+            self.is_processing,
+            self.pending_turn,
+        ));
+        // Open todos mean the model is still iterating; completion-gate
+        // exhaustion should only trip when the gate itself stops moving.
+        self.todo_completion_gate_attempts = 0;
         self.queued_messages
             .push(super::commands::build_poke_message(&incomplete));
         self.pending_queued_dispatch = true;
@@ -1092,12 +1628,65 @@ impl App {
             self.set_status_notice("Next-prompt new session canceled");
         }
     }
+
+    /// Whether the configured `keybindings.new_terminal` chord matches this key.
+    pub(crate) fn new_terminal_key_matches(&self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        self.new_terminal_key
+            .binding
+            .as_ref()
+            .map(|binding| binding.matches(code, modifiers))
+            .unwrap_or(false)
+    }
+
+    /// Whether the configured `keybindings.open_resume` chord matches this key.
+    pub(crate) fn open_resume_key_matches(&self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        self.open_resume_key
+            .binding
+            .as_ref()
+            .map(|binding| binding.matches(code, modifiers))
+            .unwrap_or(false)
+    }
+
+    /// Whether the configured `keybindings.fallback_switch` chord matches this key.
+    pub(crate) fn fallback_switch_key_matches(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        self.fallback_switch_key
+            .binding
+            .as_ref()
+            .map(|binding| binding.matches(code, modifiers))
+            .unwrap_or(false)
+    }
+
+    /// Spawn a brand-new jcode session in a new terminal window.
+    pub(crate) fn handle_new_terminal_hotkey(&mut self) {
+        let cwd = commands::active_working_dir(self)
+            .filter(|path| path.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        match super::spawn_fresh_session_in_new_terminal(&cwd) {
+            Ok(true) => self.set_status_notice("↗ New terminal opened"),
+            Ok(false) => {
+                self.set_status_notice("No supported terminal found; run `jcode` manually")
+            }
+            Err(error) => self.set_status_notice(format!("New terminal failed: {}", error)),
+        }
+    }
 }
 
 pub(super) fn is_next_prompt_new_session_hotkey(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    code == KeyCode::Char(' ')
-        && modifiers.contains(KeyModifiers::SUPER)
-        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::HYPER)
+    if code != KeyCode::Char(' ') {
+        return false;
+    }
+    // Accept either Command/Super+Space (macOS Cmd, often eaten by Spotlight) or
+    // Option/Alt+Space (macOS Option) so the fork-to-new-session arming hotkey is
+    // reachable across terminals. Reject Ctrl/Hyper combos so other chords still
+    // route to their own handlers.
+    let has_super = modifiers.contains(KeyModifiers::SUPER);
+    let has_alt = modifiers.contains(KeyModifiers::ALT);
+    (has_super || has_alt) && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::HYPER)
 }
 
 fn input_routes_to_new_session(app: &App) -> bool {
@@ -1151,7 +1740,7 @@ pub(super) fn handle_alternate_enter(app: &mut App) {
         SendAction::Queue => queue_message(app),
         SendAction::Interleave => {
             let prepared = take_prepared_input(app);
-            stage_local_interleave(app, prepared.expanded);
+            stage_local_interleave(app, prepared.expanded, prepared.images);
         }
     }
 }
@@ -1179,7 +1768,7 @@ pub(super) fn handle_control_key(app: &mut App, code: KeyCode) -> bool {
             true
         }
         KeyCode::Char('e') => {
-            edit_input_in_external_editor(app);
+            app.cursor_pos = app.input.len();
             true
         }
         KeyCode::Char('b') => {
@@ -1259,6 +1848,12 @@ pub(super) fn delete_input_to_end(app: &mut App) {
 
 pub(super) fn handle_super_key(app: &mut App, code: KeyCode) -> bool {
     match code {
+        // Cmd+5 toggles the onboarding simulator (a dev aid for walking through
+        // every first-run onboarding screen without touching real auth state).
+        KeyCode::Char('5') => {
+            app.toggle_onboarding_simulator();
+            true
+        }
         // macOS terminals that forward Command may report Command+Delete as Super+Backspace,
         // Super+Delete, or Super+DEL. Treat all of them as delete-the-previous-word, matching
         // the requested Cmd+Backspace = delete-by-word behavior.
@@ -1302,11 +1897,12 @@ pub(super) fn delete_input_word_back(app: &mut App) {
 
 pub(super) fn handle_alt_key(app: &mut App, code: KeyCode) -> bool {
     match code {
-        KeyCode::Char('b') => {
+        // Alt/Option+Left/Right move by word, matching Alt+B / Alt+F.
+        KeyCode::Left | KeyCode::Char('b') => {
             app.cursor_pos = app.find_word_boundary_back();
             true
         }
-        KeyCode::Char('f') => {
+        KeyCode::Right | KeyCode::Char('f') => {
             app.cursor_pos = app.find_word_boundary_forward();
             true
         }
@@ -1475,7 +2071,12 @@ pub(super) fn handle_pre_control_shortcuts(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
+    // Plain Ctrl+K kills to end of line (emacs habit). Ctrl+Shift+K must fall
+    // through to the scroll handler: with the Kitty keyboard protocol enabled,
+    // terminals report Ctrl+Shift+K as Char('k') + CONTROL|SHIFT, so without the
+    // Shift guard this would swallow the scroll-up chord and wipe the draft.
     if modifiers.contains(KeyModifiers::CONTROL)
+        && !modifiers.contains(KeyModifiers::SHIFT)
         && matches!(code, KeyCode::Char('k'))
         && !app.input.is_empty()
     {
@@ -1521,15 +2122,54 @@ pub(super) fn handle_pre_control_shortcuts(
         app.set_status_notice(status);
         return true;
     }
+    if app.toggle_keys.todo_card.matches(code, modifiers) {
+        app.toggle_todo_card();
+        return true;
+    }
     if app.dictation_key_matches(code, modifiers) {
         app.handle_dictation_trigger();
         return true;
     }
+
+    // Swarm views: Alt+N cycles chat → inline controls → full live page → chat.
+    // Selection/open/prompt controls stay available in both active views, while
+    // plain typing continues to flow to the chat input.
+    if app.toggle_keys.swarm_panel_focus.matches(code, modifiers) {
+        match app.cycle_swarm_panel_view() {
+            super::tui_state::SwarmPanelView::Chat => {
+                app.set_status_notice("Swarm view closed");
+            }
+            super::tui_state::SwarmPanelView::Controls => {
+                app.set_status_notice(crate::tui::keybind::swarm_view_hint("full page"));
+            }
+            super::tui_state::SwarmPanelView::FullPage => {
+                app.set_status_notice(crate::tui::keybind::swarm_page_hint());
+            }
+        }
+        return true;
+    }
+    {
+        use crate::tui::TuiState as _;
+        if app.swarm_panel_focused() && app.handle_swarm_panel_key(code, modifiers) {
+            return true;
+        }
+    }
+    if app.new_terminal_key_matches(code, modifiers) {
+        app.handle_new_terminal_hotkey();
+        return true;
+    }
+    if app.open_resume_key_matches(code, modifiers) {
+        app.record_keybinding_fast(super::shortcut_hints::LearnableAction::Resume);
+        app.open_session_picker();
+        return true;
+    }
     if let Some(direction) = app.model_switch_keys.direction_for(code, modifiers) {
+        app.record_keybinding_fast(super::shortcut_hints::LearnableAction::ModelSwitch);
         app.cycle_model(direction);
         return true;
     }
     if let Some(direction) = app.effort_switch_keys.direction_for(code, modifiers) {
+        app.record_keybinding_fast(super::shortcut_hints::LearnableAction::EffortCycle);
         app.cycle_effort(direction);
         return true;
     }
@@ -1542,7 +2182,8 @@ pub(super) fn handle_pre_control_shortcuts(
         app.cycle_effort(direction);
         return true;
     }
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.centered_toggle_keys.matches(code, modifiers) {
+        app.record_keybinding_fast(super::shortcut_hints::LearnableAction::Alignment);
         app.toggle_centered_mode();
         return true;
     }
@@ -1600,6 +2241,10 @@ pub(super) fn handle_visible_copy_shortcut(
         return true;
     }
 
+    if handle_inline_image_toggle_shortcut(app, c) {
+        return true;
+    }
+
     if let Some(target) = crate::tui::ui::recent_flicker_copy_target_for_key(c)
         .or_else(|| crate::tui::ui::visible_copy_target_for_key(c))
     {
@@ -1629,6 +2274,22 @@ fn visible_copy_shortcut_key(code: KeyCode, modifiers: KeyModifiers) -> Option<c
     };
 
     modifiers.contains(KeyModifiers::ALT).then_some(c)
+}
+
+/// Alt+Shift+I toggles inline transcript images between expanded and
+/// collapsed label stubs. Only active when the transcript actually has
+/// inline images, so the chord stays inert otherwise.
+fn handle_inline_image_toggle_shortcut(app: &mut App, key: char) -> bool {
+    if !key.eq_ignore_ascii_case(&'i') {
+        return false;
+    }
+    use crate::tui::TuiState as _;
+    if app.side_pane_images_signature().0 == 0 {
+        return false;
+    }
+    app.record_copy_badge_key_press('i');
+    app.toggle_inline_images();
+    true
 }
 
 fn handle_expand_edit_badge_shortcut(app: &mut App, key: char) -> bool {
@@ -1711,6 +2372,19 @@ pub(super) fn handle_modal_key(
         if modifiers.contains(KeyModifiers::CONTROL)
             && matches!(code, KeyCode::Char('c') | KeyCode::Char('d'))
         {
+            // Ctrl+C over an active selection is universal copy muscle
+            // memory. Falling through here used to reach the global handler,
+            // which quits when idle, so trying to copy an error message
+            // closed jcode and lost the error (issue #497). Only fall
+            // through (interrupt/quit) when nothing is selected.
+            if code == KeyCode::Char('c')
+                && app
+                    .current_copy_selection_text()
+                    .is_some_and(|text| !text.is_empty())
+            {
+                app.copy_current_selection_to_clipboard();
+                return Ok(true);
+            }
             return Ok(false);
         }
 
@@ -1747,6 +2421,7 @@ pub(super) fn handle_global_control_shortcuts(
             if app.is_processing {
                 app.cancel_requested = true;
                 app.interleave_message = None;
+                app.interleave_images.clear();
                 app.pending_soft_interrupts.clear();
                 app.pending_soft_interrupt_requests.clear();
                 if app.cancel_overnight_for_interrupt() {
@@ -1773,6 +2448,7 @@ pub(super) fn handle_global_control_shortcuts(
 }
 
 pub(super) fn handle_enter(app: &mut App) -> bool {
+    promote_dropped_images(app);
     if app.activate_picker_from_preview() {
         return true;
     }
@@ -1785,7 +2461,7 @@ pub(super) fn handle_enter(app: &mut App) -> bool {
             SendAction::Queue => queue_message(app),
             SendAction::Interleave => {
                 let prepared = take_prepared_input(app);
-                stage_local_interleave(app, prepared.expanded);
+                stage_local_interleave(app, prepared.expanded, prepared.images);
             }
         }
     }
@@ -1819,6 +2495,10 @@ pub(super) fn handle_basic_key(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Left => {
             if app.cursor_pos > 0 {
                 app.cursor_pos = crate::tui::core::prev_char_boundary(&app.input, app.cursor_pos);
+            } else {
+                // Opt-in: Left on an empty input opens the active sessions
+                // manager (no-op unless display.active_sessions_manager).
+                app.maybe_open_active_sessions_on_left();
             }
             true
         }
@@ -1871,6 +2551,7 @@ pub(super) fn handle_basic_key(app: &mut App, code: KeyCode) -> bool {
                         .any(|message| super::commands::is_poke_message(message));
                 app.cancel_requested = true;
                 app.interleave_message = None;
+                app.interleave_images.clear();
                 app.pending_soft_interrupts.clear();
                 app.pending_soft_interrupt_requests.clear();
                 let cancelled_overnight = app.cancel_overnight_for_interrupt();
@@ -1910,8 +2591,13 @@ pub(super) fn take_prepared_input(app: &mut App) -> PreparedInput {
     }
 }
 
-pub(super) fn stage_local_interleave(app: &mut App, content: String) {
+pub(super) fn stage_local_interleave(
+    app: &mut App,
+    content: String,
+    images: Vec<(String, String)>,
+) {
     app.interleave_message = Some(content);
+    app.interleave_images = images;
     app.set_status_notice("⏭ Sending now (interleave)");
 }
 
@@ -1990,6 +2676,19 @@ impl App {
         let mut modifiers = modifiers;
         ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
 
+        // Alt+5 always starts the onboarding simulator from a pristine first
+        // screen, even when another modal or a previous sim screen is active.
+        if self.handle_onboarding_sim_reset_shortcut(code, modifiers) {
+            return Ok(());
+        }
+
+        // The onboarding simulator owns all key handling while active so the
+        // real onboarding handlers and simulated modal overlays never fire (no
+        // real logins/imports or action selection).
+        if self.handle_onboarding_sim_key(code, modifiers) {
+            return Ok(());
+        }
+
         if handle_modal_key(self, code, modifiers)? {
             return Ok(());
         }
@@ -1998,15 +2697,22 @@ impl App {
             return Ok(());
         }
 
+        // Inline hotkey feedback: when a known-but-rarely-used chord is pressed,
+        // show "you just pressed X → does Y". Placed after the modal/overlay
+        // handlers so overlay-local keys stay silent. Unknown chords are
+        // reported at the fall-through points below.
+        self.observe_known_hotkey(code, modifiers, false);
+
         if code == KeyCode::BackTab {
             self.cycle_model_favorite_hotkey();
             return Ok(());
         }
 
         // While the model picker preview is visible, route its favorite/default
-        // hotkeys (Ctrl+D, Ctrl+F, Alt+F) to the focused picker handler before the
-        // global control shortcuts can claim them (e.g. Ctrl+D as quit). This makes
-        // the hotkeys work directly in the preview list the user always sees.
+        // hotkeys (Ctrl+O set default, Ctrl+N toggle favorite) to the focused
+        // picker handler before the global control shortcuts can claim them. This
+        // makes the hotkeys work directly in the preview list the user always
+        // sees, without colliding with the readline/tmux keys (Ctrl+B/Ctrl+F).
         if self.model_picker_preview_hotkey(code, modifiers)? {
             return Ok(());
         }
@@ -2019,6 +2725,23 @@ impl App {
             if !is_scroll_only_key(self, code, modifiers) {
                 self.cancel_pending_provider_failover("Provider auto-switch canceled");
             }
+        }
+
+        // Accept an armed post-error fallback offer: switch to the next best
+        // model/auth-method and resend the failed turn.
+        if self.pending_fallback_offer.is_some()
+            && !self.is_processing
+            && self.fallback_switch_key_matches(code, modifiers)
+        {
+            self.apply_pending_fallback_offer();
+            return Ok(());
+        }
+
+        // Accept an armed "merge the diverged update" offer: spawn a jcode agent
+        // to reconcile the branches. Shares the fallback-switch accept key.
+        if self.merge_offer_key_matches(code, modifiers) {
+            self.accept_update_merge_offer();
+            return Ok(());
         }
 
         if is_next_prompt_new_session_hotkey(code, modifiers) {
@@ -2037,16 +2760,23 @@ impl App {
         self.normalize_diagram_state();
         let diagram_available = self.diagram_available();
 
-        if modifiers == KeyModifiers::CONTROL && code == KeyCode::Up {
+        // Ctrl / Alt(Option) / Cmd(Super) + Up all recall queued/pending messages
+        // for editing and then walk prompt history. We accept any of the three
+        // single modifiers so the gesture works regardless of which one a given
+        // terminal forwards (some send Option as Alt, some forward Command as
+        // Super), without the user having to rebind anything.
+        if code == KeyCode::Up && is_prompt_recall_modifier(modifiers) {
             if retrieve_pending_message_for_edit(self) {
                 return Ok(());
             }
-            handle_prompt_history_navigation(self, code, modifiers);
+            // Normalize to CONTROL so handle_prompt_history_navigation takes its
+            // explicit-history path (jump straight into history even mid-draft).
+            handle_prompt_history_navigation(self, KeyCode::Up, KeyModifiers::CONTROL);
             return Ok(());
         }
 
-        if modifiers == KeyModifiers::CONTROL && code == KeyCode::Down {
-            handle_prompt_history_navigation(self, code, modifiers);
+        if code == KeyCode::Down && is_prompt_recall_modifier(modifiers) {
+            handle_prompt_history_navigation(self, KeyCode::Down, KeyModifiers::CONTROL);
             return Ok(());
         }
 
@@ -2057,15 +2787,17 @@ impl App {
             return Ok(());
         }
 
-        // Ctrl+Enter: does opposite of queue_mode during processing
-        if code == KeyCode::Enter && modifiers.contains(KeyModifiers::CONTROL) {
+        // Ctrl+Enter / Cmd+Enter: does opposite of queue_mode during processing
+        if code == KeyCode::Enter
+            && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
             handle_alternate_enter(self);
             return Ok(());
         }
 
-        // Shift+Enter and Alt/Option+Enter insert a newline in the input box.
-        if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
-            handle_shift_enter(self);
+        // Shift+Enter, Alt/Option+Enter, and the trailing-backslash fallback all
+        // insert a newline in the input box.
+        if newline::enter_inserts_newline(self, code, modifiers) {
             return Ok(());
         }
 
@@ -2098,10 +2830,15 @@ impl App {
         // Never fall through and insert literal text for unhandled Ctrl+key chords. This stays
         // after text_input so Ctrl+Alt/AltGr symbols delivered as final printable text still work.
         if modifiers.contains(KeyModifiers::CONTROL) {
+            self.note_unrecognized_hotkey(code, modifiers, false);
             return Ok(());
         }
 
         if code == KeyCode::Enter {
+            // Stray post-paste Enter from some terminals is not a submit (#544).
+            if paste_guard::consume_paste_trailing_enter() {
+                return Ok(());
+            }
             // During the onboarding model-selection phase, Enter on an empty
             // prompt opens the model picker instead of submitting nothing.
             if self.input.trim().is_empty()
@@ -2117,6 +2854,11 @@ impl App {
             return Ok(());
         }
 
+        // A modified chord (or function key) that reached this point is not
+        // bound to anything; tell the user instead of silently swallowing it or
+        // inserting a surprise character.
+        self.note_unrecognized_hotkey(code, modifiers, false);
+
         if handle_basic_key(self, code) {
             return Ok(());
         }
@@ -2128,18 +2870,46 @@ impl App {
         self.force_full_redraw = true;
     }
 
-    pub(super) fn should_redraw_after_resize(&mut self) -> bool {
-        const RESIZE_REDRAW_MIN_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(33);
+    /// Arm a full re-emit of every cell on the next frame without an
+    /// intermediate ED2 clear escape. Prefer this over `request_full_redraw`
+    /// when the real screen has not diverged from ratatui's model (e.g. chat
+    /// scrolling), so image placeholder cells do not flash blank (issue #404).
+    pub(super) fn request_full_repaint(&mut self) {
+        self.force_full_repaint = true;
+    }
 
+    const RESIZE_REDRAW_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+    fn commit_resize_redraw(&mut self, now: std::time::Instant) -> bool {
+        self.last_resize_redraw = Some(now);
+        self.resize_redraw_pending = false;
+        self.handle_diagram_geometry_change();
+        true
+    }
+
+    pub(super) fn should_redraw_after_resize(&mut self) -> bool {
         let now = std::time::Instant::now();
         match self.last_resize_redraw {
-            Some(last) if now.duration_since(last) < RESIZE_REDRAW_MIN_INTERVAL => false,
-            _ => {
-                self.last_resize_redraw = Some(now);
-                self.handle_diagram_geometry_change();
-                true
+            Some(last) if now.duration_since(last) < Self::RESIZE_REDRAW_MIN_INTERVAL => {
+                self.resize_redraw_pending = true;
+                false
             }
+            _ => self.commit_resize_redraw(now),
+        }
+    }
+
+    /// Flush the trailing edge of a debounced resize burst. Without this, the
+    /// last resize event can be suppressed after an intermediate frame, leaving
+    /// width/height-sensitive Mermaid placeholders and image state stale until
+    /// some unrelated UI event happens to redraw the terminal.
+    pub(super) fn flush_pending_resize_redraw(&mut self) -> bool {
+        if !self.resize_redraw_pending {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        match self.last_resize_redraw {
+            Some(last) if now.duration_since(last) < Self::RESIZE_REDRAW_MIN_INTERVAL => false,
+            _ => self.commit_resize_redraw(now),
         }
     }
 
@@ -2285,9 +3055,10 @@ impl App {
     pub(super) async fn send_interleave_now(
         &mut self,
         content: String,
+        images: Vec<(String, String)>,
         remote: &mut crate::tui::backend::RemoteConnection,
     ) {
-        remote::send_interleave_now(self, content, remote).await;
+        remote::send_interleave_now(self, content, images, remote).await;
     }
 
     /// Retrieve all pending unsent messages into the input for editing.
@@ -2311,37 +3082,427 @@ impl App {
             prefix.push('\n');
         }
         prefix.push('\n');
-        if self.streaming_text.is_empty() {
+        if self.streaming.streaming_text.is_empty() {
             self.replace_streaming_text(prefix);
         } else {
-            self.replace_streaming_text(format!("{}{}", prefix, self.streaming_text));
+            self.replace_streaming_text(format!("{}{}", prefix, self.streaming.streaming_text));
         }
+    }
+
+    /// Begin a reasoning region. Reasoning renders as dim, italic text (no
+    /// blockquote gutter, no header, no footer). Idempotent while open.
+    pub(super) fn open_reasoning_region(&mut self) {
+        if self.reasoning_streaming {
+            return;
+        }
+        // Separate the reasoning block from any prior content with a blank line.
+        if !self.streaming.streaming_text.is_empty() {
+            if self.streaming.streaming_text.ends_with("\n\n") {
+                // already separated
+            } else if self.streaming.streaming_text.ends_with('\n') {
+                self.append_streaming_text("\n");
+            } else {
+                self.append_streaming_text("\n\n");
+            }
+        }
+        self.reasoning_streaming = true;
+        self.reasoning_pending_line.clear();
+        self.reasoning_partial_len = 0;
+        // Remember where this reasoning block starts in the stream so `current`
+        // mode can later slice it back out in place (without disturbing any
+        // preceding answer text) once the model starts answering.
+        self.reasoning_block_start = Some(self.streaming.streaming_text.len());
+    }
+
+    /// Remove the live partial-reasoning tail (the rendered, not-yet-committed
+    /// in-progress line) from the streaming buffer so it can be rebuilt. No-op
+    /// when there is no live partial.
+    fn strip_reasoning_partial_tail(&mut self) {
+        if self.reasoning_partial_len > 0 {
+            let new_len = self
+                .streaming
+                .streaming_text
+                .len()
+                .saturating_sub(self.reasoning_partial_len);
+            self.streaming.streaming_text.truncate(new_len);
+            self.reasoning_partial_len = 0;
+        }
+    }
+
+    /// Append streamed reasoning text, rendering the in-progress line live so
+    /// reasoning trickles in token-by-token (like normal output) rather than one
+    /// whole line at a time. Complete lines (terminated by `\n`) are committed as
+    /// dim+italic markdown; the trailing partial line is rendered as a live tail
+    /// that is re-emitted in place on each delta. The whole-line emphasis run is
+    /// preserved (each line is its own `*…*`) so styling never breaks mid-line.
+    pub(super) fn append_reasoning_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.reasoning_streaming {
+            self.open_reasoning_region();
+        }
+        // Drop the previous live tail; we rebuild committed lines + a fresh tail.
+        self.strip_reasoning_partial_tail();
+        let mut committed = String::new();
+        for ch in text.chars() {
+            if ch == '\n' {
+                let line = std::mem::take(&mut self.reasoning_pending_line);
+                committed.push_str(&jcode_tui_markdown::reasoning_line_markup(&line));
+            } else {
+                self.reasoning_pending_line.push(ch);
+            }
+        }
+        if !committed.is_empty() {
+            self.streaming.streaming_text.push_str(&committed);
+        }
+        // Re-append the live tail for the in-progress (partial) line.
+        let partial = jcode_tui_markdown::reasoning_partial_markup(&self.reasoning_pending_line);
+        self.reasoning_partial_len = partial.len();
+        self.streaming.streaming_text.push_str(&partial);
+        self.refresh_split_view_if_needed();
+    }
+
+    /// Promote the live partial line to a committed line and end the region. The
+    /// `_footer` argument is ignored (the "Thought for Xs" footer was removed);
+    /// it is kept for call-site compatibility.
+    pub(super) fn close_reasoning_region(&mut self, _footer: Option<String>) {
+        if !self.reasoning_streaming {
+            return;
+        }
+        // Replace the live tail with the committed (newline-terminated) line.
+        self.strip_reasoning_partial_tail();
+        let pending = std::mem::take(&mut self.reasoning_pending_line);
+        if !pending.is_empty() {
+            self.streaming
+                .streaming_text
+                .push_str(&jcode_tui_markdown::reasoning_line_markup(&pending));
+        }
+        self.reasoning_streaming = false;
+
+        // In `current` mode, reasoning is ephemeral: it is never written to the
+        // persistent transcript. The closed block is sliced out of the live
+        // stream and anchored *in place* as a display-only reasoning message in
+        // the transcript flow: it never moves again (no bottom-following, no
+        // hoisting), stays readable for the rest of the turn, and is removed
+        // when the next user prompt starts a new turn.
+        if self.reasoning_current_mode() {
+            self.anchor_current_reasoning_block();
+            return;
+        }
+
+        // Terminate the reasoning block with a blank line so following output
+        // renders as a normal paragraph.
+        if !self.streaming.streaming_text.ends_with("\n\n") {
+            if self.streaming.streaming_text.ends_with('\n') {
+                self.streaming.streaming_text.push('\n');
+            } else {
+                self.streaming.streaming_text.push_str("\n\n");
+            }
+        }
+        self.refresh_split_view_if_needed();
+    }
+
+    /// True when the active reasoning-display mode is `current` (live-only,
+    /// ephemeral reasoning).
+    pub(super) fn reasoning_current_mode(&self) -> bool {
+        matches!(
+            crate::config::config().display.reasoning_display(),
+            crate::config::ReasoningDisplayMode::Current
+        )
+    }
+
+    /// Slice the just-closed reasoning block out of `streaming_text` and anchor
+    /// it as a display-only reasoning message in the transcript flow, exactly
+    /// where it streamed. Used in `current` mode: the trace keeps its position
+    /// (content below it can only be appended, never inserted above), so the
+    /// thought stays readable and anchored until the next user prompt removes
+    /// the turn's traces.
+    pub(super) fn anchor_current_reasoning_block(&mut self) {
+        let block_start = self
+            .reasoning_block_start
+            .take()
+            .unwrap_or(0)
+            .min(self.streaming.streaming_text.len());
+        // Everything from the block start onward is the reasoning markup. Split it
+        // off so the preceding answer text (if any) stays in the live stream.
+        let block = self.streaming.streaming_text.split_off(block_start);
+        // Drop the separator the open path added before the reasoning block so the
+        // surrounding answer text rejoins cleanly.
+        while self.streaming.streaming_text.ends_with('\n') {
+            self.streaming.streaming_text.pop();
+        }
+        let block = block.trim_matches('\n').to_string();
+        if block.is_empty() {
+            self.refresh_split_view_if_needed();
+            return;
+        }
+        // Answer text that streamed *before* the block must commit first so the
+        // anchored trace lands after it in the transcript (chronological order).
+        if !self.streaming.streaming_text.trim().is_empty() {
+            let preceding = self.take_streaming_text();
+            let preceding = self.collapse_reasoning_for_commit(preceding);
+            if !preceding.trim().is_empty() {
+                self.push_display_message(DisplayMessage::assistant(preceding));
+            }
+        }
+        self.turn_reasoning_traces
+            .push(crate::tui::app::TurnReasoningTrace {
+                display_index: self.display_messages.len(),
+                // Snapshot the transcript height when this trace anchors. The trace
+                // begins life at the viewport tail; once the transcript grows a
+                // full viewport beyond this point the trace is provably off-screen
+                // (while tail-following) and can be GC'd without visible motion.
+                wrapped_lines_at_anchor: crate::tui::ui::last_total_wrapped_lines(),
+            });
+        self.push_display_message(DisplayMessage::reasoning(block));
+        self.refresh_split_view_if_needed();
+    }
+
+    /// Remove the current turn's anchored reasoning traces from the transcript.
+    /// Called when the next user prompt is submitted so `current` mode stays
+    /// ephemeral across turns: the trace never moves while on screen, it is
+    /// simply gone the next time the user acts (a moment when the transcript
+    /// reflows anyway).
+    pub(super) fn clear_turn_reasoning_traces(&mut self) {
+        if self.turn_reasoning_traces.is_empty() {
+            return;
+        }
+        let traces = std::mem::take(&mut self.turn_reasoning_traces);
+        let removed = self.remove_reasoning_trace_messages(traces.iter().map(|t| t.display_index));
+        if removed > 0 {
+            self.bump_display_messages_version();
+            self.refresh_split_view_if_needed();
+        }
+    }
+
+    /// Garbage-collect *stale* reasoning traces (every anchored trace except
+    /// the most recent one) that are provably above the tail-following
+    /// viewport, so their removal causes zero visible motion. Keeps `current`
+    /// mode meaning "the current thought": old thoughts dissolve once they
+    /// scroll out of view instead of accumulating across a long agentic turn.
+    /// Skipped entirely while the user has scrolled up (their reading position
+    /// must not shift).
+    pub(super) fn gc_offscreen_reasoning_traces(&mut self) -> bool {
+        // Only the traces *before* the most recent one are stale.
+        if self.turn_reasoning_traces.len() < 2 {
+            return false;
+        }
+        if self.auto_scroll_paused {
+            // User is reading history; never remove anything they might see.
+            return false;
+        }
+        let total = crate::tui::ui::last_total_wrapped_lines();
+        let viewport = crate::tui::ui::last_layout_snapshot()
+            .map(|l| l.messages_area.height as usize)
+            .unwrap_or(0);
+        if total == 0 || viewport == 0 {
+            return false;
+        }
+        // A trace anchored when the transcript was `at_anchor` lines tall sits
+        // entirely above wrapped line `at_anchor`. While tail-following, the
+        // viewport shows the last `viewport` lines, so once the transcript has
+        // grown a full viewport past the anchor point (with margin for the
+        // separator blank line), the trace cannot be on screen.
+        let last = self.turn_reasoning_traces.len() - 1;
+        let stale: Vec<usize> = self.turn_reasoning_traces[..last]
+            .iter()
+            .filter(|t| total.saturating_sub(t.wrapped_lines_at_anchor) > viewport + 2)
+            .map(|t| t.display_index)
+            .collect();
+        if stale.is_empty() {
+            return false;
+        }
+        let removed = self.remove_reasoning_trace_messages(stale.iter().copied());
+        if removed > 0 {
+            // Re-track surviving traces with adjusted display indices.
+            self.turn_reasoning_traces.retain_mut(|t| {
+                if stale.contains(&t.display_index) {
+                    return false;
+                }
+                let shift = stale.iter().filter(|&&s| s < t.display_index).count();
+                t.display_index -= shift;
+                true
+            });
+            self.bump_display_messages_version();
+            self.refresh_split_view_if_needed();
+            return true;
+        }
+        false
+    }
+
+    /// Remove reasoning display messages at the given (pre-removal) indices.
+    /// Returns how many were removed.
+    fn remove_reasoning_trace_messages(&mut self, indices: impl Iterator<Item = usize>) -> usize {
+        let mut sorted: Vec<usize> = indices.collect();
+        sorted.sort_unstable();
+        let mut removed = 0usize;
+        for idx in sorted {
+            let idx = idx.saturating_sub(removed);
+            if idx < self.display_messages.len() && self.display_messages[idx].role == "reasoning" {
+                self.display_messages.remove(idx);
+                removed += 1;
+            }
+        }
+        removed
     }
 
     pub(super) fn append_streaming_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.streaming_text.push_str(text);
+        // Invariant: answer text is never appended *into* an open reasoning
+        // region. If a region is still open when real (non-whitespace) answer
+        // text arrives, close it first so the next `open_reasoning_region` still
+        // inserts its blank-line separator. Without this, a stale
+        // `reasoning_streaming` flag makes `open_reasoning_region` early-return
+        // and the answer tail gets glued directly onto the next reasoning run
+        // (e.g. `...patch + build.Ah, I see...`). Whitespace-only appends (the
+        // separators emitted by the reasoning helpers themselves) never trip
+        // this. `open_reasoning_region` only appends its separator *before*
+        // setting the flag, so this cannot recurse.
+        if self.reasoning_streaming && !text.trim().is_empty() {
+            self.close_reasoning_region(None);
+        }
+        self.streaming.streaming_text.push_str(text);
         self.refresh_split_view_if_needed();
     }
 
+    /// Apply a batch of paced [`StreamOp`]s from the segment-aware
+    /// [`StreamBuffer`](crate::tui::stream_buffer::StreamBuffer) to the live
+    /// streaming view, preserving arrival order across answer text, reasoning
+    /// text, and reasoning-region boundaries. Returns true when anything
+    /// visible changed.
+    pub(super) fn apply_stream_ops(
+        &mut self,
+        ops: Vec<crate::tui::stream_buffer::StreamOp>,
+    ) -> bool {
+        use crate::tui::stream_buffer::StreamOp;
+        let mut changed = false;
+        for op in ops {
+            match op {
+                StreamOp::Text(text) => {
+                    if !text.is_empty() {
+                        // `append_streaming_text` enforces the invariant that real
+                        // answer text closes any still-open reasoning region first
+                        // (so the region's blank-line separator is preserved). The
+                        // buffer also queues an explicit CloseReasoning before
+                        // non-whitespace text, so this is normally already closed.
+                        self.append_streaming_text(&text);
+                        changed = true;
+                    }
+                }
+                StreamOp::Reasoning(text) => {
+                    if !text.is_empty() {
+                        self.append_reasoning_text(&text);
+                        changed = true;
+                    }
+                }
+                StreamOp::CloseReasoning => {
+                    if self.reasoning_streaming {
+                        self.close_reasoning_region(None);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// In `current` reasoning display mode, reasoning is shown live but collapsed
+    /// once the assistant commits a message or runs a tool. Strip any
+    /// reasoning-marked lines (identified by [`REASONING_SENTINEL`]) from text
+    /// about to be committed to the transcript. Other modes pass through.
+    pub(super) fn collapse_reasoning_for_commit(&self, content: String) -> String {
+        if !matches!(
+            crate::config::config().display.reasoning_display(),
+            crate::config::ReasoningDisplayMode::Current
+        ) {
+            return content;
+        }
+        strip_reasoning_lines(&content)
+    }
+
     pub(super) fn replace_streaming_text(&mut self, text: String) {
-        self.streaming_text = text;
+        self.streaming.streaming_text = text;
         self.refresh_split_view_if_needed();
     }
 
     pub(super) fn clear_streaming_render_state(&mut self) {
-        self.streaming_text.clear();
+        self.streaming.streaming_text.clear();
         self.stream_message_ended = false;
+        self.deferred_stream_done_id = None;
+        self.reasoning_streaming = false;
+        self.reasoning_pending_line.clear();
+        self.reasoning_partial_len = 0;
+        // The stream (and any block offset into it) is gone.
+        self.reasoning_block_start = None;
         self.refresh_split_view_if_needed();
         self.streaming_md_renderer.borrow_mut().reset();
         crate::tui::mermaid::clear_streaming_preview_diagram();
     }
 
+    /// Reset provider-reported usage that belongs to a transcript being fully
+    /// discarded. Render-only resets intentionally preserve these counters,
+    /// so full session clears must call this separately.
+    pub(super) fn clear_live_usage_state(&mut self) {
+        self.streaming.streaming_input_tokens = 0;
+        self.streaming.streaming_output_tokens = 0;
+        self.streaming.streaming_cache_read_tokens = None;
+        self.streaming.streaming_cache_creation_tokens = None;
+        self.streaming.streaming_context_stale = false;
+        self.streaming.streaming_usage_call_reset_pending = false;
+        self.kv_cache.current_api_usage_recorded = false;
+    }
+
+    /// Discard all client-side render state for the current streaming attempt:
+    /// the live streaming buffer, in-progress tool calls, thinking-line state,
+    /// and any assistant transcript messages that were already committed
+    /// mid-attempt at tool-call boundaries.
+    ///
+    /// Used when the provider reports a `RetryRollback`: a transient transport
+    /// fault interrupted the response mid-stream and the request is being
+    /// replayed from the top, so everything from the aborted attempt must
+    /// disappear or the replay would render duplicated output.
+    pub(super) fn rollback_streaming_attempt(&mut self) {
+        self.stream_buffer.clear();
+        self.clear_streaming_render_state();
+        self.streaming_tool_calls.clear();
+        self.batch_progress = None;
+        self.thought_line_inserted = false;
+        self.thinking_prefix_emitted = false;
+        self.thinking_buffer.clear();
+        self.thinking_start = None;
+        // Assistant text committed to the transcript during this attempt (a
+        // ToolStart boundary commits the pending streamed text) must also go;
+        // the retry re-streams the entire response. `push_display_message`
+        // counts the trailing run of assistant messages and resets on any
+        // user/tool/system fence, so this removes exactly the current
+        // attempt's committed segments and never touches earlier turns.
+        let to_remove = self.attempt_committed_assistant_messages;
+        for _ in 0..to_remove {
+            if self
+                .display_messages
+                .last()
+                .is_some_and(|m| m.role == "assistant")
+            {
+                let idx = self.display_messages.len() - 1;
+                self.remove_display_message(idx);
+            } else {
+                break;
+            }
+        }
+        self.attempt_committed_assistant_messages = 0;
+    }
+
     pub(super) fn take_streaming_text(&mut self) -> String {
-        let content = std::mem::take(&mut self.streaming_text);
+        let content = std::mem::take(&mut self.streaming.streaming_text);
         self.stream_message_ended = false;
+        self.deferred_stream_done_id = None;
+        self.reasoning_streaming = false;
+        self.reasoning_pending_line.clear();
+        self.reasoning_partial_len = 0;
+        self.reasoning_block_start = None;
         self.refresh_split_view_if_needed();
         self.streaming_md_renderer.borrow_mut().reset();
         crate::tui::mermaid::clear_streaming_preview_diagram();
@@ -2349,16 +3510,40 @@ impl App {
     }
 
     pub(super) fn commit_pending_streaming_assistant_message(&mut self) -> bool {
-        if let Some(chunk) = self.stream_buffer.flush() {
-            self.append_streaming_text(&chunk);
+        let ops = self.stream_buffer.flush();
+        self.apply_stream_ops(ops);
+        // A commit is a hard message boundary: end any still-open reasoning
+        // region so `current` mode retains/discards the trace correctly.
+        if self.reasoning_streaming {
+            self.close_reasoning_region(None);
         }
 
-        if self.streaming_text.is_empty() {
+        if self.streaming.streaming_text.is_empty() {
             self.stream_buffer.clear();
+            // Tool-only boundary (no answer text): keep the retained trace on
+            // screen so the thought stays readable while the tool runs. It
+            // folds when superseded by the next trace or at end of turn.
+            //
+            // The ephemeral mermaid preview slot mirrors the (now empty) live
+            // buffer, so any surviving entry here is stale by definition. The
+            // buffer can only become empty without the slot being cleared via
+            // `replace_streaming_text` (remote TextReplace, debug snapshot
+            // restore); `take_streaming_text` and `clear_streaming_render_state`
+            // both clear it themselves.
+            crate::tui::mermaid::clear_streaming_preview_diagram();
             return false;
         }
 
+        // `take_streaming_text` also clears the streaming mermaid preview
+        // slot, so the whitespace-only early return below cannot leak it.
         let content = self.take_streaming_text();
+        let content = self.collapse_reasoning_for_commit(content);
+        if content.trim().is_empty() {
+            // Nothing left after collapsing reasoning-only content; same
+            // tool-only situation as above, keep the trace readable.
+            self.stream_buffer.clear();
+            return false;
+        }
         self.push_display_message(DisplayMessage::assistant(content));
         self.stream_buffer.clear();
         true
@@ -2376,8 +3561,8 @@ impl App {
             // treat this as a reset and count the full value once.
             output_tokens
         };
-        if self.streaming_tps_collect_output {
-            self.streaming_total_output_tokens += delta;
+        if self.streaming.streaming_tps_collect_output {
+            self.streaming.streaming_total_output_tokens += delta;
             if delta > 0 {
                 self.snapshot_streaming_tps();
             }
@@ -2387,12 +3572,13 @@ impl App {
 
     /// Submit input - just sets up message and flags, processing happens in next loop iteration
     pub(super) fn submit_input(&mut self) {
+        promote_dropped_images(self);
         if self.activate_picker_from_preview() {
             return;
         }
 
         let raw_input = std::mem::take(&mut self.input);
-        let input = self.expand_paste_placeholders(&raw_input);
+        let mut input = self.expand_paste_placeholders(&raw_input);
         if let Some(notice) = input_exceeds_submit_limit(&input) {
             self.input = raw_input;
             self.cursor_pos = self.input.len();
@@ -2427,21 +3613,7 @@ impl App {
         }
 
         let trimmed = input.trim();
-        let handled = commands::handle_help_command(self, trimmed)
-            || commands::handle_ssh_command(self, trimmed)
-            || commands::handle_session_command(self, trimmed)
-            || commands::handle_dictation_command(self, trimmed)
-            || commands::handle_config_command(self, trimmed)
-            || commands::handle_log_command(self, trimmed)
-            || commands::handle_diff_command(self, trimmed)
-            || commands::handle_model_status_command(self, trimmed)
-            || super::debug::handle_debug_command(self, trimmed)
-            || super::model_context::handle_model_command(self, trimmed)
-            || super::commands::handle_usage_command(self, trimmed)
-            || super::commands::handle_feedback_command(self, trimmed)
-            || super::state_ui::handle_info_command(self, trimmed)
-            || super::auth::handle_auth_command(self, trimmed)
-            || super::tui_lifecycle_runtime::handle_dev_command(self, trimmed);
+        let handled = super::commands_dispatch::dispatch_local_command(self, trimmed);
         if handled {
             if trimmed.starts_with('/') {
                 crate::telemetry::record_command_family(trimmed);
@@ -2480,9 +3652,19 @@ impl App {
             return;
         }
 
-        // Check for skill invocation
-        if let Some(skill_name) = SkillRegistry::parse_invocation(&input) {
-            let mut skill = self.current_skills_snapshot().get(skill_name).cloned();
+        // File drops remain ordinary input. Registry-aware resolution supports
+        // multi-word skill names without weakening that guard.
+        let initial_snapshot = self.current_skills_snapshot();
+        let skill_invocation = parse_dropped_paths(&input)
+            .is_none()
+            .then(|| initial_snapshot.resolve_invocation(&input))
+            .flatten();
+
+        // Check for skill invocation.
+        if let Some(invocation) = skill_invocation {
+            let skill_name = invocation.name.to_string();
+            let trailing_prompt = invocation.prompt.map(str::to_string);
+            let mut skill = initial_snapshot.get(&skill_name).cloned();
 
             // Remote/minimal TUI clients may start with an empty skill snapshot, and
             // daemon-side `skill_manage reload_all` can update a different process.
@@ -2490,23 +3672,12 @@ impl App {
             // directory before reporting Unknown skill so project-local skills such
             // as .jcode/skills/optimization work immediately after reload/build.
             if skill.is_none() {
-                let working_dir = self
-                    .session
-                    .working_dir
-                    .as_deref()
-                    .map(std::path::Path::new);
-                if let Ok(reloaded) = SkillRegistry::load_for_working_dir(working_dir) {
-                    skill = reloaded.get(skill_name).cloned();
-                    self.skills = std::sync::Arc::new(reloaded.clone());
-                    if let Ok(mut shared) = self.registry.skills().try_write() {
-                        *shared = reloaded;
-                    }
-                    self.invalidate_command_candidates_cache();
-                }
+                self.refresh_skills_snapshot();
+                skill = self.current_skills_snapshot().get(&skill_name).cloned();
             }
 
             if let Some(skill) = skill {
-                self.active_skill = Some(skill_name.to_string());
+                self.active_skill = Some(skill_name.clone());
                 self.push_display_message(DisplayMessage {
                     role: "system".to_string(),
                     content: format!("Activated skill: {} - {}", skill.name, skill.description),
@@ -2515,23 +3686,55 @@ impl App {
                     title: None,
                     tool_data: None,
                 });
+                if let Some(prompt) = trailing_prompt {
+                    input = prompt;
+                } else {
+                    return;
+                }
             } else {
+                // Distinguish an endorsed-but-not-installed skill from a
+                // typo: the skill list advertises endorsed skills, so a bare
+                // "Unknown skill" for them reads like a bug (issue #445).
+                let endorsed_hint = crate::skill::endorsed_skills()
+                    .iter()
+                    .find(|endorsed| endorsed.name == skill_name)
+                    .map(|endorsed| match endorsed.install {
+                        Some(install) => format!(
+                            "Skill /{} is endorsed but not installed. Install it with `{}`, then run /skills or skill_manage reload_all.",
+                            skill_name, install
+                        ),
+                        None => format!(
+                            "Skill /{} is endorsed but not installed (source: {}). Install it into ~/.jcode/skills/{}/SKILL.md.",
+                            skill_name, endorsed.source, skill_name
+                        ),
+                    });
                 self.push_display_message(DisplayMessage {
                     role: "error".to_string(),
-                    content: format!("Unknown skill: /{}", skill_name),
+                    content: endorsed_hint
+                        .unwrap_or_else(|| format!("Unknown skill: /{}", skill_name)),
                     tool_calls: vec![],
                     duration_secs: None,
                     title: None,
                     tool_data: None,
                 });
+                return;
             }
-            return;
         }
 
         // Leaving the preview should happen as soon as the user acts on it.
         self.onboarding_preview_mode = false;
 
         // Add user message to display (show placeholder to user, not full paste)
+        // Remember the typed prompt so we can restore it to the input box if this
+        // turn fails (e.g. "token refresh needed"), instead of dropping it.
+        self.last_submitted_input = Some(raw_input.clone());
+
+        // See `stage_turn_for_remote_tick_loop`: a remote client must never
+        // park on the local-only `pending_turn` flag.
+        if super::remote::stage_turn_for_remote_tick_loop(self, &input) {
+            return;
+        }
+
         self.push_display_message(DisplayMessage {
             role: "user".to_string(),
             content: raw_input, // Show placeholder to user (condensed view)
@@ -2579,28 +3782,37 @@ impl App {
         crate::telemetry::record_turn();
         self.session_save_pending = true;
 
+        // A fresh user turn supersedes any post-error fallback offer from the
+        // previous turn; drop it so a stale keypress can't switch+resend.
+        self.clear_pending_fallback_offer();
+        // Likewise drop any armed "merge the diverged update" offer.
+        self.clear_update_merge_offer();
+
         // Set up processing state - actual processing happens after UI redraws
         self.is_processing = true;
         self.status = ProcessingStatus::Sending;
         self.clear_streaming_render_state();
+        // A new prompt starts a new turn: the previous turn's anchored
+        // reasoning traces leave the transcript (ephemeral `current` mode).
+        self.clear_turn_reasoning_traces();
         self.stream_buffer.clear();
         self.thought_line_inserted = false;
         self.thinking_prefix_emitted = false;
         self.thinking_buffer.clear();
         self.streaming_tool_calls.clear();
-        self.streaming_input_tokens = 0;
-        self.streaming_output_tokens = 0;
-        self.streaming_cache_read_tokens = None;
-        self.streaming_cache_creation_tokens = None;
-        self.current_api_usage_recorded = false;
+        self.streaming.streaming_input_tokens = 0;
+        self.streaming.streaming_output_tokens = 0;
+        self.streaming.streaming_cache_read_tokens = None;
+        self.streaming.streaming_cache_creation_tokens = None;
+        self.kv_cache.current_api_usage_recorded = false;
         self.upstream_provider = None;
         self.status_detail = None;
-        self.streaming_tps_start = None;
-        self.streaming_tps_elapsed = Duration::ZERO;
-        self.streaming_tps_collect_output = false;
-        self.streaming_total_output_tokens = 0;
-        self.streaming_tps_observed_output_tokens = 0;
-        self.streaming_tps_observed_elapsed = Duration::ZERO;
+        self.streaming.streaming_tps_start = None;
+        self.streaming.streaming_tps_elapsed = Duration::ZERO;
+        self.streaming.streaming_tps_collect_output = false;
+        self.streaming.streaming_total_output_tokens = 0;
+        self.streaming.streaming_tps_observed_output_tokens = 0;
+        self.streaming.streaming_tps_observed_elapsed = Duration::ZERO;
         self.processing_started = Some(Instant::now());
         self.visible_turn_started = Some(Instant::now());
         self.pending_turn = true;
@@ -2656,19 +3868,19 @@ impl App {
             self.thinking_prefix_emitted = false;
             self.thinking_buffer.clear();
             self.streaming_tool_calls.clear();
-            self.streaming_input_tokens = 0;
-            self.streaming_output_tokens = 0;
-            self.streaming_cache_read_tokens = None;
-            self.streaming_cache_creation_tokens = None;
-            self.current_api_usage_recorded = false;
+            self.streaming.streaming_input_tokens = 0;
+            self.streaming.streaming_output_tokens = 0;
+            self.streaming.streaming_cache_read_tokens = None;
+            self.streaming.streaming_cache_creation_tokens = None;
+            self.kv_cache.current_api_usage_recorded = false;
             self.upstream_provider = None;
             self.status_detail = None;
-            self.streaming_tps_start = None;
-            self.streaming_tps_elapsed = Duration::ZERO;
-            self.streaming_tps_collect_output = false;
-            self.streaming_total_output_tokens = 0;
-            self.streaming_tps_observed_output_tokens = 0;
-            self.streaming_tps_observed_elapsed = Duration::ZERO;
+            self.streaming.streaming_tps_start = None;
+            self.streaming.streaming_tps_elapsed = Duration::ZERO;
+            self.streaming.streaming_tps_collect_output = false;
+            self.streaming.streaming_total_output_tokens = 0;
+            self.streaming.streaming_tps_observed_output_tokens = 0;
+            self.streaming.streaming_tps_observed_elapsed = Duration::ZERO;
             self.processing_started = Some(Instant::now());
             if has_combined {
                 if preserve_visible_turn {
@@ -2686,10 +3898,18 @@ impl App {
             {
                 Ok(()) => {
                     self.last_stream_error = None;
+                    self.last_submitted_input = None;
                 }
                 Err(e) => {
                     let err_str = crate::util::format_error_chain(&e);
-                    if is_context_limit_error(&err_str) {
+                    if is_request_payload_too_large_error(&err_str) {
+                        if !self
+                            .try_recover_payload_too_large_and_retry(terminal, event_stream)
+                            .await
+                        {
+                            self.handle_turn_error(err_str);
+                        }
+                    } else if is_context_limit_error(&err_str) {
                         if self
                             .try_auto_compact_and_retry(terminal, event_stream)
                             .await
@@ -2724,5 +3944,79 @@ impl App {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_control_sequence_tests {
+    use super::strip_terminal_control_sequences;
+
+    /// Remnants of terminal reports must never reach the composer (#540).
+    #[test]
+    fn strips_escape_and_bare_report_remnants() {
+        for (input, expected) in [
+            // Full mouse report, and the bare tail left by a torn read.
+            ("\x1b[<65;50;24M", ""),
+            ("[<65;50;24M", ""),
+            ("hi[<65;50;24Mthere", "hithere"),
+            ("[<65;50;24m", ""),
+            // Bracketed paste markers and cursor/focus reports.
+            ("[200~", ""),
+            ("[201~", ""),
+            ("[12;40R", ""),
+            ("[1I", ""),
+            ("[1O", ""),
+            // 8-bit CSI introducer.
+            ("\u{9b}[<65;50;24M", ""),
+            // Stray C0 controls, but tabs and newlines survive.
+            ("a\x07b", "ab"),
+            ("a\tb\nc", "a\tb\nc"),
+            // Truncated escape with no final byte: drop the remnant.
+            ("\x1b[<65;5", ""),
+        ] {
+            assert_eq!(
+                strip_terminal_control_sequences(input),
+                expected,
+                "input {input:?} should sanitize to {expected:?}"
+            );
+        }
+    }
+
+    /// The guard must not eat text a user actually typed. Being too aggressive
+    /// here is worse than missing a remnant.
+    #[test]
+    fn preserves_ordinary_bracketed_text() {
+        for input in [
+            "array[0]",
+            "list[1] = list[2]",
+            "[TODO] fix this",
+            "see docs[1] and notes[2]",
+            "fn f(v: Vec<u8>) -> [u8; 4]",
+            "a[b]c",
+            "[]",
+            "[",
+            "]",
+            "[abc]",
+            "[1]",
+            "[12;40]",
+            "plain text with no brackets",
+            "emoji 🎉 and accents café",
+            "match x { [a, b] => a + b }",
+        ] {
+            assert_eq!(
+                strip_terminal_control_sequences(input),
+                input,
+                "input {input:?} must be preserved verbatim"
+            );
+        }
+    }
+
+    /// Non-suspicious text must not be reallocated.
+    #[test]
+    fn borrows_when_nothing_to_strip() {
+        assert!(matches!(
+            strip_terminal_control_sequences("array[0] = 1"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

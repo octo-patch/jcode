@@ -44,10 +44,10 @@ impl ProviderAvailability {
 pub fn auto_default_provider(availability: ProviderAvailability) -> ActiveProvider {
     if availability.copilot_premium_zero && availability.copilot {
         ActiveProvider::Copilot
-    } else if availability.openai {
-        ActiveProvider::OpenAI
     } else if availability.claude {
         ActiveProvider::Claude
+    } else if availability.openai {
+        ActiveProvider::OpenAI
     } else if availability.copilot {
         ActiveProvider::Copilot
     } else if availability.antigravity {
@@ -119,6 +119,48 @@ pub fn provider_from_model_key(key: &str) -> Option<ActiveProvider> {
     }
 }
 
+/// Translate a persisted session/runtime provider key (the `RuntimeKey`
+/// stable-id or `ModelRouteApiMethod` vocabulary, e.g. `anthropic-api-key`,
+/// `claude-oauth`, `openai-api-key`) into the CLI `--provider` argument value
+/// (the `ProviderChoice` vocabulary, e.g. `anthropic-api`, `claude`,
+/// `openai-api`).
+///
+/// These two vocabularies overlap but are NOT identical: the runtime key
+/// distinguishes auth method (`anthropic-api-key` vs `claude-oauth`) while the
+/// CLI `--provider` enum uses `anthropic-api` / `claude`. Passing a raw runtime
+/// key straight to `--provider` makes clap reject it (`invalid value
+/// 'anthropic-api-key'`) and the spawned process exits immediately.
+///
+/// Returns `None` when there is no clean, unambiguous CLI provider to pass; in
+/// that case callers should omit the flag entirely and rely on the persisted
+/// session (model + provider_key + route_api_method) to reconstruct the exact
+/// route on resume.
+pub fn cli_provider_arg_for_session_key(key: &str) -> Option<&'static str> {
+    let normalized = key.trim().to_ascii_lowercase();
+    let base = normalized
+        .split_once(':')
+        .map(|(prefix, _rest)| prefix)
+        .unwrap_or(normalized.as_str());
+    // Dual-auth (Anthropic/OpenAI OAuth-vs-API) keys share one canonical alias
+    // table, so the CLI arg never drifts from the route/runtime vocabularies.
+    if let Some(route) = crate::auth_mode::AuthRoute::parse(base) {
+        return Some(route.cli_provider_arg());
+    }
+    match base {
+        "openrouter" => Some("openrouter"),
+        "copilot" => Some("copilot"),
+        "gemini" => Some("gemini"),
+        "cursor" => Some("cursor"),
+        "bedrock" => Some("bedrock"),
+        "antigravity" => Some("antigravity"),
+        "code-assist-oauth" | "google" => Some("google"),
+        // openai-compatible / custom profiles, remote-catalog, current, and any
+        // unknown key have no clean standalone CLI provider value (they need a
+        // profile too), so omit the flag and let the persisted session route.
+        _ => None,
+    }
+}
+
 pub fn explicit_model_provider_prefix(model: &str) -> Option<(ActiveProvider, &'static str, &str)> {
     if let Some(rest) = model.strip_prefix("claude-api:") {
         Some((ActiveProvider::Claude, "claude-api:", rest))
@@ -161,8 +203,50 @@ pub fn model_name_for_provider(provider: ActiveProvider, model: &str) -> Cow<'_,
 }
 
 pub fn dedupe_model_routes(routes: Vec<ModelRoute>) -> Vec<ModelRoute> {
-    let mut deduped: Vec<ModelRoute> = Vec::with_capacity(routes.len());
+    use std::collections::HashMap;
 
+    let mut deduped: Vec<ModelRoute> = Vec::with_capacity(routes.len());
+    // Bucket candidate duplicates by (provider, model). The api_method match is
+    // fuzzy (generic vs profile openai-compatible), so buckets keep a linear
+    // scan, but each bucket only holds the handful of routes for one model.
+    // The previous full `deduped.iter().position(..)` scan was O(n^2) over
+    // 2000+ routes and showed up in server connect-burst profiles.
+    let mut buckets: HashMap<(String, String), Vec<usize>> = HashMap::with_capacity(routes.len());
+
+    for route in routes {
+        let key = (route.provider.clone(), route.model.clone());
+        let bucket = buckets.entry(key).or_default();
+
+        if let Some(existing_idx) = bucket
+            .iter()
+            .copied()
+            .find(|&idx| duplicate_route_api_method(&deduped[idx].api_method, &route.api_method))
+        {
+            if should_replace_duplicate_route(&deduped[existing_idx], &route) {
+                deduped[existing_idx] = route;
+            }
+            continue;
+        }
+
+        bucket.push(deduped.len());
+        deduped.push(route);
+    }
+
+    deduped
+}
+
+#[cfg(test)]
+fn duplicate_model_route(existing: &ModelRoute, candidate: &ModelRoute) -> bool {
+    existing.provider == candidate.provider
+        && existing.model == candidate.model
+        && duplicate_route_api_method(&existing.api_method, &candidate.api_method)
+}
+
+/// Reference O(n^2) dedupe used to prove the bucketed implementation above is
+/// behavior-identical (see `bucketed_dedupe_matches_reference` test).
+#[cfg(test)]
+fn dedupe_model_routes_reference(routes: Vec<ModelRoute>) -> Vec<ModelRoute> {
+    let mut deduped: Vec<ModelRoute> = Vec::with_capacity(routes.len());
     for route in routes {
         if let Some(existing_idx) = deduped
             .iter()
@@ -173,17 +257,9 @@ pub fn dedupe_model_routes(routes: Vec<ModelRoute>) -> Vec<ModelRoute> {
             }
             continue;
         }
-
         deduped.push(route);
     }
-
     deduped
-}
-
-fn duplicate_model_route(existing: &ModelRoute, candidate: &ModelRoute) -> bool {
-    existing.provider == candidate.provider
-        && existing.model == candidate.model
-        && duplicate_route_api_method(&existing.api_method, &candidate.api_method)
 }
 
 fn duplicate_route_api_method(existing: &str, candidate: &str) -> bool {
@@ -305,6 +381,58 @@ mod tests {
         );
         assert_eq!(parse_provider_hint("openai"), Some(ActiveProvider::OpenAI));
         assert_eq!(parse_provider_hint("unknown"), None);
+    }
+
+    #[test]
+    fn cli_provider_arg_translates_runtime_keys() {
+        // Anthropic API key (the regression: this is NOT a valid --provider
+        // value verbatim; it must map to `anthropic-api`).
+        assert_eq!(
+            cli_provider_arg_for_session_key("anthropic-api-key"),
+            Some("anthropic-api")
+        );
+        assert_eq!(
+            cli_provider_arg_for_session_key("claude-api"),
+            Some("anthropic-api")
+        );
+        // Anthropic OAuth -> claude.
+        assert_eq!(
+            cli_provider_arg_for_session_key("claude-oauth"),
+            Some("claude")
+        );
+        assert_eq!(cli_provider_arg_for_session_key("claude"), Some("claude"));
+        // OpenAI variants.
+        assert_eq!(
+            cli_provider_arg_for_session_key("openai-oauth"),
+            Some("openai")
+        );
+        assert_eq!(
+            cli_provider_arg_for_session_key("openai-api-key"),
+            Some("openai-api")
+        );
+        // Passthrough providers.
+        assert_eq!(
+            cli_provider_arg_for_session_key("openrouter"),
+            Some("openrouter")
+        );
+        assert_eq!(cli_provider_arg_for_session_key("copilot"), Some("copilot"));
+        assert_eq!(cli_provider_arg_for_session_key("gemini"), Some("gemini"));
+        assert_eq!(cli_provider_arg_for_session_key("bedrock"), Some("bedrock"));
+        // Case-insensitive and whitespace tolerant.
+        assert_eq!(
+            cli_provider_arg_for_session_key("  Anthropic-API-Key "),
+            Some("anthropic-api")
+        );
+        // Profile-scoped openai-compatible keys have no clean standalone CLI
+        // value, so we omit the flag and let the persisted session route.
+        assert_eq!(
+            cli_provider_arg_for_session_key("openai-compatible:zai"),
+            None
+        );
+        assert_eq!(cli_provider_arg_for_session_key("openai-compatible"), None);
+        assert_eq!(cli_provider_arg_for_session_key("remote-catalog"), None);
+        assert_eq!(cli_provider_arg_for_session_key("current"), None);
+        assert_eq!(cli_provider_arg_for_session_key("totally-unknown"), None);
     }
 
     #[test]
@@ -477,6 +605,49 @@ mod tests {
         }));
     }
 
+    /// State-space equivalence: the bucketed O(n) dedupe must produce exactly
+    /// the same output (content and order) as the original O(n^2) reference for
+    /// a pseudo-random mix of providers/models/api-methods, including the fuzzy
+    /// generic-vs-profile openai-compatible collisions.
+    #[test]
+    fn bucketed_dedupe_matches_reference() {
+        let providers = ["Anthropic", "OpenAI", "Cerebras", "auto"];
+        let models = ["m1", "m2", "m3", "qwen", "claude-x"];
+        let api_methods = [
+            "claude-oauth",
+            "claude-api",
+            "openrouter",
+            "openai-compatible",
+            "openai-compatible:cerebras",
+            "openai-compatible:other",
+        ];
+
+        // Deterministic pseudo-random stream, dense enough to hit every
+        // provider/model/api-method combination and repeated duplicates.
+        let mut seed = 0x9e37_79b9_u64;
+        let mut routes = Vec::new();
+        for i in 0..600 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let p = providers[(seed >> 7) as usize % providers.len()];
+            let m = models[(seed >> 17) as usize % models.len()];
+            let a = api_methods[(seed >> 27) as usize % api_methods.len()];
+            routes.push(ModelRoute {
+                model: m.to_string(),
+                provider: p.to_string(),
+                api_method: a.to_string(),
+                available: seed & 1 == 0,
+                detail: format!("route-{i}"),
+                cheapness: None,
+            });
+        }
+
+        let expected = dedupe_model_routes_reference(routes.clone());
+        let actual = dedupe_model_routes(routes);
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn auto_default_prefers_copilot_zero_mode() {
         let provider = auto_default_provider(ProviderAvailability {
@@ -486,6 +657,16 @@ mod tests {
             ..ProviderAvailability::default()
         });
         assert_eq!(provider, ActiveProvider::Copilot);
+    }
+
+    #[test]
+    fn auto_default_prefers_claude_when_both_frontier_providers_are_available() {
+        let provider = auto_default_provider(ProviderAvailability {
+            openai: true,
+            claude: true,
+            ..ProviderAvailability::default()
+        });
+        assert_eq!(provider, ActiveProvider::Claude);
     }
 
     #[test]

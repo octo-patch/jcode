@@ -159,6 +159,7 @@ pub(super) fn provider_report_from_usage_data(
         extra_info,
         hard_limit_reached: false,
         error: None,
+        last_used_unix_secs: None,
     }
 }
 
@@ -256,6 +257,7 @@ pub(super) fn provider_report_from_openai_usage_data(
         extra_info: Vec::new(),
         hard_limit_reached: data.hard_limit_reached,
         error: None,
+        last_used_unix_secs: None,
     }
 }
 
@@ -266,15 +268,21 @@ pub(super) fn openai_snapshot_from_usage(
 ) -> AccountUsageSnapshot {
     let five_hour_ratio = usage.five_hour.as_ref().map(|window| window.usage_ratio);
     let seven_day_ratio = usage.seven_day.as_ref().map(|window| window.usage_ratio);
-    let exhausted = usage.has_limits()
-        && five_hour_ratio.map(|ratio| ratio >= 0.99).unwrap_or(false)
-        && seven_day_ratio.map(|ratio| ratio >= 0.99).unwrap_or(false);
+    let exhausted = usage.exhausted();
 
     AccountUsageSnapshot {
         label,
         email,
         exhausted,
+        primary_label: usage
+            .five_hour
+            .as_ref()
+            .map(|window| window.name.trim_end_matches(" window").to_string()),
         five_hour_ratio,
+        secondary_label: usage
+            .seven_day
+            .as_ref()
+            .map(|window| window.name.trim_end_matches(" window").to_string()),
         seven_day_ratio,
         resets_at: usage
             .five_hour
@@ -299,7 +307,9 @@ pub(super) fn anthropic_snapshot_from_usage(
         label,
         email,
         exhausted: usage.five_hour >= 0.99 && usage.seven_day >= 0.99,
+        primary_label: Some("5h".to_string()),
         five_hour_ratio: Some(usage.five_hour),
+        secondary_label: Some("7d".to_string()),
         seven_day_ratio: Some(usage.seven_day),
         resets_at: usage
             .five_hour_resets_at

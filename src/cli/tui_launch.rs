@@ -51,7 +51,7 @@ pub async fn run_client() -> Result<()> {
                         use crate::protocol::ServerEvent;
                         match event {
                             ServerEvent::TextDelta { text } => {
-                                print!("{}", text);
+                                print!("{}", crate::output_style::terminal_text(&text));
                                 std::io::stdout().flush()?;
                             }
                             ServerEvent::Done { id } if id == msg_id => {
@@ -86,6 +86,8 @@ pub async fn run_tui_client(
     startup_hints: Option<setup_hints::StartupHints>,
     server_spawning: bool,
     fresh_spawn: bool,
+    remote_working_dir: Option<String>,
+    onboarding_sim: bool,
 ) -> Result<()> {
     startup_profile::mark("tui_client_enter");
     let (terminal, tui_runtime) = init_tui_runtime()?;
@@ -130,6 +132,9 @@ pub async fn run_tui_client(
     if should_show_server_spawning(server_spawning).await {
         app.set_server_spawning();
     }
+    if onboarding_sim {
+        app.start_onboarding_simulator_on_launch();
+    }
     startup_profile::mark("app_new_for_remote");
     if resume_session.is_none()
         && let Some(hints) = startup_hints
@@ -140,7 +145,7 @@ pub async fn run_tui_client(
     startup_profile::mark("pre_run_remote");
     startup_profile::report_to_log();
 
-    let result = app.run_remote(terminal).await;
+    let result = app.run_remote(terminal, remote_working_dir).await;
 
     // On the error path, `?` returns here while `tui_runtime` is still alive, so
     // its `Drop` guarantees the terminal is restored (issue #214). On the happy
@@ -187,7 +192,10 @@ fn apply_startup_hints(app: &mut tui::App, hints: setup_hints::StartupHints) {
         app.set_status_notice(status_notice);
     }
     if let Some((title, message)) = hints.display_message {
-        app.push_display_message(tui::DisplayMessage::system(message).with_title(title));
+        // Stash the card so it survives the remote History bootstrap, which
+        // clears the transcript for a brand-new session and would otherwise make
+        // the hint flash for a moment and then disappear on the idle screen.
+        app.set_pending_startup_notice(title, message);
     }
     if let Some(message) = hints.auto_send_message {
         app.queue_startup_message(message);
@@ -253,9 +261,12 @@ pub async fn run_replay_command(
                 })
                 .collect();
             eprintln!(
-                "🐝 Exporting swarm replay from seed {} ({} panes)",
-                session_id_or_path,
-                panes.len()
+                "{}",
+                crate::output_style::terminal_text(&format!(
+                    "🐝 Exporting swarm replay from seed {} ({} panes)",
+                    session_id_or_path,
+                    panes.len()
+                ))
             );
             video_export::export_swarm_video(
                 &panes,
@@ -296,15 +307,24 @@ pub async fn run_replay_command(
 
         let pane_count = replayable_panes.len();
         eprintln!(
-            "🐝 Replaying swarm: {} ({} panes, {:.1}x speed)",
-            session_id_or_path, pane_count, speed
+            "{}",
+            crate::output_style::terminal_text(&format!(
+                "🐝 Replaying swarm: {} ({} panes, {:.1}x speed)",
+                session_id_or_path, pane_count, speed
+            ))
         );
         eprintln!("  Controls: Space=pause  +/-=speed  q=quit\n");
 
         let (terminal, tui_runtime) = init_tui_runtime()?;
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::terminal::SetTitle(format!("🐝 swarm replay: {}", session_id_or_path))
+            crossterm::terminal::SetTitle(
+                crate::output_style::terminal_text(&format!(
+                    "🐝 swarm replay: {}",
+                    session_id_or_path
+                ))
+                .into_owned()
+            )
         );
 
         let result =
@@ -455,6 +475,13 @@ pub fn list_sessions() -> Result<()> {
                     crate::import::imported_opencode_session_id(session_id),
                 ],
             ),
+            jcode_tui_session_picker::ResumeTarget::CursorSession { session_id, .. } => (
+                exe.to_path_buf(),
+                vec![
+                    "--resume".to_string(),
+                    crate::import::imported_cursor_session_id(session_id),
+                ],
+            ),
         }
     }
 
@@ -493,12 +520,39 @@ pub fn list_sessions() -> Result<()> {
             jcode_tui_session_picker::ResumeTarget::OpenCodeSession { session_id, .. } => {
                 format!("◌ OpenCode {}", &session_id[..session_id.len().min(8)])
             }
+            jcode_tui_session_picker::ResumeTarget::CursorSession { session_id, .. } => {
+                format!("▮ Cursor {}", &session_id[..session_id.len().min(8)])
+            }
         };
+        let title = crate::output_style::terminal_text(&title).into_owned();
         let command = crate::terminal_launch::TerminalCommand::new(program, args).title(title);
         crate::terminal_launch::spawn_command_in_new_terminal(&command, cwd)
     }
 
     match tui::session_picker::pick_session()? {
+        Some(tui::session_picker::PickerResult::TakeOverClaude(target)) => {
+            let resolved_target = crate::import::take_over_live_claude_session(&target)?;
+            let jcode_tui_session_picker::ResumeTarget::JcodeSession { session_id } =
+                &resolved_target
+            else {
+                anyhow::bail!("Claude takeover did not produce a Jcode session");
+            };
+            let exe = std::env::current_exe()?;
+            let mut session_cwd = std::env::current_dir()?;
+            if let Ok(sess) = session::Session::load(session_id)
+                && let Some(dir) = sess.working_dir.as_deref()
+                && std::path::Path::new(dir).is_dir()
+            {
+                session_cwd = std::path::PathBuf::from(dir);
+            }
+            let (program, args) = build_resume_target_command(&exe, &resolved_target);
+            let err = crate::platform::replace_process(
+                ProcessCommand::new(&program)
+                    .args(&args)
+                    .current_dir(session_cwd),
+            );
+            Err(anyhow::anyhow!("Failed to exec {:?}: {}", program, err))
+        }
         Some(
             tui::session_picker::PickerResult::Selected(targets)
             | tui::session_picker::PickerResult::SelectedInCurrentTerminal(targets),
@@ -686,7 +740,9 @@ pub fn list_sessions() -> Result<()> {
 
             Ok(())
         }
-        None | Some(tui::session_picker::PickerResult::StartNewSession) => {
+        None
+        | Some(tui::session_picker::PickerResult::StartNewSession)
+        | Some(tui::session_picker::PickerResult::ReviewRecentProject) => {
             eprintln!("No session selected.");
             Ok(())
         }

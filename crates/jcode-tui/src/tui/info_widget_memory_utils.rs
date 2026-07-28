@@ -1,16 +1,5 @@
 use super::format_event_for_expanded;
-use super::model::shorten_model_name;
 use super::{MemoryActivity, MemoryEvent, MemoryEventKind, MemoryState};
-
-pub(super) fn compact_memory_model_label(model: &str) -> String {
-    let trimmed = model.trim();
-    let model_name = trimmed
-        .rsplit_once('·')
-        .map(|(_, model)| model.trim())
-        .filter(|model| !model.is_empty())
-        .unwrap_or(trimmed);
-    shorten_model_name(model_name)
-}
 
 pub(super) fn memory_active_summary(state: &MemoryState) -> Option<String> {
     match state {

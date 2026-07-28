@@ -55,6 +55,7 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
                 last_seen: now,
                 is_processing: true,
                 current_tool_name: Some("bash".to_string()),
+                terminal_env: Vec::new(),
                 disconnect_tx: mpsc::unbounded_channel().0,
             },
         ),
@@ -69,15 +70,14 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
                 last_seen: now,
                 is_processing: false,
                 current_tool_name: None,
+                terminal_env: Vec::new(),
                 disconnect_tx: mpsc::unbounded_channel().0,
             },
         ),
     ])));
     let swarm_members = Arc::new(RwLock::new(HashMap::<String, SwarmMember>::new()));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
-    let file_touches = Arc::new(RwLock::new(HashMap::<PathBuf, Vec<FileAccess>>::new()));
-    let files_touched_by_session =
-        Arc::new(RwLock::new(HashMap::<String, HashSet<PathBuf>>::new()));
+    let file_touch = FileTouchService::new();
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::<
         String,
         HashMap<String, HashSet<String>>,
@@ -104,6 +104,7 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
         77,
         target_session_id.to_string(),
         None,
+        None,
         false,
         false,
         &mut client_selfdev,
@@ -119,8 +120,7 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
         &Arc::new(RwLock::new(ClientDebugState::default())),
         &swarm_members,
         &swarms_by_id,
-        &file_touches,
-        &files_touched_by_session,
+        &file_touch,
         &channel_subscriptions,
         &channel_subscriptions_by_session,
         &swarm_plans,
@@ -137,7 +137,46 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
     )
     .await?;
 
-    let events = collect_events_until_done(&mut client_event_rx, 77).await;
+    // The desktop follows a target-aware resume with the normal subscribe
+    // bookkeeping while the original client can still be processing. That
+    // bookkeeping must never wait for the live agent lock, otherwise the
+    // desktop's immediately following state request remains unread and times
+    // out after ten seconds.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle_subscribe(
+            77,
+            Some("/tmp/jcode-busy-desktop-attach".to_string()),
+            Some(true),
+            false,
+            &mut client_selfdev,
+            target_session_id,
+            "conn_new",
+            &None,
+            &existing_agent,
+            &new_registry,
+            true,
+            &swarm_members,
+            &swarms_by_id,
+            &channel_subscriptions,
+            &channel_subscriptions_by_session,
+            &swarm_plans,
+            &swarm_coordinators,
+            &client_event_tx,
+            &mcp_pool,
+            &event_history,
+            &event_counter,
+            &swarm_event_tx,
+        ),
+    )
+    .await
+    .expect("subscribe bookkeeping must not wait for a busy live agent");
+
+    // Resume and subscribe both answer request id 77, so each emits its own
+    // Done. Collect both batches, otherwise the assertions below only ever see
+    // resume's events and subscribe's are invisible.
+    let mut events = collect_events_until_done(&mut client_event_rx, 77).await;
+    events.extend(collect_events_until_done(&mut client_event_rx, 77).await);
     assert!(
         events
             .iter()
@@ -149,6 +188,17 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
             .iter()
             .any(|event| matches!(event, ServerEvent::Error { .. })),
         "busy live attach should not emit error events: {events:?}"
+    );
+    // A remote (gateway) client has no other way to learn its session id, and
+    // without it a dropped connection cannot reattach: the next Subscribe
+    // carries no `target_session_id`, so the server hands it a fresh session
+    // and the in-flight turn becomes unreachable.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ServerEvent::SessionId { session_id } if session_id == target_session_id
+        )),
+        "subscribe must report the bound session id so clients can reattach: {events:?}"
     );
 
     let mut peer_reader = tokio::io::BufReader::new(peer_stream);

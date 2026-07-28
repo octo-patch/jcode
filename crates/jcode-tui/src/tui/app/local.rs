@@ -30,10 +30,18 @@ pub(super) async fn process_turn_with_input(
     {
         Ok(()) => {
             app.last_stream_error = None;
+            app.last_submitted_input = None;
         }
         Err(error) => {
             let err_str = crate::util::format_error_chain(&error);
-            if is_context_limit_error(&err_str) {
+            if super::is_request_payload_too_large_error(&err_str) {
+                if !app
+                    .try_recover_payload_too_large_and_retry(terminal, event_stream)
+                    .await
+                {
+                    app.handle_turn_error(err_str);
+                }
+            } else if is_context_limit_error(&err_str) {
                 if !app.try_auto_compact_and_retry(terminal, event_stream).await {
                     app.handle_turn_error(err_str);
                 }
@@ -53,24 +61,45 @@ pub(super) async fn process_turn_with_input(
 }
 
 pub(super) fn handle_tick(app: &mut App) -> bool {
+    // Liveness breadcrumb: if the UI loop wedges, the watchdog reports this as
+    // the last phase that made progress.
+    crate::logging::watchdog::beat("tui.idle_tick");
+    // The decorative animation must still request redraws here: the run loops
+    // decide *how* to paint (cheap animation-only repaint vs full frame) at the
+    // draw site. Excluding it here instead would mean animation ticks request
+    // no paint at all, which drops the animation to whatever unrelated events
+    // happen to trigger (~4fps in practice).
     let mut needs_redraw = crate::tui::periodic_redraw_required(app);
+    needs_redraw |= app.flush_pending_resize_redraw();
     app.maybe_capture_runtime_memory_heartbeat();
+    app.maybe_release_idle_heap();
+    // Surface the cold-cache transcript warning the moment the TTL expires
+    // while idle, not only when the next request starts.
+    needs_redraw |= app.maybe_push_idle_cold_cache_warning();
+    needs_redraw |= app.progress_copy_selection_edge_autoscroll();
     app.progress_mouse_scroll_animation();
     needs_redraw |= app.update_chat_overscroll();
     needs_redraw |= app.update_pinned_images_auto_hide();
+    // Dissolve stale (off-screen) reasoning traces with zero visible motion.
+    needs_redraw |= app.gc_offscreen_reasoning_traces();
+    // Adopt the resolved scroll position once a frame containing newly loaded
+    // older history has rendered, so manual scrolling resumes seamlessly.
+    needs_redraw |= app.reconcile_history_anchor();
     if app.submit_input_on_startup && !app.is_processing {
         app.submit_input_on_startup = false;
         app.submit_input();
         needs_redraw = true;
     }
-    if let Some(chunk) = app.stream_buffer.flush() {
-        app.append_streaming_text(&chunk);
+    let ops = app.stream_buffer.flush();
+    if app.apply_stream_ops(ops) {
         needs_redraw = true;
     }
     needs_redraw |= app.refresh_todos_view_if_needed();
+    needs_redraw |= app.refresh_todo_card_if_needed();
     needs_redraw |= app.refresh_side_panel_linked_content_if_due();
     needs_redraw |= app.poll_model_picker_load();
     needs_redraw |= app.poll_session_picker_load();
+    needs_redraw |= app.poll_session_picker_presence();
     needs_redraw |= app.onboarding_tick();
     needs_redraw |= app.poll_compaction_completion();
     needs_redraw |= app.maybe_refresh_overnight_display_card();
@@ -107,6 +136,7 @@ pub(super) fn handle_terminal_event(
     terminal: &mut DefaultTerminal,
     event: Option<std::result::Result<Event, std::io::Error>>,
 ) -> Result<bool> {
+    crate::logging::watchdog::beat("tui.terminal_event");
     let mut needs_redraw = apply_terminal_event(app, terminal, event)?;
     const MAX_DRAINED_EVENTS_PER_WAKE: usize = 32;
     for _ in 0..MAX_DRAINED_EVENTS_PER_WAKE {
@@ -149,6 +179,10 @@ pub(super) fn handle_bus_event(
             super::commands::handle_git_status_completed(app, result);
             true
         }
+        Ok(BusEvent::ProductivityReportReady(event)) => {
+            app.handle_productivity_report_ready(event);
+            true
+        }
         Ok(BusEvent::MermaidRenderCompleted) => true,
         Ok(BusEvent::UsageReport(results)) => {
             app.handle_usage_report(results);
@@ -167,6 +201,10 @@ pub(super) fn handle_bus_event(
         }
         Ok(BusEvent::ModelsUpdated) => {
             app.invalidate_model_picker_cache();
+            true
+        }
+        Ok(BusEvent::AuthCatalogRefreshReady) => {
+            app.finish_auth_catalog_refresh();
             true
         }
         Ok(BusEvent::ProviderModelActivated {
@@ -193,7 +231,9 @@ pub(super) fn handle_bus_event(
             });
             app.session.model = Some(model.clone());
             let _ = app.session.save();
-            app.push_display_message(crate::tui::DisplayMessage::system(message));
+            if !app.auth_catalog_refresh_pending {
+                app.push_display_message(crate::tui::DisplayMessage::system(message));
+            }
             app.set_status_notice(format!("Model → {}", model));
             if open_picker {
                 app.open_model_picker();
@@ -242,6 +282,7 @@ pub(super) fn handle_bus_event(
         }
         Ok(BusEvent::TodoUpdated(event)) => {
             if event.session_id == app.session.id {
+                app.update_terminal_title();
                 app.refresh_todos_view_now()
             } else {
                 false
@@ -268,7 +309,10 @@ pub(super) fn handle_ui_activity(app: &mut App, activity: UiActivity) -> bool {
             app.push_display_message(DisplayMessage::background_task(activity.message.clone()))
         }
         UiActivityKind::Auth | UiActivityKind::Catalog => {
-            if activity.kind == UiActivityKind::Catalog
+            if activity.message.trim().is_empty() {
+                // Status-only lifecycle updates should not leave blank transcript
+                // entries.
+            } else if activity.kind == UiActivityKind::Catalog
                 && crate::message::parse_background_task_progress_notification_markdown(
                     &activity.message,
                 )
@@ -340,7 +384,12 @@ fn apply_terminal_event(
 ) -> Result<bool> {
     match event {
         Some(Ok(Event::FocusGained)) => {
+            let redraw = app.set_client_focused(true);
             app.note_client_focus(true);
+            Ok(redraw)
+        }
+        Some(Ok(Event::FocusLost)) => {
+            app.set_client_focused(false);
             Ok(false)
         }
         Some(Ok(Event::Key(key))) => {
@@ -357,6 +406,9 @@ fn apply_terminal_event(
             Ok(true)
         }
         Some(Ok(Event::Mouse(mouse))) => {
+            if matches!(mouse.kind, crossterm::event::MouseEventKind::Moved) {
+                return Ok(false);
+            }
             app.note_client_interaction();
             app.handle_mouse_event(mouse);
             Ok(true)
@@ -453,24 +505,28 @@ fn handle_input_shell_completed(app: &mut App, shell: InputShellCompleted) {
 }
 
 pub(super) fn finish_turn(app: &mut App) {
-    app.total_input_tokens += app.streaming_input_tokens;
-    app.total_output_tokens += app.streaming_output_tokens;
+    let turn_duration_secs = app.display_turn_duration_secs();
+    app.token_accounting.total_input_tokens += app.streaming.streaming_input_tokens;
+    app.token_accounting.total_output_tokens += app.streaming.streaming_output_tokens;
     app.update_cost_impl();
     app.is_processing = false;
     app.status = ProcessingStatus::Idle;
     app.stream_message_ended = false;
     app.processing_started = None;
     app.interleave_message = None;
+    app.interleave_images.clear();
     app.pending_soft_interrupts.clear();
     app.pending_soft_interrupt_requests.clear();
     app.thought_line_inserted = false;
     app.thinking_prefix_emitted = false;
     app.thinking_buffer.clear();
     app.note_runtime_memory_event_force("turn_completed", "local_turn_finished");
-    if !app.schedule_auto_poke_followup_if_needed()
-        && !app.schedule_overnight_poke_followup_if_needed()
-    {
+    let followup_scheduled = app.schedule_turn_end_followups();
+    if !followup_scheduled {
         app.clear_visible_turn_started();
+        if !app.pending_queued_dispatch && app.queued_messages.is_empty() {
+            app.maybe_notify_turn_complete(turn_duration_secs);
+        }
     }
     let _ = super::commands::maybe_begin_pending_local_transfer(app);
 }

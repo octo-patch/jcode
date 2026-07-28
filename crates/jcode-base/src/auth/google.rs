@@ -309,40 +309,40 @@ async fn exchange_code(
     Ok(tokens)
 }
 
+/// Refresh Google OAuth tokens, serialized via the refresh coordinator so
+/// concurrent callers do not race the token endpoint and the stored file.
 pub async fn refresh_tokens(tokens: &GoogleTokens) -> Result<GoogleTokens> {
+    crate::auth::refresh_coordinator::single_flight(
+        "google".to_string(),
+        || load_tokens().ok(),
+        |stored: &GoogleTokens| !stored.is_expired(),
+        {
+            let observed = tokens.clone();
+            move |stored: Option<GoogleTokens>| async move {
+                let source = stored.unwrap_or(observed);
+                refresh_tokens_uncoordinated(&source).await
+            }
+        },
+    )
+    .await
+}
+
+async fn refresh_tokens_uncoordinated(tokens: &GoogleTokens) -> Result<GoogleTokens> {
     let result: Result<GoogleTokens> = async {
         let creds = load_credentials()?;
-        let client = crate::provider::shared_http_client();
-
-        let resp = client
-            .post(TOKEN_URL)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("client_id", &creds.client_id),
-                ("client_secret", &creds.client_secret),
-                ("refresh_token", &tokens.refresh_token),
-            ])
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await?;
-            anyhow::bail!("Google token refresh failed: {}", text);
-        }
-
-        #[derive(Deserialize)]
-        struct RefreshResponse {
-            access_token: String,
-            expires_in: i64,
-        }
-
-        let refresh_resp: RefreshResponse = resp.json().await?;
-        let expires_at = chrono::Utc::now().timestamp_millis() + (refresh_resp.expires_in * 1000);
+        let refreshed = crate::auth::google_oauth::refresh_access_token(
+            "Google",
+            &creds.client_id,
+            &creds.client_secret,
+            &tokens.refresh_token,
+            None,
+        )
+        .await?;
 
         let new_tokens = GoogleTokens {
-            access_token: refresh_resp.access_token,
-            refresh_token: tokens.refresh_token.clone(),
-            expires_at,
+            access_token: refreshed.access_token,
+            refresh_token: refreshed.refresh_token,
+            expires_at: refreshed.expires_at_ms,
             tier: tokens.tier,
             email: tokens.email.clone(),
         };

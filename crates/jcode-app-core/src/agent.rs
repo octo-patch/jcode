@@ -2,6 +2,7 @@
 
 mod compaction;
 mod environment;
+mod inline_tail;
 mod interrupts;
 mod messages;
 mod prompting;
@@ -12,13 +13,10 @@ mod streaming;
 mod tools;
 mod turn_execution;
 mod turn_loops;
-mod turn_streaming_broadcast;
 mod turn_streaming_mpsc;
 mod utils;
 
-use self::streaming::{
-    send_stream_keepalive_broadcast, send_stream_keepalive_mpsc, stream_keepalive_ticker,
-};
+use self::streaming::{send_stream_keepalive_mpsc, stream_keepalive_ticker};
 use self::tools::{
     cap_sdk_tool_content_for_history, cap_tool_output_for_history, print_tool_summary,
     tool_output_side_pane_images, tool_output_to_content_blocks,
@@ -46,7 +44,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use interrupts::{NoToolCallOutcome, PostToolInterruptOutcome};
 pub use jcode_agent_runtime::{
@@ -89,7 +87,12 @@ fn stable_json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
 }
 
 fn message_hashes(messages: &[Message]) -> Vec<u64> {
-    messages.iter().map(stable_hash_json).collect()
+    // Hash the cache-relevant projection, not the raw Message. Raw hashing
+    // keys off non-transmitted metadata (timestamp, tool_duration_ms,
+    // ReasoningTrace blocks, cache_control markers), which triggers spurious
+    // harness:_prefix_changed KV-cache miss reports when the same message is
+    // re-serialized with backfilled metadata on the next turn.
+    crate::message::cache_relevant_message_hashes(messages)
 }
 
 fn kv_cache_request_event(
@@ -106,7 +109,7 @@ fn kv_cache_request_event(
     ServerEvent::KvCacheRequest {
         system_static_hash: stable_hash_str(system_static),
         tools_hash: stable_hash_json(tools),
-        messages_hash: stable_hash_json(messages),
+        messages_hash: stable_hash_json(&crate::message::cache_relevant_messages(messages)),
         message_hashes: message_hashes(messages),
         message_count: messages.len(),
         tool_count: tools.len(),
@@ -238,6 +241,14 @@ pub struct Agent {
     stdin_request_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tool::StdinInputRequest>>,
     /// Canonical reducer-backed view of runtime provider/model selection.
     provider_runtime_state: ProviderRuntimeState,
+    /// When true, this session is an inline swarm worker: stream a throttled
+    /// output tail to the global bus so the coordinator's inline gallery can
+    /// render a live viewport. Off for normal sessions to avoid bus traffic.
+    inline_output_tap: bool,
+    /// Rolling activity tail (text + tool markers) for the inline output tap.
+    /// Persists across turns so the coordinator's viewport never blanks at
+    /// turn boundaries or freezes during long tool calls.
+    inline_tail: inline_tail::InlineTailBuffer,
 }
 
 impl Agent {
@@ -289,6 +300,8 @@ impl Agent {
             rewind_undo_snapshot: None,
             stdin_request_tx: None,
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
+            inline_output_tap: false,
+            inline_tail: inline_tail::InlineTailBuffer::default(),
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,
@@ -299,11 +312,25 @@ impl Agent {
     }
 
     fn current_skills_snapshot(&self) -> Arc<SkillRegistry> {
-        self.registry
+        // Global skills come from the process-wide shared registry; the
+        // project-local overlay is composed fresh from this session's
+        // workspace root so per-repo skills are session-scoped, immediately
+        // visible, and never leak across sessions (issue #457).
+        let global = self
+            .registry
             .skills()
             .try_read()
             .map(|skills| Arc::new(skills.clone()))
-            .unwrap_or_else(|_| self.skills.clone())
+            .unwrap_or_else(|_| self.skills.clone());
+        let working_dir = self
+            .session
+            .working_dir
+            .as_deref()
+            .map(std::path::Path::new);
+        Arc::new(SkillRegistry::effective_for_working_dir(
+            &global,
+            working_dir,
+        ))
     }
 
     pub fn available_skill_names(&self) -> Vec<String> {
@@ -315,11 +342,23 @@ impl Agent {
     }
 
     pub fn new(provider: Arc<dyn Provider>, registry: Registry) -> Self {
+        Self::new_with_initial_working_dir(provider, registry, None)
+    }
+
+    pub(crate) fn new_with_initial_working_dir(
+        provider: Arc<dyn Provider>,
+        registry: Registry,
+        working_dir: Option<&str>,
+    ) -> Self {
         let tool_selection = crate::config::config().tools.selection();
+        let mut session = Session::create(None, None);
+        if let Some(working_dir) = working_dir {
+            session.working_dir = Some(working_dir.to_string());
+        }
         let mut agent = Self::build_base(
             provider,
             registry,
-            Session::create(None, None),
+            session,
             tool_selection.allowed_tools,
             tool_selection.disabled_tools,
         );
@@ -330,6 +369,7 @@ impl Agent {
         agent.session.ensure_initial_session_context_message();
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("create");
+        agent.fire_session_lifecycle_hook("session_start", "create");
         crate::telemetry::begin_session_with_parent(
             agent.provider.name(),
             &agent.provider.model(),
@@ -389,6 +429,7 @@ impl Agent {
         agent.sync_memory_dedup_state_from_session();
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("attach");
+        agent.fire_session_lifecycle_hook("session_start", "attach");
         crate::telemetry::begin_session_with_parent(
             agent.provider.name(),
             &agent.provider.model(),
@@ -840,6 +881,23 @@ impl Agent {
         if !self.session.messages.is_empty() {
             self.persist_session_best_effort("session close state");
         }
+        self.fire_session_lifecycle_hook("session_end", "close");
+    }
+
+    /// Fire a session lifecycle observer hook (`session_start`/`session_end`).
+    /// No-op when the hook is not configured.
+    pub(crate) fn fire_session_lifecycle_hook(&self, event_name: &'static str, source: &str) {
+        if !crate::hooks::hook_configured(event_name) {
+            return;
+        }
+        let mut event = crate::hooks::HookEvent::new(event_name)
+            .session_id(self.session.id.clone())
+            .field("SOURCE", source)
+            .field("MODEL", self.provider_model());
+        if let Some(cwd) = self.working_dir() {
+            event = event.cwd(cwd);
+        }
+        crate::hooks::dispatch_observer(event);
     }
 
     pub fn mark_crashed(&mut self, message: Option<String>) {
@@ -880,6 +938,9 @@ impl Agent {
                         md.push_str("\n\n");
                     }
                     ContentBlock::Reasoning { text } => {
+                        md.push_str(&format!("*Thinking:* {}\n\n", text));
+                    }
+                    ContentBlock::ReasoningTrace { text } => {
                         md.push_str(&format!("*Thinking:* {}\n\n", text));
                     }
                     ContentBlock::AnthropicThinking { thinking, .. } => {

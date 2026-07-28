@@ -30,12 +30,14 @@ pub use jcode_compaction_core::{
     CHARS_PER_TOKEN, COMPACTION_THRESHOLD, CRITICAL_THRESHOLD, CompactionAction, CompactionEvent,
     CompactionStats, DEFAULT_TOKEN_BUDGET, EMBED_MAX_CHARS_PER_MSG, EMBEDDING_HISTORY_WINDOW,
     EMERGENCY_IMAGE_MAX_CHARS, EMERGENCY_TOOL_RESULT_MAX_CHARS, MANUAL_COMPACT_MIN_THRESHOLD,
-    MIN_TURNS_TO_KEEP, RECENT_TURNS_TO_KEEP, SEMANTIC_EMBED_CACHE_CAPACITY, SUMMARY_PROMPT,
-    SYSTEM_OVERHEAD_TOKENS, Summary, TOKEN_HISTORY_WINDOW, build_compaction_prompt,
-    build_emergency_summary_text, compacted_summary_text_block, content_char_count,
-    emergency_truncate_large_payloads, estimate_compaction_tokens, mean_embedding,
-    message_char_count, safe_compaction_cutoff, semantic_cache_key, semantic_goal_text,
-    semantic_message_text, summary_payload_char_count,
+    MIN_TURNS_TO_KEEP, PAYLOAD_IMAGE_CHAR_BUDGET, RECENT_TURNS_TO_KEEP,
+    SEMANTIC_EMBED_CACHE_CAPACITY, SUMMARY_PROMPT, SYSTEM_OVERHEAD_TOKENS, Summary,
+    TOKEN_HISTORY_WINDOW, build_compaction_prompt, build_emergency_summary_text,
+    compacted_summary_text_block, content_char_count, effective_context_tokens_from_usage,
+    emergency_strip_large_images, emergency_truncate_large_payloads, estimate_compaction_tokens,
+    is_request_payload_too_large_error, mean_embedding, message_char_count, safe_compaction_cutoff,
+    semantic_cache_key, semantic_goal_text, semantic_message_text, strip_large_images_in_contents,
+    summary_payload_char_count,
 };
 
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
@@ -1596,7 +1598,7 @@ impl CompactionManager {
     /// Returns a structured outcome so callers can render their own
     /// user-facing message. `pre_usage` is the context usage fraction observed
     /// before recovery (captured here so the report matches what triggered it).
-    pub fn recover_within_budget(&mut self, all_messages: &mut Vec<Message>) -> EmergencyRecovery {
+    pub fn recover_within_budget(&mut self, all_messages: &mut [Message]) -> EmergencyRecovery {
         let pre_usage = self.context_usage_with(all_messages);
 
         let dropped = match self.hard_compact_with(all_messages) {

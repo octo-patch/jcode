@@ -8,9 +8,61 @@ use jcode_swarm_core::{SwarmLifecycleStatus, SwarmMemberRecord, SwarmRole};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
+
+/// Process-global registry mapping session id -> background-tool signal.
+///
+/// The background-tool ("move tool to background", Alt+B/Ctrl+B) signal lives on
+/// the `Agent`, so a `SessionControlHandle` can normally only obtain it by
+/// locking the agent mutex. When a turn is busy (e.g. running `await_members`),
+/// `refresh_session_control_handle` falls back to a lock-free `cancel_only`
+/// handle that historically dropped the background signal entirely, which made
+/// Alt+B/Ctrl+B silently no-op (`BACKGROUND_TOOL_SIGNAL_FIRE result=no_signal_handle`).
+///
+/// This registry is populated every time a full `SessionControlHandle` is built
+/// (which always has both the session id and the correct signal), so the
+/// lock-free fallback can still fire the background signal without the agent
+/// lock. Entries are keyed by session id; renames/removals reuse
+/// [`rename_background_tool_signal`]/[`remove_background_tool_signal`] alongside
+/// the existing shutdown-signal lifecycle.
+static BACKGROUND_TOOL_SIGNALS: LazyLock<StdMutex<HashMap<String, InterruptSignal>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Register (or replace) the background-tool signal for a session.
+pub(super) fn register_background_tool_signal(session_id: &str, signal: InterruptSignal) {
+    if let Ok(mut map) = BACKGROUND_TOOL_SIGNALS.lock() {
+        map.insert(session_id.to_string(), signal);
+    }
+}
+
+/// Look up the registered background-tool signal for a session, if any.
+pub(super) fn background_tool_signal_for_session(session_id: &str) -> Option<InterruptSignal> {
+    BACKGROUND_TOOL_SIGNALS
+        .lock()
+        .ok()
+        .and_then(|map| map.get(session_id).cloned())
+}
+
+/// Move a session's background-tool signal registration to a new session id.
+pub(super) fn rename_background_tool_signal(old_session_id: &str, new_session_id: &str) {
+    if old_session_id == new_session_id {
+        return;
+    }
+    if let Ok(mut map) = BACKGROUND_TOOL_SIGNALS.lock()
+        && let Some(signal) = map.remove(old_session_id)
+    {
+        map.insert(new_session_id.to_string(), signal);
+    }
+}
+
+/// Drop a session's background-tool signal registration.
+pub(super) fn remove_background_tool_signal(session_id: &str) {
+    if let Ok(mut map) = BACKGROUND_TOOL_SIGNALS.lock() {
+        map.remove(session_id);
+    }
+}
 
 /// Record of a file access by an agent
 #[derive(Clone, Debug)]
@@ -152,13 +204,17 @@ pub struct SwarmMember {
     pub status: String,
     /// Optional detail (current task, error, etc.)
     pub detail: Option<String>,
+    /// Stable, human-readable label of the task/role this member was spawned
+    /// or assigned for (compacted from the spawn prompt or plan item). Unlike
+    /// `detail`, this is not overwritten by transient status updates.
+    pub task_label: Option<String>,
     /// Friendly name like "fox"
     pub friendly_name: Option<String>,
     /// Session that should receive direct completion report-back for this member, if any.
     pub report_back_to_session_id: Option<String>,
     /// Latest explicit completion report submitted by this member.
     pub latest_completion_report: Option<String>,
-    /// Role: "agent", "coordinator", "worktree_manager"
+    /// Role: "agent" or "coordinator"
     pub role: String,
     /// When this member joined the swarm
     pub joined_at: Instant,
@@ -167,6 +223,20 @@ pub struct SwarmMember {
     /// Whether this is a headless (spawned) session vs a TUI-connected session.
     /// Headless sessions should not be automatically elected as coordinator.
     pub is_headless: bool,
+    /// Recent streamed output tail (last few lines of in-progress assistant
+    /// text), captured for inline swarm gallery rendering. Updated by the bus
+    /// monitor from worker streaming taps; not persisted.
+    pub output_tail: Option<String>,
+    /// Aggregate todo progress (completed, total) for this member's session,
+    /// updated from `TodoUpdated` bus events. Surfaced on the inline swarm
+    /// strip; not persisted.
+    pub todo_progress: Option<(u32, u32)>,
+    /// Compact snapshot of this member's todo list (content + status), capped
+    /// at a few entries by the bus monitor. Rendered in the focused inline
+    /// swarm panel; not persisted.
+    pub todo_items: Vec<crate::protocol::SwarmTodoItem>,
+    /// Ephemeral model/timing metadata for the inline swarm card.
+    pub runtime: crate::protocol::SwarmMemberRuntime,
 }
 
 impl SwarmMember {
@@ -178,6 +248,7 @@ impl SwarmMember {
             swarm_enabled: self.swarm_enabled,
             status: SwarmLifecycleStatus::from(self.status.clone()),
             detail: self.detail.clone(),
+            task_label: self.task_label.clone(),
             friendly_name: self.friendly_name.clone(),
             report_back_to_session_id: self.report_back_to_session_id.clone(),
             latest_completion_report: self.latest_completion_report.clone(),
@@ -209,6 +280,7 @@ impl SwarmMember {
             swarm_enabled: record.swarm_enabled,
             status: record.status.as_str().into_owned(),
             detail: record.detail,
+            task_label: record.task_label,
             friendly_name: record.friendly_name,
             report_back_to_session_id: record.report_back_to_session_id,
             latest_completion_report: record.latest_completion_report,
@@ -216,6 +288,10 @@ impl SwarmMember {
             joined_at: Instant::now(),
             last_status_change: Instant::now(),
             is_headless: record.is_headless,
+            output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            runtime: crate::protocol::SwarmMemberRuntime::default(),
         }
     }
 }
@@ -386,9 +462,26 @@ pub(super) fn session_event_fanout_sender(
     tx
 }
 
+pub(super) fn session_event_fanout_sender_with_fallback(
+    session_id: String,
+    swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
+    fallback_tx: mpsc::UnboundedSender<ServerEvent>,
+) -> mpsc::UnboundedSender<ServerEvent> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<ServerEvent>();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if fanout_session_event(&swarm_members, &session_id, event.clone()).await == 0 {
+                let _ = fallback_tx.send(event);
+            }
+        }
+    });
+    tx
+}
+
 pub(super) fn enqueue_soft_interrupt(
     queue: &SoftInterruptQueue,
     content: String,
+    images: Vec<(String, String)>,
     urgent: bool,
     source: SoftInterruptSource,
 ) -> bool {
@@ -398,6 +491,7 @@ pub(super) fn enqueue_soft_interrupt(
         let pending_before = pending.len();
         pending.push(SoftInterruptMessage {
             content,
+            images,
             urgent,
             source,
         });
@@ -441,8 +535,14 @@ impl SessionControlHandle {
         background_tool_signal: InterruptSignal,
         stop_current_turn_signal: InterruptSignal,
     ) -> Self {
+        let session_id = session_id.into();
+        // Mirror the signal into the process-global registry so the lock-free
+        // `cancel_only` fallback (used while the agent mutex is busy, e.g. during
+        // `await_members`) can still fire it. Without this, Alt+B/Ctrl+B silently
+        // no-ops for busy turns.
+        register_background_tool_signal(&session_id, background_tool_signal.clone());
         Self {
-            session_id: session_id.into(),
+            session_id,
             soft_interrupt_queue,
             background_tool_signal: Some(background_tool_signal),
             stop_current_turn_signal,
@@ -465,10 +565,11 @@ impl SessionControlHandle {
     pub fn queue_soft_interrupt(
         &self,
         content: String,
+        images: Vec<(String, String)>,
         urgent: bool,
         source: SoftInterruptSource,
     ) -> bool {
-        enqueue_soft_interrupt(&self.soft_interrupt_queue, content, urgent, source)
+        enqueue_soft_interrupt(&self.soft_interrupt_queue, content, images, urgent, source)
     }
 
     pub fn clear_soft_interrupts(&self) {
@@ -487,12 +588,41 @@ impl SessionControlHandle {
         }
     }
 
-    pub fn request_cancel(&self) {
+    /// Fire the stop-current-turn signal. Returns the signal's fire epoch so
+    /// callers that schedule a deferred [`reset_cancel_if_epoch`](Self::reset_cancel_if_epoch)
+    /// can avoid erasing a newer cancel that fired in the meantime (issue #428).
+    ///
+    /// Also fires every cancel signal registered for currently running turns
+    /// of this session. The handle's own signal can be a stale instance that
+    /// the streaming turn never observes (reattach after reload/disconnect,
+    /// server-initiated turns, headless recovery), which used to make Esc show
+    /// "Interrupting..." while the model kept generating for minutes
+    /// (issue #428).
+    pub fn request_cancel(&self) -> u64 {
         crate::logging::info(&format!(
             "SESSION_CANCEL_SIGNAL_FIRE session={}",
             self.session_id
         ));
         self.stop_current_turn_signal.fire();
+        let active_turn_signals =
+            crate::turn_cancel_registry::active_turn_signals(&self.session_id);
+        let mut fired_active = 0usize;
+        for signal in &active_turn_signals {
+            if signal.same_instance(&self.stop_current_turn_signal) {
+                continue;
+            }
+            signal.fire();
+            fired_active += 1;
+        }
+        if fired_active > 0 {
+            crate::logging::info(&format!(
+                "SESSION_CANCEL_ACTIVE_TURN_SIGNALS_FIRED session={} fired={} registered={}",
+                self.session_id,
+                fired_active,
+                active_turn_signals.len()
+            ));
+        }
+        self.stop_current_turn_signal.epoch()
     }
 
     pub fn reset_cancel(&self) {
@@ -503,8 +633,31 @@ impl SessionControlHandle {
         self.stop_current_turn_signal.reset();
     }
 
+    /// Reset the cancel signal only if no newer cancel fired since `epoch`
+    /// was captured from [`request_cancel`](Self::request_cancel). Timed
+    /// resets (used when the running turn is not owned by this connection)
+    /// must use this instead of [`reset_cancel`](Self::reset_cancel):
+    /// an unconditional deferred reset can erase a newer, not-yet-observed
+    /// cancel, making repeated Esc presses appear to be ignored (issue #428).
+    pub fn reset_cancel_if_epoch(&self, epoch: u64) -> bool {
+        let reset = self.stop_current_turn_signal.reset_if_epoch(epoch);
+        crate::logging::info(&format!(
+            "SESSION_CANCEL_SIGNAL_RESET session={} epoch={} applied={}",
+            self.session_id, epoch, reset
+        ));
+        reset
+    }
+
     pub fn request_background_current_tool(&self) -> bool {
-        if let Some(signal) = &self.background_tool_signal {
+        // Prefer the directly-held signal; fall back to the process-global
+        // registry for lock-free (`cancel_only`) handles built while the agent
+        // mutex was busy. This is what makes Alt+B/Ctrl+B work during a busy
+        // turn such as `await_members`.
+        let signal = self
+            .background_tool_signal
+            .clone()
+            .or_else(|| background_tool_signal_for_session(&self.session_id));
+        if let Some(signal) = signal {
             signal.fire();
             crate::logging::info(&format!(
                 "BACKGROUND_TOOL_SIGNAL_FIRE session={} result=sent",
@@ -562,7 +715,7 @@ pub(super) async fn queue_soft_interrupt_for_session(
     sessions: &super::SessionAgents,
 ) -> bool {
     if let Some(queue) = queues.read().await.get(session_id).cloned() {
-        return enqueue_soft_interrupt(&queue, content, urgent, source);
+        return enqueue_soft_interrupt(&queue, content, Vec::new(), urgent, source);
     }
 
     let queue = {
@@ -577,7 +730,7 @@ pub(super) async fn queue_soft_interrupt_for_session(
 
     if let Some(queue) = queue {
         register_session_interrupt_queue(queues, session_id, queue.clone()).await;
-        enqueue_soft_interrupt(&queue, content, urgent, source)
+        enqueue_soft_interrupt(&queue, content, Vec::new(), urgent, source)
     } else {
         let session_exists = {
             let guard = sessions.read().await;
@@ -592,6 +745,7 @@ pub(super) async fn queue_soft_interrupt_for_session(
             session_id,
             SoftInterruptMessage {
                 content,
+                images: Vec::new(),
                 urgent,
                 source,
             },

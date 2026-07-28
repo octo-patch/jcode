@@ -47,6 +47,7 @@ fn test_provider_choice_arg_values() {
     assert_eq!(ProviderChoice::Minimax.as_arg_value(), "minimax");
     assert_eq!(ProviderChoice::Xai.as_arg_value(), "xai");
     assert_eq!(ProviderChoice::XiaomiMimo.as_arg_value(), "xiaomi-mimo");
+    assert_eq!(ProviderChoice::Celeris.as_arg_value(), "celeris");
     assert_eq!(ProviderChoice::Lmstudio.as_arg_value(), "lmstudio");
     assert_eq!(ProviderChoice::Ollama.as_arg_value(), "ollama");
     assert_eq!(ProviderChoice::Chutes.as_arg_value(), "chutes");
@@ -65,6 +66,77 @@ fn test_provider_choice_arg_values() {
     assert_eq!(ProviderChoice::Antigravity.as_arg_value(), "antigravity");
     assert_eq!(ProviderChoice::Google.as_arg_value(), "google");
     assert_eq!(ProviderChoice::Auto.as_arg_value(), "auto");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "test env locks intentionally stay held across provider init to isolate process-global auth env"
+)]
+async fn explicit_anthropic_api_choice_pins_api_key_over_available_oauth() {
+    let _guard = lock_env();
+    let _env_guard = crate::storage::lock_test_env();
+    let dir = TempDir::new().expect("temp dir");
+    let keys = [
+        "JCODE_HOME",
+        "ANTHROPIC_API_KEY",
+        "JCODE_RUNTIME_PROVIDER",
+        "JCODE_ACTIVE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
+    ];
+    let saved: Vec<(&str, Option<String>)> = keys
+        .iter()
+        .map(|key| (*key, std::env::var(key).ok()))
+        .collect();
+
+    crate::env::set_var("JCODE_HOME", dir.path());
+    crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-api-test");
+    for key in [
+        "JCODE_RUNTIME_PROVIDER",
+        "JCODE_ACTIVE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
+    ] {
+        crate::env::remove_var(key);
+    }
+    std::fs::write(
+        dir.path().join("auth.json"),
+        serde_json::json!({
+            "anthropic_accounts": [{
+                "label": "primary",
+                "access": "oauth-access-token",
+                "refresh": "oauth-refresh-token",
+                "expires": chrono::Utc::now().timestamp_millis() + 3_600_000,
+                "scopes": ["user:inference"]
+            }],
+            "active_anthropic_account": "primary"
+        })
+        .to_string(),
+    )
+    .expect("write competing OAuth credentials");
+    crate::config::invalidate_config_cache();
+    crate::auth::AuthStatus::invalidate_cache();
+
+    let provider =
+        init_provider_for_validation(&ProviderChoice::AnthropicApi, Some("claude-haiku-4-5"))
+            .await
+            .expect("explicit Anthropic API provider should initialize");
+
+    assert_eq!(provider.active_auth_method_label(), Some("API key"));
+    assert_eq!(provider.model(), "claude-haiku-4-5");
+    assert_eq!(
+        std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
+        Some("claude-api")
+    );
+
+    for (key, value) in saved {
+        if let Some(value) = value {
+            crate::env::set_var(key, value);
+        } else {
+            crate::env::remove_var(key);
+        }
+    }
+    crate::config::invalidate_config_cache();
+    crate::auth::AuthStatus::invalidate_cache();
 }
 
 #[test]
@@ -125,11 +197,17 @@ fn test_auto_init_login_selection_preserves_order() {
 fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
     let _guard = lock_env();
     let _env_guard = crate::storage::lock_test_env();
+    // Sandbox JCODE_HOME: with the real home, persisted auth/credential state
+    // (e.g. a pinned anthropic api-key route) re-pins JCODE_RUNTIME_PROVIDER
+    // during MultiProvider construction and breaks the assertions below.
+    let dir = TempDir::new().expect("temp dir");
+    let saved_home = std::env::var("JCODE_HOME").ok();
+    crate::env::set_var("JCODE_HOME", dir.path());
     crate::subscription_catalog::clear_runtime_env();
     crate::env::remove_var("JCODE_OPENROUTER_MODEL");
     crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
     crate::env::remove_var("JCODE_ACTIVE_PROVIDER");
-    crate::env::remove_var("JCODE_FORCE_PROVIDER");
+    crate::env::remove_var("JCODE_INITIAL_PROVIDER_EXPLICIT");
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let provider = runtime
@@ -151,7 +229,9 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
         Some("jcode")
     );
     assert_eq!(
-        std::env::var("JCODE_FORCE_PROVIDER").ok().as_deref(),
+        std::env::var("JCODE_INITIAL_PROVIDER_EXPLICIT")
+            .ok()
+            .as_deref(),
         Some("1")
     );
 
@@ -159,7 +239,11 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
     crate::env::remove_var("JCODE_OPENROUTER_MODEL");
     crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
     crate::env::remove_var("JCODE_ACTIVE_PROVIDER");
-    crate::env::remove_var("JCODE_FORCE_PROVIDER");
+    crate::env::remove_var("JCODE_INITIAL_PROVIDER_EXPLICIT");
+    match saved_home {
+        Some(home) => crate::env::set_var("JCODE_HOME", home),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
 }
 
 #[test]
@@ -300,6 +384,7 @@ fn login_provider_menu_shows_autodetected_auth_and_skip() {
         anthropic: auth::ProviderAuth {
             state: auth::AuthState::Available,
             has_oauth: true,
+            oauth_state: auth::AuthState::Available,
             has_api_key: false,
         },
         ..Default::default()
@@ -463,7 +548,7 @@ fn resolved_profile_default_model_uses_openai_compatible_override() {
 }
 
 #[test]
-fn apply_login_provider_profile_env_locks_compatible_profile_for_auto_spawn() {
+fn apply_login_provider_profile_env_preserves_compatible_profile_for_auto_spawn() {
     let _guard = lock_env();
     let _env_guard = crate::storage::lock_test_env();
     let saved: Vec<(String, Option<String>)> = [
@@ -565,7 +650,7 @@ async fn init_provider_for_ollama_reapplies_local_compat_runtime_env_after_disab
         "JCODE_OPENROUTER_TRANSPORT_STATE",
         "JCODE_OPENROUTER_ALLOW_NO_AUTH",
         "JCODE_RUNTIME_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
         "JCODE_ACTIVE_PROVIDER",
     ]
     .iter()
@@ -600,7 +685,9 @@ async fn init_provider_for_ollama_reapplies_local_compat_runtime_env_after_disab
         Some("1")
     );
     assert_eq!(
-        std::env::var("JCODE_FORCE_PROVIDER").ok().as_deref(),
+        std::env::var("JCODE_INITIAL_PROVIDER_EXPLICIT")
+            .ok()
+            .as_deref(),
         Some("1")
     );
     assert_eq!(
@@ -652,7 +739,7 @@ async fn auto_provider_uses_config_default_named_no_auth_provider() {
         "JCODE_NAMED_PROVIDER_PROFILE",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]
     .iter()
     .map(|k| (k.to_string(), std::env::var(k).ok()))
@@ -678,7 +765,7 @@ async fn auto_provider_uses_config_default_named_no_auth_provider() {
         "JCODE_NAMED_PROVIDER_PROFILE",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ] {
         crate::env::remove_var(key);
     }
@@ -734,6 +821,7 @@ async fn auto_provider_noninteractive_skips_untrusted_external_auth_instead_of_b
     let saved: Vec<(String, Option<String>)> = [
         "JCODE_HOME",
         "JCODE_NON_INTERACTIVE",
+        "JCODE_DEFERRED_AUTH_BOOTSTRAP",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
@@ -742,7 +830,7 @@ async fn auto_provider_noninteractive_skips_untrusted_external_auth_instead_of_b
         "CURSOR_API_KEY",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]
     .iter()
     .map(|k| (k.to_string(), std::env::var(k).ok()))
@@ -751,6 +839,7 @@ async fn auto_provider_noninteractive_skips_untrusted_external_auth_instead_of_b
     crate::env::set_var("JCODE_HOME", dir.path());
     crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
     for key in [
+        "JCODE_DEFERRED_AUTH_BOOTSTRAP",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
@@ -758,7 +847,7 @@ async fn auto_provider_noninteractive_skips_untrusted_external_auth_instead_of_b
         "GEMINI_API_KEY",
         "CURSOR_API_KEY",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ] {
         crate::env::remove_var(key);
     }

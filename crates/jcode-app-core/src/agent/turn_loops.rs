@@ -1,14 +1,31 @@
 use super::*;
+use crate::{terminal_eprintln as eprintln, terminal_print as print, terminal_println as println};
 
 impl Agent {
     /// Run turns until no more tool calls
     /// Maximum number of context-limit compaction retries before giving up.
     pub(super) const MAX_CONTEXT_LIMIT_RETRIES: u32 = 5;
     pub(super) const MAX_INCOMPLETE_CONTINUATION_ATTEMPTS: u32 = 3;
-    pub(super) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 1;
+    /// Retries allowed when the provider returns an empty response right after
+    /// tool results. This is a transient provider hiccup, not a signal that the
+    /// task is finished, so a single retry is too few: one empty response
+    /// observed once in 43 turns silently ended a 20-hour benchmark run with the
+    /// task half-done. The counter is per turn-loop, so a genuinely finished
+    /// agent still exits promptly.
+    pub(crate) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
 
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
         self.set_log_context();
+        crate::session_metrics::record_turn(&self.session.id);
+        // Mark this session as actively streaming for presence UIs (e.g. the
+        // macOS menu bar indicator). Cleared automatically on every exit path.
+        let _streaming_guard = crate::session::StreamingGuard::new(self.session.id.clone());
+        // Register this turn's cancel signal so session-level cancels reach
+        // this in-flight turn even through stale control handles (issue #428).
+        let _turn_cancel_guard = crate::turn_cancel_registry::register_active_turn(
+            &self.session.id,
+            self.graceful_shutdown.clone(),
+        );
         let mut final_text = String::new();
         let trace = trace_enabled();
         let mut context_limit_retries = 0u32;
@@ -33,7 +50,11 @@ impl Agent {
                         .pre_tokens
                         .map(|t| format!(" ({} tokens)", t))
                         .unwrap_or_default();
-                    println!("📦 Context compacted ({}){}", event.trigger, tokens_str);
+                    crate::terminal_println!(
+                        "📦 Context compacted ({}){}",
+                        event.trigger,
+                        tokens_str
+                    );
                 }
             }
 
@@ -50,6 +71,10 @@ impl Agent {
             // Memory is an ephemeral suffix that changes each turn; tracking it would cause
             // false-positive violations every turn (prior turn's memory ≠ current history prefix).
             self.record_client_cache_request(&messages);
+
+            // The request snapshot now owns everything the provider needs. Drop
+            // the session's derived transcript copy before the network wait.
+            self.session.release_provider_messages_cache();
 
             // Inject memory as a user message at the end (preserves cache prefix)
             let mut messages_with_memory: Vec<Message> = messages.iter().cloned().collect();
@@ -80,13 +105,11 @@ impl Agent {
                 model: Some(self.provider.model()),
             }));
 
-            let stamped;
-            let send_messages: &[Message] = if crate::config::config().features.message_timestamps {
-                stamped = Message::with_timestamps(&messages_with_memory);
-                &stamped
-            } else {
-                &messages_with_memory
-            };
+            let stamped = crate::config::config()
+                .features
+                .message_timestamps
+                .then(|| Message::with_timestamps(&messages_with_memory));
+            let send_messages = stamped.as_deref().unwrap_or(&messages_with_memory);
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
             self.last_status_detail = None;
             let mut stream = match self
@@ -118,6 +141,14 @@ impl Agent {
                     return Err(e);
                 }
             };
+
+            // The provider returned an owned stream, so the request transcript
+            // copies are no longer needed while the response is consumed.
+            drop(stamped);
+            drop(messages_with_memory);
+            drop(memory_pending);
+            drop(messages);
+            drop(split_prompt);
 
             // Successful API call - reset retry counter
             context_limit_retries = 0;
@@ -216,11 +247,11 @@ impl Agent {
                     StreamEvent::ThinkingDelta(thinking_text) => {
                         // Display reasoning content only if enabled
                         if print_output && crate::config::config().display.show_thinking {
-                            println!("💭 {}", thinking_text);
+                            crate::terminal_println!("💭 {}", thinking_text);
                         }
-                        if store_reasoning_content {
-                            reasoning_content.push_str(&thinking_text);
-                        }
+                        // Always capture reasoning text so it can be persisted as a
+                        // history-only trace, regardless of provider replay support.
+                        reasoning_content.push_str(&thinking_text);
                     }
                     StreamEvent::ThinkingSignatureDelta(signature) => {
                         if store_reasoning_content {
@@ -239,7 +270,7 @@ impl Agent {
                     }
                     StreamEvent::TextDelta(text) => {
                         if print_output {
-                            print!("{}", text);
+                            crate::terminal_print!("{}", text);
                             io::stdout().flush()?;
                         }
                         text_content.push_str(&text);
@@ -257,6 +288,7 @@ impl Agent {
                             name,
                             input: serde_json::Value::Null,
                             intent: None,
+                            thought_signature: None,
                         });
                         current_tool_input.clear();
                     }
@@ -293,6 +325,15 @@ impl Agent {
 
                             tool_calls.push(tool);
                             current_tool_input.clear();
+                        }
+                    }
+                    StreamEvent::ToolUseSignature(signature) => {
+                        // Attach Gemini 3 thought signature to the most recent
+                        // tool call so it can be persisted and replayed.
+                        if let Some(tool) = tool_calls.last_mut()
+                            && !signature.is_empty()
+                        {
+                            tool.thought_signature = Some(signature);
                         }
                     }
                     StreamEvent::ToolResult {
@@ -411,6 +452,36 @@ impl Agent {
                         }
                         self.last_status_detail = Some(detail);
                     }
+                    StreamEvent::RetryRollback { attempt, max } => {
+                        // Transient transport fault mid-stream; the provider is
+                        // replaying the request. Discard this attempt's partial
+                        // output so the replay doesn't duplicate it in history.
+                        logging::warn(&format!(
+                            "Mid-stream retry rollback (attempt {}/{}): discarding partial output ({} text chars, {} tool calls)",
+                            attempt,
+                            max,
+                            text_content.len(),
+                            tool_calls.len(),
+                        ));
+                        if print_output && !text_content.is_empty() {
+                            // Already-printed text can't be unprinted on a plain
+                            // stdout stream; mark the discontinuity instead.
+                            println!("\n[connection interrupted, retrying response from the top]");
+                            io::stdout().flush()?;
+                        }
+                        text_content.clear();
+                        tool_calls.clear();
+                        current_tool = None;
+                        current_tool_input.clear();
+                        sdk_tool_results.clear();
+                        generated_image_contexts.clear();
+                        reasoning_content.clear();
+                        reasoning_signature.clear();
+                        openai_reasoning_items.clear();
+                        openai_native_compaction = None;
+                        saw_message_end = false;
+                        stop_reason = None;
+                    }
                     StreamEvent::MessageEnd {
                         stop_reason: reason,
                     } => {
@@ -467,7 +538,11 @@ impl Agent {
                             let tokens_str = pre_tokens
                                 .map(|t| format!(" ({} tokens)", t))
                                 .unwrap_or_default();
-                            println!("📦 Context compacted ({}){}", trigger, tokens_str);
+                            crate::terminal_println!(
+                                "📦 Context compacted ({}){}",
+                                trigger,
+                                tokens_str
+                            );
                         }
                     }
                     StreamEvent::NativeToolCall {
@@ -660,13 +735,14 @@ impl Agent {
                     cache_control: None,
                 });
             }
+            crate::message::push_reasoning_blocks(
+                &mut content_blocks,
+                &provider_name,
+                &reasoning_content,
+                Some(&reasoning_signature),
+                store_reasoning_content,
+            );
             if store_reasoning_content {
-                crate::message::push_reasoning_content_block(
-                    &mut content_blocks,
-                    &provider_name,
-                    &reasoning_content,
-                    Some(&reasoning_signature),
-                );
                 content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
@@ -674,6 +750,7 @@ impl Agent {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
+                    thought_signature: tc.thought_signature.clone(),
                 });
             }
 
@@ -747,6 +824,24 @@ impl Agent {
                 )? {
                     continue;
                 }
+                // Surface silent guardrail/refusal stops instead of returning
+                // an empty final answer with no explanation.
+                if let Some(notice) = Self::provider_guardrail_notice(
+                    stop_reason.as_deref(),
+                    visible_text_is_empty,
+                    !reasoning_content.trim().is_empty(),
+                ) {
+                    logging::warn(&format!(
+                        "PROVIDER_GUARDRAIL: turn ended with no visible output (stop_reason={:?})",
+                        stop_reason
+                    ));
+                    if print_output {
+                        println!("\n[provider guardrail] {}", notice);
+                    }
+                    if text_content.trim().is_empty() {
+                        text_content = format!("[provider guardrail] {}", notice);
+                    }
+                }
                 logging::info("Turn complete - no tool calls, returning");
                 if print_output {
                     println!();
@@ -795,6 +890,7 @@ impl Agent {
                         tool_call_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
                         status: ToolStatus::Error,
+                        intent: tc.intent.clone(),
                         title: None,
                     }));
                     if print_output {
@@ -854,6 +950,7 @@ impl Agent {
                             } else {
                                 ToolStatus::Completed
                             },
+                            intent: tc.intent.clone(),
                             title: None,
                         }));
 
@@ -895,6 +992,7 @@ impl Agent {
                     tool_call_id: tc.id.clone(),
                     tool_name: tc.name.clone(),
                     status: ToolStatus::Running,
+                    intent: tc.intent.clone(),
                     title: None,
                 }));
 
@@ -927,6 +1025,7 @@ impl Agent {
                             tool_call_id: tc.id.clone(),
                             tool_name: tc.name.clone(),
                             status: ToolStatus::Completed,
+                            intent: tc.intent.clone(),
                             title: output.title.clone(),
                         }));
 
@@ -961,6 +1060,7 @@ impl Agent {
                             tool_call_id: tc.id.clone(),
                             tool_name: tc.name.clone(),
                             status: ToolStatus::Error,
+                            intent: tc.intent.clone(),
                             title: None,
                         }));
 

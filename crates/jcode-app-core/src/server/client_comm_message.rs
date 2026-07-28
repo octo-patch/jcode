@@ -1,7 +1,7 @@
+use super::live_turn::{LiveTurnSwarmContext, run_live_turn_if_idle};
 use super::{
     ClientConnectionInfo, SessionInterruptQueues, SwarmEvent, SwarmEventType, SwarmMember,
-    fanout_session_event, queue_soft_interrupt_for_session, record_swarm_event,
-    session_event_fanout_sender, truncate_detail,
+    fanout_session_event, queue_soft_interrupt_for_session, record_swarm_event, truncate_detail,
 };
 use crate::agent::Agent;
 use crate::protocol::{CommDeliveryMode, NotificationType, ServerEvent};
@@ -79,60 +79,6 @@ async fn resolve_dm_target_session(
     }
 }
 
-async fn run_message_in_live_session_if_idle(
-    session_id: &str,
-    message: &str,
-    system_reminder: Option<String>,
-    sessions: &SessionAgents,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-) -> bool {
-    let agent = {
-        let guard = sessions.read().await;
-        guard.get(session_id).cloned()
-    };
-    let Some(agent) = agent else {
-        return false;
-    };
-
-    let has_live_attachments = {
-        let members = swarm_members.read().await;
-        members
-            .get(session_id)
-            .map(|member| !member.event_txs.is_empty() || !member.event_tx.is_closed())
-            .unwrap_or(false)
-    };
-    if !has_live_attachments {
-        return false;
-    }
-
-    let is_idle = match agent.try_lock() {
-        Ok(guard) => {
-            drop(guard);
-            true
-        }
-        Err(_) => false,
-    };
-    if !is_idle {
-        return false;
-    }
-
-    let session_id = session_id.to_string();
-    let message = message.to_string();
-    let event_tx = session_event_fanout_sender(session_id.clone(), Arc::clone(swarm_members));
-    tokio::spawn(async move {
-        let _ = super::client_lifecycle::process_message_streaming_mpsc(
-            agent,
-            &message,
-            vec![],
-            system_reminder,
-            event_tx,
-        )
-        .await;
-    });
-
-    true
-}
-
 fn resolve_comm_delivery_mode(
     scope: &str,
     delivery: Option<CommDeliveryMode>,
@@ -162,6 +108,7 @@ pub(super) async fn handle_comm_message(
     channel: Option<String>,
     delivery: Option<CommDeliveryMode>,
     wake: Option<bool>,
+    tldr: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
     soft_interrupt_queues: &SessionInterruptQueues,
@@ -196,6 +143,13 @@ pub(super) async fn handle_comm_message(
             ),
             ("wake", wake.unwrap_or(false).to_string()),
             ("message_chars", message.chars().count().to_string()),
+            (
+                "tldr_chars",
+                tldr.as_deref()
+                    .map(|t| t.chars().count())
+                    .unwrap_or(0)
+                    .to_string(),
+            ),
         ],
     );
     let swarm_id = swarm_id_for_session(&from_session, swarm_members).await;
@@ -273,6 +227,27 @@ pub(super) async fn handle_comm_message(
             members.keys().cloned().collect()
         };
 
+        // Broadcast-style sends are subtree-scoped: a sender reaches only the
+        // agents it (transitively) spawned, via the report-back ancestry chain.
+        // The swarm coordinator keeps whole-swarm reach as an escape hatch.
+        // This prevents one agent from producing a member-cap-sized
+        // notification storm (see docs/SWARM_TASK_GRAPH.md section 8a).
+        let subtree_broadcast_targets: Vec<String> = {
+            let members = swarm_members.read().await;
+            let sender_is_coordinator = members
+                .get(&from_session)
+                .is_some_and(|member| member.role == "coordinator");
+            swarm_session_ids
+                .iter()
+                .filter(|session_id| *session_id != &from_session)
+                .filter(|session_id| {
+                    sender_is_coordinator
+                        || super::swarm_is_self_or_ancestor(&members, &from_session, session_id)
+                })
+                .cloned()
+                .collect()
+        };
+
         let target_sessions: Vec<String> = if let Some(target) = resolved_to_session {
             vec![target]
         } else if let Some(ref channel_name) = channel {
@@ -283,11 +258,9 @@ pub(super) async fn handle_comm_message(
             };
             let channel_members = index.members(&swarm_id, channel_name);
             if channel_members.is_empty() {
-                swarm_session_ids
-                    .iter()
-                    .filter(|session_id| *session_id != &from_session)
-                    .cloned()
-                    .collect()
+                // No subscribers: fall back to the subtree scope rather than
+                // blasting the whole swarm.
+                subtree_broadcast_targets.clone()
             } else {
                 channel_members
                     .into_iter()
@@ -295,11 +268,7 @@ pub(super) async fn handle_comm_message(
                     .collect()
             }
         } else {
-            swarm_session_ids
-                .iter()
-                .filter(|session_id| *session_id != &from_session)
-                .cloned()
-                .collect()
+            subtree_broadcast_targets
         };
 
         let mut delivered_targets = 0usize;
@@ -327,6 +296,7 @@ pub(super) async fn handle_comm_message(
                         notification_type: NotificationType::Message {
                             scope: Some(scope.to_string()),
                             channel: channel.clone(),
+                            tldr: tldr.clone(),
                         },
                         message: notification_msg.clone(),
                     },
@@ -366,12 +336,18 @@ pub(super) async fn handle_comm_message(
                         .await;
                     }
                     CommDeliveryMode::Wake => {
-                        let woke_immediately = run_message_in_live_session_if_idle(
+                        let woke_immediately = run_live_turn_if_idle(
                             session_id,
                             &notification_msg,
                             reminder,
                             sessions,
-                            swarm_members,
+                            LiveTurnSwarmContext::new(
+                                swarm_members,
+                                swarms_by_id,
+                                event_history,
+                                event_counter,
+                                swarm_event_tx,
+                            ),
                         )
                         .await;
 

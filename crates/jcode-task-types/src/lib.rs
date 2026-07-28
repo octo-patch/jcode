@@ -194,22 +194,142 @@ fn default_pending_status() -> String {
     "pending".to_string()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub content: String,
     pub status: String,
     pub priority: String,
     pub id: String,
+    /// Optional group label. Todos that share a group are displayed together
+    /// under a single header. Use one group per coherent goal; when work is
+    /// steered into a new area, start a new group instead of renaming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Forward-looking confidence, from 0-100, that this todo can be completed correctly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<u8>,
     /// Confidence, from 0-100, recorded when the todo is marked completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_confidence: Option<u8>,
+    /// Every distinct confidence value this todo has carried, oldest first,
+    /// ending with the current one. Maintained by the todo tool (not the
+    /// model): the first entry is the planning-time confidence, later entries
+    /// record how the assessment evolved while the item was worked on. This
+    /// preserves the planning signal even after the model overwrites
+    /// `confidence` when marking the item done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confidence_history: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_to: Option<String>,
+}
+
+/// Plan-level understanding of what the user actually wants, covering the
+/// whole todo list rather than one group.
+///
+/// Intent is a property of the request, not of an individual group of steps,
+/// so it is recorded once per plan: what the user is really after, and how
+/// faithfully the plan and its feedback loops represent that.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoPlan {
+    /// The user's underlying reason and desired outcome for this work, kept
+    /// distinct from the agent's steps and validation loops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_intention: Option<String>,
+    /// How well the agent understands what the user actually wants and how
+    /// faithfully this plan represents it, from 0-100. It does not measure
+    /// implementation progress. Older payloads called this `alignment_score`.
+    #[serde(
+        default,
+        alias = "alignment_score",
+        alias = "user_intention_alignment",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub understands_user_intent: Option<u8>,
+    /// Every distinct `understands_user_intent` value this plan has carried,
+    /// oldest first, ending with the current one. Maintained by the todo tool,
+    /// not the model: understanding of a request typically starts low and rises
+    /// as the agent explores, so the trajectory distinguishes an agent that
+    /// resolved the ambiguity by investigating from one that never did.
+    /// Model-supplied values are ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub understands_user_intent_history: Vec<u8>,
+}
+
+/// A plan field changed by a todo-tool update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoPlanField {
+    UserIntention,
+    #[serde(alias = "alignment_score", alias = "user_intention_alignment")]
+    UnderstandsUserIntent,
+}
+
+/// Before/after state for the plan-level intent assessment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoPlanChange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<TodoPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<TodoPlan>,
+    pub fields: Vec<TodoPlanField>,
+}
+
+/// A goal-level assessment attached to a todo group (or, for an ungrouped
+/// flat list, the whole list as one implicit goal with `group: None`).
+///
+/// Hill-climbability is a property of an objective, not of individual steps:
+/// "optimize grep latency" is hill-climbable because progress has a metric,
+/// while "design an onboarding screen" is not because success is a taste
+/// judgment. Items like "read the auth code" have no meaningful score of
+/// their own, so the score lives here instead of on `TodoItem`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoGoal {
+    /// Group label this goal describes. `None` covers the ungrouped list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// How hill-climbable this goal is, from 0-100: can progress be measured
+    /// against a quantifiable, verifiable objective and iterated on?
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hill_climbability: Option<u8>,
+    /// Every distinct `hill_climbability` value this goal has carried, oldest
+    /// first. Tool-maintained; model-supplied values are ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hill_climbability_history: Vec<u8>,
+    /// The concrete feedback loop used to judge whether each iteration improves
+    /// the outcome (e.g. a benchmark command and the metric it reports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_loop: Option<String>,
+    /// How completely the agent owned the goal's full outcome, including the
+    /// requested work, reasonably necessary adjacent work, end-to-end
+    /// validation, cleanup, and explicit disclosure of remaining gaps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_to_end_ownership: Option<u8>,
+    /// Every distinct `end_to_end_ownership` value this goal has carried,
+    /// oldest first. Tool-maintained; model-supplied values are ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub end_to_end_ownership_history: Vec<u8>,
+}
+
+/// A goal field changed by a todo-tool update. This lets transcript renderers
+/// show a concise quality-gate refinement instead of repeating the full plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoGoalField {
+    HillClimbability,
+    FeedbackLoop,
+    EndToEndOwnership,
+}
+
+/// Before/after state for one changed todo goal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoGoalChange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<TodoGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<TodoGoal>,
+    pub fields: Vec<TodoGoalField>,
 }
 
 use std::collections::HashMap;

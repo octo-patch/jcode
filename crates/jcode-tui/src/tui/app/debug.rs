@@ -202,6 +202,15 @@ pub(super) struct ScrollSuiteConfig {
     require_no_anomalies: Option<bool>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(super) struct WidgetStabilityConfig {
+    width: Option<u16>,
+    height: Option<u16>,
+    step: Option<usize>,
+    max_frames: Option<usize>,
+    include_frames: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SidePanelLatencyConfig {
     width: Option<u16>,
@@ -343,7 +352,8 @@ impl ProviderMessageMemoryStats {
                     self.text_bytes += text.len();
                     self.record_bytes(text.len());
                 }
-                crate::message::ContentBlock::Reasoning { text } => {
+                crate::message::ContentBlock::Reasoning { text }
+                | crate::message::ContentBlock::ReasoningTrace { text } => {
                     self.reasoning_bytes += text.len();
                     self.record_bytes(text.len());
                 }
@@ -489,7 +499,7 @@ impl ScrollTestState {
             diff_pane_focus: app.diff_pane_focus,
             diff_pane_auto_scroll: app.diff_pane_auto_scroll,
             is_processing: app.is_processing,
-            streaming_text: app.streaming_text.clone(),
+            streaming_text: app.streaming.streaming_text.clone(),
             queued_messages: app.queued_messages.clone(),
             interleave_message: app.interleave_message.clone(),
             pending_soft_interrupts: app.pending_soft_interrupts.clone(),
@@ -560,6 +570,11 @@ mod debug_profile;
 mod debug_script;
 
 pub(super) fn handle_debug_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed == "/debug-fixture gmail-draft" {
+        app.handle_debug_command("gmail-draft-fixture");
+        return true;
+    }
+
     if trimmed == "/debug-visual" || trimmed == "/debug-visual on" {
         use crate::tui::visual_debug;
         visual_debug::enable();

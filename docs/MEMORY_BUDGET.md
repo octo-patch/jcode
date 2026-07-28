@@ -5,6 +5,9 @@ Updated: 2026-04-18
 
 This document defines the current memory regression budget for jcode.
 
+For live server triage and cause-specific remediation, see
+[Jcode Server Memory Incident Runbook](./MEMORY_INCIDENT_RUNBOOK.md).
+
 The goal is not to freeze memory usage forever. The goal is to make memory changes:
 - measurable
 - reviewable
@@ -21,6 +24,9 @@ Use existing debug surfaces instead of ad hoc instrumentation:
 - Markdown cache profile: `:debug markdown:memory`
 - Mermaid cache profile: `:debug mermaid:memory`
 - Agent/session memory profile via debug socket: `agent:memory`
+- Fast server incident classification: `server:memory-incident`
+- Full server attribution: `server:memory`
+- Process-lifetime timeline: `python scripts/analyze_runtime_memory_log.py --days 1`
 
 Primary sources in code:
 - `src/tui/app/debug_cmds.rs`

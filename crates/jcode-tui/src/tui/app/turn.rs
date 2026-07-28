@@ -31,15 +31,19 @@ impl App {
     ) -> Result<()> {
         let eager_stream_redraw = !crate::perf::tui_policy().enable_decorative_animations;
         let mut redraw_period = crate::tui::redraw_interval(self);
-        let mut redraw_interval = interval(redraw_period);
+        let mut redraw_interval = super::run_shell::redraw_timer(redraw_period);
         let mut status_spinner_interval = super::run_shell::status_spinner_interval();
         let mut status_spinner_renderer = super::run_shell::StatusSpinnerRenderer::default();
 
         'turn_loop: loop {
+            // Mark the turn as in-flight work: from here until the turn ends,
+            // missing progress beats mean a real hang, not an idle client.
+            let _turn_work = crate::logging::watchdog::begin_work("turn.request");
+            crate::logging::watchdog::set_detail("provider request");
             let desired_redraw = crate::tui::redraw_interval(self);
             if desired_redraw != redraw_period {
                 redraw_period = desired_redraw;
-                redraw_interval = interval(redraw_period);
+                redraw_interval = super::run_shell::redraw_timer(redraw_period);
             }
 
             self.status = ProcessingStatus::Sending;
@@ -132,6 +136,7 @@ impl App {
                                     if self.cancel_requested {
                                         self.cancel_requested = false;
                                         self.interleave_message = None;
+                                        self.interleave_images.clear();
                                         self.pending_soft_interrupts.clear();
                                         self.pending_soft_interrupt_requests.clear();
                                         self.clear_streaming_render_state();
@@ -153,10 +158,12 @@ impl App {
                                 super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                             }
                             Some(Ok(Event::Mouse(mouse))) => {
-                                let scroll_only = self.handle_mouse_event(mouse);
-                                if !scroll_only {
-                                    status_spinner_renderer.draw_full(self, terminal)?;
-                                    super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
+                                if !matches!(mouse.kind, MouseEventKind::Moved) {
+                                    let scroll_only = self.handle_mouse_event(mouse);
+                                    if !scroll_only {
+                                        status_spinner_renderer.draw_full(self, terminal)?;
+                                        super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
+                                    }
                                 }
                             }
                             Some(Ok(Event::Resize(_, _))) => {
@@ -169,13 +176,14 @@ impl App {
                         }
                     }
                     // Redraw periodically
-                    _ = status_spinner_interval.tick(), if super::run_shell::status_spinner_only_symbol(self).is_some() => {
+                    _ = status_spinner_interval.tick(), if status_spinner_renderer.spinner_only_available(self) => {
                         if !status_spinner_renderer.draw_status_spinner_only(self, terminal)? {
                             status_spinner_renderer.draw_full(self, terminal)?;
                             super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                         }
                     }
                     _ = redraw_interval.tick() => {
+                        let _ = self.flush_pending_resize_redraw();
                         status_spinner_renderer.draw_full(self, terminal)?;
                         super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                     }
@@ -249,17 +257,29 @@ impl App {
                 let desired_redraw = crate::tui::redraw_interval(self);
                 if desired_redraw != redraw_period {
                     redraw_period = desired_redraw;
-                    redraw_interval = interval(redraw_period);
+                    redraw_interval = super::run_shell::redraw_timer(redraw_period);
                 }
                 tokio::select! {
+                    // Cheap single-cell spinner refresh between full redraws. This
+                    // keeps the thinking/connecting spinner feeling responsive
+                    // (especially in low-resource tiers where full redraws run at
+                    // the ~1 Hz passive-liveness rate) by patching just the status
+                    // cell. Only active while there is no streaming text to reveal.
+                    _ = status_spinner_interval.tick(), if status_spinner_renderer.spinner_only_available(self) => {
+                        if !status_spinner_renderer.draw_status_spinner_only(self, terminal)? {
+                            status_spinner_renderer.draw_full(self, terminal)?;
+                            super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
+                        }
+                    }
                     // Redraw periodically
                     _ = redraw_interval.tick() => {
-                        if let Some(chunk) = self.stream_buffer.flush_smooth_frame() {
-                            self.append_streaming_text(&chunk);
-                        }
+                        let _ = self.flush_pending_resize_redraw();
+                        let ops = self.stream_buffer.flush_smooth_frame();
+                        self.apply_stream_ops(ops);
                         // Poll for background compaction completion during streaming
                         self.poll_compaction_completion();
                         status_spinner_renderer.draw_full(self, terminal)?;
+                        super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                     }
                     bus_event = async {
                         match bus_receiver.as_mut() {
@@ -283,6 +303,7 @@ impl App {
                                     if self.cancel_requested {
                                         self.cancel_requested = false;
                                         self.interleave_message = None;
+                                        self.interleave_images.clear();
                                         self.pending_soft_interrupts.clear();
                                         self.pending_soft_interrupt_requests.clear();
                                         // Save partial assistant response before clearing
@@ -297,21 +318,21 @@ impl App {
                                                     cache_control: None,
                                                 });
                                             }
+                                            crate::message::push_reasoning_blocks(
+                                                &mut content_blocks,
+                                                &provider_name,
+                                                &reasoning_content,
+                                                Some(&reasoning_signature),
+                                                store_reasoning_content,
+                                            );
                                             if store_reasoning_content {
-                                                crate::message::push_reasoning_content_block(
-                                                    &mut content_blocks,
-                                                    &provider_name,
-                                                    &reasoning_content,
-                                                    Some(&reasoning_signature),
-                                                );
                                                 content_blocks.extend(openai_reasoning_items.iter().cloned());
                                             }
                                             for tc in &tool_calls {
                                                 content_blocks.push(ContentBlock::ToolUse {
                                                     id: tc.id.clone(),
                                                     name: tc.name.clone(),
-                                                    input: tc.input.clone(),
-                                                });
+                                                    input: tc.input.clone(), thought_signature: None, });
                                             }
                                             if !content_blocks.is_empty() {
                                                 let content_clone = content_blocks.clone();
@@ -325,11 +346,12 @@ impl App {
                                                 let _ = self.session.save();
                                             }
                                             // Flush buffer and show partial response
-                                            if let Some(chunk) = self.stream_buffer.flush() {
-                                                self.append_streaming_text(&chunk);
-                                            }
-                                            if !self.streaming_text.is_empty() {
+                                            let ops = self.stream_buffer.flush();
+                                            self.apply_stream_ops(ops);
+                                            if !self.streaming.streaming_text.is_empty() {
                                                 let content = self.take_streaming_text();
+                                                let content = self.collapse_reasoning_for_commit(content);
+                                                if !content.trim().is_empty() {
                                                 self.push_display_message(DisplayMessage {
                                                     role: "assistant".to_string(),
                                                     content,
@@ -338,6 +360,7 @@ impl App {
                                                     title: None,
                                                     tool_data: None,
                                                 });
+                                                }
                                             }
                                         }
                                         self.clear_streaming_render_state();
@@ -349,6 +372,8 @@ impl App {
                                     }
                                     // Check for interleave request (Shift+Enter)
                                     if let Some(interleave_msg) = self.interleave_message.take() {
+                                        let interleave_images =
+                                            std::mem::take(&mut self.interleave_images);
                                         // Save partial assistant response if any
                                         if !text_content.is_empty() || !tool_calls.is_empty() {
                                             // Complete any pending tool
@@ -363,21 +388,21 @@ impl App {
                                                     cache_control: None,
                                                 });
                                             }
+                                            crate::message::push_reasoning_blocks(
+                                                &mut content_blocks,
+                                                &provider_name,
+                                                &reasoning_content,
+                                                Some(&reasoning_signature),
+                                                store_reasoning_content,
+                                            );
                                             if store_reasoning_content {
-                                                crate::message::push_reasoning_content_block(
-                                                    &mut content_blocks,
-                                                    &provider_name,
-                                                    &reasoning_content,
-                                                    Some(&reasoning_signature),
-                                                );
                                                 content_blocks.extend(openai_reasoning_items.iter().cloned());
                                             }
                                             for tc in &tool_calls {
                                                 content_blocks.push(ContentBlock::ToolUse {
                                                     id: tc.id.clone(),
                                                     name: tc.name.clone(),
-                                                    input: tc.input.clone(),
-                                                });
+                                                    input: tc.input.clone(), thought_signature: None, });
                                             }
                                             // Add partial assistant response to messages
                                             if !content_blocks.is_empty() {
@@ -389,8 +414,10 @@ impl App {
                                                 });
                                             }
                                             // Add display message for partial response
-                                            if !self.streaming_text.is_empty() {
+                                            if !self.streaming.streaming_text.is_empty() {
                                                 let content = self.take_streaming_text();
+                                                let content = self.collapse_reasoning_for_commit(content);
+                                                if !content.trim().is_empty() {
                                                 self.push_display_message(DisplayMessage {
                                                     role: "assistant".to_string(),
                                                     content,
@@ -399,10 +426,18 @@ impl App {
                                                     title: None,
                                                     tool_data: None,
                                                 });
+                                                }
                                             }
                                         }
                                         // Add user's interleaved message
-                                        self.add_provider_message(Message::user(&interleave_msg));
+                                        if interleave_images.is_empty() {
+                                            self.add_provider_message(Message::user(&interleave_msg));
+                                        } else {
+                                            self.add_provider_message(Message::user_with_images(
+                                                &interleave_msg,
+                                                interleave_images,
+                                            ));
+                                        }
                                         self.push_display_message(DisplayMessage {
                                             role: "user".to_string(),
                                             content: interleave_msg,
@@ -431,9 +466,11 @@ impl App {
                                 status_spinner_renderer.draw_full(self, terminal)?;
                             }
                             Some(Ok(Event::Mouse(mouse))) => {
-                                let scroll_only = self.handle_mouse_event(mouse);
-                                if !scroll_only {
-                                    status_spinner_renderer.draw_full(self, terminal)?;
+                                if !matches!(mouse.kind, MouseEventKind::Moved) {
+                                    let scroll_only = self.handle_mouse_event(mouse);
+                                    if !scroll_only {
+                                        status_spinner_renderer.draw_full(self, terminal)?;
+                                    }
                                 }
                             }
                             Some(Ok(Event::Resize(_, _))) => {
@@ -449,6 +486,7 @@ impl App {
                         match stream_event {
                             Some(Ok(event)) => {
                                 // Track activity for status display
+                                crate::logging::watchdog::beat("turn.stream");
                                 self.last_stream_activity = Some(Instant::now());
 
                                 if first_event {
@@ -459,11 +497,25 @@ impl App {
                                         self.status = ProcessingStatus::Streaming;
                                         text_content.push_str(&text);
                                         self.resume_streaming_tps();
-                                        if let Some(chunk) = self.stream_buffer.push(&text) {
-                                            self.append_streaming_text(&chunk);
-                                            self.broadcast_debug(crate::tui::backend::DebugEvent::TextDelta {
-                                                text: chunk.clone()
-                                            });
+                                        // The buffer queues a CloseReasoning marker ahead of real
+                                        // output so any open reasoning region closes in order as
+                                        // the paced stream reveals.
+                                        let ops = self.stream_buffer.push_text(&text);
+                                        let revealed: Vec<String> = ops
+                                            .iter()
+                                            .filter_map(|op| match op {
+                                                crate::tui::stream_buffer::StreamOp::Text(chunk) => {
+                                                    Some(chunk.clone())
+                                                }
+                                                _ => None,
+                                            })
+                                            .collect();
+                                        if self.apply_stream_ops(ops) {
+                                            for chunk in revealed {
+                                                self.broadcast_debug(crate::tui::backend::DebugEvent::TextDelta {
+                                                    text: chunk
+                                                });
+                                            }
                                             if eager_stream_redraw {
                                                 status_spinner_renderer.draw_full(self, terminal)?;
                                             }
@@ -480,6 +532,11 @@ impl App {
                                             id: id.clone(),
                                             name: name.clone(),
                                         });
+                                        // Close any open reasoning region before committing the
+                                        // assistant message so the blockquote is well-formed.
+                                        if self.reasoning_streaming {
+                                            self.close_reasoning_region(None);
+                                        }
                                         self.commit_pending_streaming_assistant_message();
                                         // Update status to show tool in progress
                                         self.status = ProcessingStatus::RunningTool(name.clone());
@@ -492,14 +549,12 @@ impl App {
                                             id: id.clone(),
                                             name: name.clone(),
                                             input: serde_json::Value::Null,
-                                            intent: None,
-                                        });
+                                            intent: None, thought_signature: None, });
                                         current_tool = Some(ToolCall {
                                             id,
                                             name,
                                             input: serde_json::Value::Null,
-                                            intent: None,
-                                        });
+                                            intent: None, thought_signature: None, });
                                         current_tool_input.clear();
                                         if eager_stream_redraw {
                                             status_spinner_renderer.draw_full(self, terminal)?;
@@ -524,6 +579,11 @@ impl App {
                                             if let Some(key) = Self::experimental_feature_key_for_tool(&tool) {
                                                 self.note_experimental_feature_use(key);
                                             }
+                                            if tool.name == "swarm" {
+                                                self.maybe_surface_swarm_config_hint();
+                                            }
+                                            let sponsor_disclosure_title =
+                                                self.inline_sponsor_disclosure_title(&tool);
                                             if let Some(streaming_tool) = self
                                                 .streaming_tool_calls
                                                 .iter_mut()
@@ -544,7 +604,7 @@ impl App {
                                                 content: tool.name.clone(),
                                                 tool_calls: vec![],
                                                 duration_secs: None,
-                                                title: None,
+                                                title: sponsor_disclosure_title,
                                                 tool_data: Some(tool.clone()),
                                             });
 
@@ -555,31 +615,39 @@ impl App {
                                             }
                                         }
                                     }
+                                    StreamEvent::ToolUseSignature(signature) => {
+                                        // Attach Gemini 3 thought signature to the
+                                        // most recent tool call so it can be
+                                        // persisted and replayed on later turns.
+                                        if !signature.is_empty() {
+                                            if let Some(tool) = tool_calls.last_mut() {
+                                                tool.thought_signature = Some(signature.clone());
+                                            }
+                                            if let Some(streaming_tool) =
+                                                self.streaming_tool_calls.last_mut()
+                                            {
+                                                streaming_tool.thought_signature = Some(signature);
+                                            }
+                                        }
+                                    }
                                     StreamEvent::TokenUsage {
                                         input_tokens,
                                         output_tokens,
                                         cache_read_input_tokens,
                                         cache_creation_input_tokens,
                                     } => {
-                                        let mut usage_changed = false;
-                                        if let Some(input) = input_tokens {
-                                            self.streaming_input_tokens = input;
-                                            usage_changed = true;
-                                        }
+                                        let mut usage_changed = self
+                                            .apply_stream_usage_input_report(
+                                                input_tokens,
+                                                cache_read_input_tokens,
+                                                cache_creation_input_tokens,
+                                            );
                                         if let Some(output) = output_tokens {
-                                            self.streaming_output_tokens = output;
+                                            self.streaming.streaming_output_tokens = output;
                                             self.accumulate_streaming_output_tokens(
                                                 output,
                                                 &mut call_output_tokens_seen,
                                             );
-                                        }
-                                        if cache_read_input_tokens.is_some() {
-                                            self.streaming_cache_read_tokens = cache_read_input_tokens;
-                                            usage_changed = true;
-                                        }
-                                        if cache_creation_input_tokens.is_some() {
-                                            self.streaming_cache_creation_tokens =
-                                                cache_creation_input_tokens;
                                             usage_changed = true;
                                         }
                                         if usage_changed {
@@ -589,11 +657,11 @@ impl App {
                                             }
                                         }
                                         self.broadcast_debug(crate::tui::backend::DebugEvent::TokenUsage {
-                                            input_tokens: self.streaming_input_tokens,
-                                            output_tokens: self.streaming_output_tokens,
-                                            cache_read_input_tokens: self.streaming_cache_read_tokens,
+                                            input_tokens: self.streaming.streaming_input_tokens,
+                                            output_tokens: self.streaming.streaming_output_tokens,
+                                            cache_read_input_tokens: self.streaming.streaming_cache_read_tokens,
                                             cache_creation_input_tokens: self
-                                                .streaming_cache_creation_tokens,
+                                                .streaming.streaming_cache_creation_tokens,
                                         });
                                     }
                                     StreamEvent::ConnectionType { connection } => {
@@ -601,9 +669,20 @@ impl App {
                                         self.update_terminal_title();
                                     }
                                     StreamEvent::ConnectionPhase { phase } => {
+                                        let was_connecting = matches!(
+                                            self.status,
+                                            ProcessingStatus::Connecting(_)
+                                        );
                                         self.status = if matches!(phase, crate::message::ConnectionPhase::Streaming) {
+                                            self.connection_phase_started = None;
                                             ProcessingStatus::Streaming
                                         } else {
+                                            // Measure "suspiciously long" per connection attempt:
+                                            // start the timer when entering the connecting group,
+                                            // not on every sub-phase transition.
+                                            if !was_connecting {
+                                                self.connection_phase_started = Some(Instant::now());
+                                            }
                                             ProcessingStatus::Connecting(phase)
                                         };
                                         if eager_stream_redraw {
@@ -624,6 +703,42 @@ impl App {
                                             status_spinner_renderer.draw_full(self, terminal)?;
                                         }
                                     }
+                                    StreamEvent::RetryRollback { attempt, max } => {
+                                        // Transient transport fault mid-stream; the provider is
+                                        // replaying the request from the top. Discard the partial
+                                        // attempt (accumulators + on-screen streaming render) so
+                                        // the replay streams into a clean slate instead of
+                                        // duplicating output.
+                                        crate::logging::warn(&format!(
+                                            "Retry rollback (attempt {}/{}): discarding partial streamed output ({} text chars, {} tool calls)",
+                                            attempt,
+                                            max,
+                                            text_content.len(),
+                                            tool_calls.len(),
+                                        ));
+                                        text_content.clear();
+                                        tool_calls.clear();
+                                        current_tool = None;
+                                        current_tool_input.clear();
+                                        generated_image_contexts.clear();
+                                        sdk_tool_results.clear();
+                                        reasoning_content.clear();
+                                        reasoning_signature.clear();
+                                        openai_reasoning_items.clear();
+                                        openai_native_compaction = None;
+                                        saw_message_end = false;
+                                        self.rollback_streaming_attempt();
+                                        self.connection_phase_started = Some(Instant::now());
+                                        self.status = ProcessingStatus::Connecting(
+                                            crate::message::ConnectionPhase::Retrying {
+                                                attempt,
+                                                max,
+                                            },
+                                        );
+                                        if eager_stream_redraw {
+                                            status_spinner_renderer.draw_full(self, terminal)?;
+                                        }
+                                    }
                                     StreamEvent::SessionId(sid) => {
                                         self.provider_session_id = Some(sid);
                                         if saw_message_end {
@@ -634,7 +749,7 @@ impl App {
                                         let no_partial_output = text_content.is_empty()
                                             && tool_calls.is_empty()
                                             && current_tool.is_none()
-                                            && self.streaming_text.is_empty()
+                                            && self.streaming.streaming_text.is_empty()
                                             && !saw_message_end;
                                         if no_partial_output
                                             && let Some(reason) = crate::network_retry::classify_message(&message)
@@ -676,26 +791,36 @@ impl App {
                                     }
                                     StreamEvent::ThinkingDelta(thinking_text) => {
                                         self.resume_streaming_tps();
-                                        // Buffer thinking content and emit with prefix only once
+                                        // Reflect active reasoning in the status line even when the
+                                        // provider streams reasoning deltas without an explicit
+                                        // ThinkingStart (e.g. OpenRouter, Bedrock) or when the
+                                        // reasoning text itself is hidden by config.
+                                        let thinking_start =
+                                            *self.thinking_start.get_or_insert_with(Instant::now);
+                                        let entered_thinking =
+                                            !matches!(self.status, ProcessingStatus::Thinking(_));
+                                        if entered_thinking {
+                                            self.status = ProcessingStatus::Thinking(thinking_start);
+                                        }
+                                        // Buffer thinking content for status/debug accounting.
                                         self.thinking_buffer.push_str(&thinking_text);
-                                        // Display reasoning/thinking content from OpenAI
-                                        if let Some(chunk) = self.stream_buffer.flush() {
-                                            self.append_streaming_text(&chunk);
+                                        // Only render thinking content if enabled in config. It is
+                                        // paced through the same segment-aware StreamBuffer as the
+                                        // answer text, so ordering is preserved without flushing
+                                        // and bursts trickle in smoothly.
+                                        if config().display.reasoning_enabled() {
+                                            let ops = self.stream_buffer.push_reasoning(&thinking_text);
+                                            self.apply_stream_ops(ops);
                                         }
-                                        // Only show thinking content if enabled in config
-                                        if config().display.show_thinking {
-                                            // Only emit the prefix once at the start of thinking
-                                            if !self.thinking_prefix_emitted && !self.thinking_buffer.trim().is_empty() {
-                                                self.insert_thought_line(format!("💭 {}", self.thinking_buffer.trim_start()));
-                                                self.thinking_prefix_emitted = true;
-                                                self.thinking_buffer.clear();
-                                            } else if self.thinking_prefix_emitted {
-                                                // After prefix is emitted, append subsequent chunks directly
-                                                self.append_streaming_text(&thinking_text);
-                                            }
-                                        }
-                                        if store_reasoning_content {
-                                            reasoning_content.push_str(&thinking_text);
+                                        // Always capture reasoning text so it can be
+                                        // persisted as a history-only trace, regardless
+                                        // of provider replay support.
+                                        reasoning_content.push_str(&thinking_text);
+                                        // When reasoning text is hidden, the status flip to
+                                        // "thinking…" is the only visible signal, so repaint
+                                        // promptly on the first delta.
+                                        if entered_thinking && eager_stream_redraw {
+                                            status_spinner_renderer.draw_full(self, terminal)?;
                                         }
                                     }
                                     StreamEvent::ThinkingEnd => {
@@ -704,13 +829,14 @@ impl App {
                                         self.thinking_buffer.clear();
                                         self.broadcast_debug(crate::tui::backend::DebugEvent::ThinkingEnd);
                                     }
-                                    StreamEvent::ThinkingDone { duration_secs } => {
-                                        // Flush any pending buffered text first
-                                        if let Some(chunk) = self.stream_buffer.flush() {
-                                            self.append_streaming_text(&chunk);
+                                    StreamEvent::ThinkingDone { duration_secs: _ } => {
+                                        if config().display.reasoning_enabled() {
+                                            // Queue the region close behind any still-buffered
+                                            // reasoning so it lands exactly after the final
+                                            // reasoning character reveals.
+                                            let ops = self.stream_buffer.push_close_reasoning();
+                                            self.apply_stream_ops(ops);
                                         }
-                                        let thinking_msg = format!("*Thought for {:.1}s*", duration_secs);
-                                        self.insert_thought_line(thinking_msg);
                                         self.thinking_prefix_emitted = false;
                                         self.thinking_buffer.clear();
                                     }
@@ -741,9 +867,8 @@ impl App {
                                                 });
                                         }
                                         // Flush any pending buffered text first
-                                        if let Some(chunk) = self.stream_buffer.flush() {
-                                            self.append_streaming_text(&chunk);
-                                        }
+                                        let ops = self.stream_buffer.flush();
+                                        self.apply_stream_ops(ops);
                                         let tokens_str = pre_tokens
                                             .map(|t| format!(" (was {} tokens)", t))
                                             .unwrap_or_default();
@@ -810,8 +935,7 @@ impl App {
                                             id: id.clone(),
                                             name: crate::message::GENERATED_IMAGE_TOOL_NAME.to_string(),
                                             input,
-                                            intent: Some("OpenAI native image generation".to_string()),
-                                        };
+                                            intent: Some("OpenAI native image generation".to_string()), thought_signature: None, };
                                         let summary = crate::message::generated_image_summary(
                                             &path,
                                             metadata_path.as_deref(),
@@ -826,19 +950,12 @@ impl App {
                                             title: Some("Generated image".to_string()),
                                             tool_data: Some(tool_call),
                                         });
-                                        match crate::tui::write_generated_image_side_panel_page(
-                                            &self.session.id,
+                                        if let Some(image) = crate::message::generated_image_rendered_image(
                                             &id,
                                             &path,
-                                            metadata_path.as_deref(),
                                             &output_format,
-                                            revised_prompt.as_deref(),
                                         ) {
-                                            Ok(snapshot) => self.set_side_panel_snapshot(snapshot),
-                                            Err(err) => crate::logging::warn(&format!(
-                                                "Failed to write generated image side panel page: {}",
-                                                err
-                                            )),
+                                            self.append_live_inline_images(vec![image]);
                                         }
                                         if provider.supports_image_input() {
                                             if let Some(blocks) = crate::message::generated_image_visual_context_blocks(
@@ -901,7 +1018,7 @@ impl App {
                                 let no_partial_output = text_content.is_empty()
                                     && tool_calls.is_empty()
                                     && current_tool.is_none()
-                                    && self.streaming_text.is_empty()
+                                    && self.streaming.streaming_text.is_empty()
                                     && !saw_message_end;
                                 if no_partial_output
                                     && let Some(reason) = crate::network_retry::classify_network_interruption(e.as_ref())
@@ -927,7 +1044,7 @@ impl App {
                                 let no_partial_output = text_content.is_empty()
                                     && tool_calls.is_empty()
                                     && current_tool.is_none()
-                                    && self.streaming_text.is_empty()
+                                    && self.streaming.streaming_text.is_empty()
                                     && !saw_message_end;
                                 if no_partial_output {
                                     let plan = crate::network_retry::wait_plan();
@@ -965,13 +1082,14 @@ impl App {
                     cache_control: None,
                 });
             }
+            crate::message::push_reasoning_blocks(
+                &mut content_blocks,
+                &provider_name,
+                &reasoning_content,
+                Some(&reasoning_signature),
+                store_reasoning_content,
+            );
             if store_reasoning_content {
-                crate::message::push_reasoning_content_block(
-                    &mut content_blocks,
-                    &provider_name,
-                    &reasoning_content,
-                    Some(&reasoning_signature),
-                );
                 content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
@@ -979,6 +1097,7 @@ impl App {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
+                    thought_signature: None,
                 });
             }
 
@@ -1009,8 +1128,15 @@ impl App {
             let duration = self.display_turn_duration_secs();
 
             // Flush any remaining buffered text
-            if let Some(chunk) = self.stream_buffer.flush() {
-                self.append_streaming_text(&chunk);
+            let ops = self.stream_buffer.flush();
+            self.apply_stream_ops(ops);
+            // The turn can finish with a reasoning region still open (reasoning
+            // streamed but no answer text / explicit close followed). Close it as
+            // a hard message boundary so the live-rendered reasoning is
+            // anchored/retained instead of being silently stripped by
+            // `collapse_reasoning_for_commit`.
+            if self.reasoning_streaming {
+                self.close_reasoning_region(None);
             }
 
             if tool_calls.is_empty() {
@@ -1029,15 +1155,19 @@ impl App {
             } else {
                 // Had tool calls - only display text that came AFTER the last tool
                 // (text before each tool was already committed in ToolUseEnd handler)
-                if !self.streaming_text.is_empty() {
-                    self.push_display_message(DisplayMessage {
-                        role: "assistant".to_string(),
-                        content: self.streaming_text.clone(),
-                        tool_calls: vec![],
-                        duration_secs: duration,
-                        title: None,
-                        tool_data: None,
-                    });
+                if !self.streaming.streaming_text.is_empty() {
+                    let content =
+                        self.collapse_reasoning_for_commit(self.streaming.streaming_text.clone());
+                    if !content.trim().is_empty() {
+                        self.push_display_message(DisplayMessage {
+                            role: "assistant".to_string(),
+                            content,
+                            tool_calls: vec![],
+                            duration_secs: duration,
+                            title: None,
+                            tool_data: None,
+                        });
+                    }
                 }
                 if self.has_streaming_footer_stats() {
                     self.push_turn_footer(duration);
@@ -1095,6 +1225,7 @@ impl App {
                         } else {
                             ToolStatus::Completed
                         },
+                        intent: tc.intent.clone(),
                         title: None,
                     }));
 
@@ -1111,6 +1242,8 @@ impl App {
                     let _ = self.replace_latest_tool_display_message(&tc.id, None, display_output);
 
                     self.observe_tool_result(&tc, &sdk_content, sdk_is_error, None);
+                    self.note_tool_completed(&tc, sdk_is_error);
+                    self.note_todo_gate_result(&tc, &sdk_content, sdk_is_error);
 
                     self.add_provider_message(Message {
                         role: Role::User,
@@ -1151,6 +1284,7 @@ impl App {
                     tool_call_id: tc.id.clone(),
                     tool_name: tc.name.clone(),
                     status: ToolStatus::Running,
+                    intent: tc.intent.clone(),
                     title: None,
                 }));
 
@@ -1160,6 +1294,8 @@ impl App {
                 let tool_name = tc.name.clone();
                 let tool_input = tc.input.clone();
                 let tool_start = Instant::now();
+                let _tool_work = crate::logging::watchdog::begin_work("turn.tool");
+                crate::logging::watchdog::set_detail(format!("tool={tool_name}"));
                 let mut tool_future = std::pin::pin!(registry.execute(&tool_name, tool_input, ctx));
 
                 // Subscribe to bus for subagent status updates
@@ -1181,16 +1317,18 @@ impl App {
                                         if self.cancel_requested {
                                             self.cancel_requested = false;
                                             self.interleave_message = None;
+                                            self.interleave_images.clear();
                                             self.pending_soft_interrupts.clear();
                                             self.pending_soft_interrupt_requests.clear();
                                             // Partial text+tool_calls were already saved
                                             // to the session before tool execution started.
                                             // Just preserve the visual streaming content.
-                                            if let Some(chunk) = self.stream_buffer.flush() {
-                                                self.append_streaming_text(&chunk);
-                                            }
-                                            if !self.streaming_text.is_empty() {
+                                            let ops = self.stream_buffer.flush();
+                                            self.apply_stream_ops(ops);
+                                            if !self.streaming.streaming_text.is_empty() {
                                                 let content = self.take_streaming_text();
+                                                let content = self.collapse_reasoning_for_commit(content);
+                                                if !content.trim().is_empty() {
                                                 self.push_display_message(DisplayMessage {
                                                     role: "assistant".to_string(),
                                                     content,
@@ -1199,6 +1337,7 @@ impl App {
                                                     title: None,
                                                     tool_data: None,
                                                 });
+                                                }
                                             }
                                             self.clear_streaming_render_state();
                                             self.stream_buffer.clear();
@@ -1219,9 +1358,11 @@ impl App {
                                     status_spinner_renderer.draw_full(self, terminal)?;
                                 }
                                 Some(Ok(Event::Mouse(mouse))) => {
-                                    let scroll_only = self.handle_mouse_event(mouse);
-                                    if !scroll_only {
-                                        status_spinner_renderer.draw_full(self, terminal)?;
+                                    if !matches!(mouse.kind, MouseEventKind::Moved) {
+                                        let scroll_only = self.handle_mouse_event(mouse);
+                                        if !scroll_only {
+                                            status_spinner_renderer.draw_full(self, terminal)?;
+                                        }
                                     }
                                 }
                                 Some(Ok(Event::Resize(_, _))) => {
@@ -1269,6 +1410,7 @@ impl App {
                         }
                         // Redraw periodically
                         _ = redraw_interval.tick() => {
+                            let _ = self.flush_pending_resize_redraw();
                             status_spinner_renderer.draw_full(self, terminal)?;
                         }
                         // Poll tool execution
@@ -1289,6 +1431,7 @@ impl App {
                             tool_call_id: tc.id.clone(),
                             tool_name: tc.name.clone(),
                             status: ToolStatus::Completed,
+                            intent: tc.intent.clone(),
                             title: o.title.clone(),
                         }));
                         (o.output, false, o.title)
@@ -1300,6 +1443,7 @@ impl App {
                             tool_call_id: tc.id.clone(),
                             tool_name: tc.name.clone(),
                             status: ToolStatus::Error,
+                            intent: tc.intent.clone(),
                             title: None,
                         }));
                         (format!("Error: {}", e), true, None)
@@ -1329,6 +1473,8 @@ impl App {
                     Some(tool_duration_ms),
                 );
                 self.observe_tool_result(&tc, &output, is_error, tool_title.as_deref());
+                self.note_tool_completed(&tc, is_error);
+                self.note_todo_gate_result(&tc, &output, is_error);
                 let _ = self.session.save();
             }
 

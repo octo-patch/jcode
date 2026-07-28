@@ -68,6 +68,7 @@ impl App {
             crate::tui::CopySelectionPane::SidePane => {
                 crate::tui::ui::side_pane_line_text(abs_line)
             }
+            crate::tui::CopySelectionPane::Input => crate::tui::ui::input_pane_line_text(abs_line),
         }
     }
 
@@ -79,6 +80,7 @@ impl App {
         match pane {
             crate::tui::CopySelectionPane::Chat => crate::tui::ui::copy_viewport_line_count(),
             crate::tui::CopySelectionPane::SidePane => crate::tui::ui::side_pane_line_count(),
+            crate::tui::CopySelectionPane::Input => crate::tui::ui::input_pane_line_count(),
         }
     }
 
@@ -128,6 +130,9 @@ impl App {
             crate::tui::CopySelectionPane::SidePane => {
                 self.diff_pane_auto_scroll = false;
             }
+            // The composer has no auto-scroll to pause; selecting the text
+            // being typed must not disturb the transcript view.
+            crate::tui::CopySelectionPane::Input => {}
         }
     }
 
@@ -425,6 +430,26 @@ impl App {
         }
     }
 
+    /// Drive browser-style continuous edge auto-scroll while a mouse drag is
+    /// held at the top/bottom edge of a pane. Called once per UI tick; returns
+    /// true if it scrolled (so the caller can request a redraw).
+    pub(super) fn progress_copy_selection_edge_autoscroll(&mut self) -> bool {
+        let Some((pane, upward)) = self.copy_selection_edge_autoscroll else {
+            return false;
+        };
+        // Only active during an in-progress mouse drag selection.
+        if !self.copy_selection_dragging {
+            self.copy_selection_edge_autoscroll = None;
+            return false;
+        }
+        // Extend the selection to the current edge line, then scroll once more.
+        if let Some(point) = crate::tui::ui::copy_pane_autoscroll_edge_point(pane, upward) {
+            self.update_selection_with_point(point, true);
+        }
+        self.scroll_copy_selection_pane(pane, upward);
+        true
+    }
+
     fn scroll_copy_selection_pane(
         &mut self,
         pane: crate::tui::CopySelectionPane,
@@ -443,6 +468,8 @@ impl App {
                     if upward { -1 } else { 1 },
                 );
             }
+            // The composer scrolls with the caret, not the mouse wheel.
+            crate::tui::CopySelectionPane::Input => return false,
         }
         true
     }
@@ -480,39 +507,80 @@ impl App {
                 if !self.copy_selection_dragging {
                     let pending = self.copy_selection_pending_anchor?;
                     let point = point.filter(|point| point.pane == pending.pane)?;
+                    // Kitty reports mouse motion at pixel granularity, so a
+                    // plain click with sub-cell hand jitter still delivers
+                    // Drag events for the *same* cell between press and
+                    // release. That is not a selection drag: keep the press
+                    // armed as a pending click so the release can fall
+                    // through to the click handlers (inline-image expand
+                    // badge, link open) instead of being swallowed as an
+                    // empty selection.
+                    if point == pending {
+                        return Some(false);
+                    }
                     self.copy_selection_pending_anchor = None;
                     self.copy_selection_dragging = true;
                     self.collapse_selection_to(pending);
                     self.update_selection_with_point(point, true);
                     return Some(false);
                 }
-                if let Some(point) =
-                    point.filter(|point| Some(point.pane) == self.current_copy_selection_pane())
-                {
-                    self.update_selection_with_point(point, true);
-                } else if let Some(pane) = self.current_copy_selection_pane() {
-                    if let Some((point, upward)) =
+                let active_pane = self.current_copy_selection_pane();
+                // Browser-style edge auto-scroll: if the drag is at the top/bottom
+                // boundary row of the active pane, keep scrolling so the selection can
+                // extend past the currently visible transcript. This takes priority
+                // over a plain in-pane update so reaching the edge pulls in more rows.
+                // We also arm a tick-driven autoscroll so it keeps going while the
+                // mouse is simply held at the edge (no further movement needed), just
+                // like dragging a selection past the edge of a browser window.
+                if let Some(pane) = active_pane
+                    && let Some((edge_point, upward)) =
                         crate::tui::ui::copy_pane_vertical_edge_point(pane, mouse.column, mouse.row)
-                    {
-                        self.update_selection_with_point(point, true);
-                        self.scroll_copy_selection_pane(pane, upward);
-                    }
+                {
+                    self.update_selection_with_point(edge_point, true);
+                    self.scroll_copy_selection_pane(pane, upward);
+                    self.copy_selection_edge_autoscroll = Some((pane, upward));
+                    return Some(false);
+                }
+                // Left the edge: stop the continuous autoscroll.
+                self.copy_selection_edge_autoscroll = None;
+                // Resolve the drag target, clamping vertical overshoot (e.g. a
+                // drag into the blank space below the last line) to the nearest
+                // in-bounds line edge so the boundary line is fully selected,
+                // just like native terminal/browser selection.
+                let resolved = active_pane.and_then(|pane| {
+                    crate::tui::ui::copy_pane_drag_point(pane, mouse.column, mouse.row)
+                });
+                if let Some(point) = resolved.filter(|point| Some(point.pane) == active_pane) {
+                    self.update_selection_with_point(point, true);
                 }
                 Some(false)
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                let had_pending = self.copy_selection_pending_anchor.take().is_some();
+                // Clear any armed (un-dragged) press anchor; a plain click does
+                // not start a selection.
+                self.copy_selection_pending_anchor = None;
+                self.copy_selection_edge_autoscroll = None;
                 if !self.copy_selection_dragging {
-                    return if self.copy_selection_mode || had_pending {
+                    // A press+release with no drag is a plain click, not a
+                    // selection. While actively in copy-selection mode we still
+                    // consume it (so a stray click does not leak into the chat),
+                    // but in normal mode we must let it fall through to the
+                    // click handlers (inline-image expand badge, link open).
+                    // Returning `Some(false)` here would swallow those clicks,
+                    // since the `Down` arms `copy_selection_pending_anchor` and
+                    // this branch runs before the expand/link checks.
+                    return if self.copy_selection_mode {
                         Some(false)
                     } else {
                         None
                     };
                 }
                 self.copy_selection_dragging = false;
-                if let Some(point) =
-                    point.filter(|point| Some(point.pane) == self.current_copy_selection_pane())
-                {
+                let release_pane = self.current_copy_selection_pane();
+                let resolved = release_pane.and_then(|pane| {
+                    crate::tui::ui::copy_pane_drag_point(pane, mouse.column, mouse.row)
+                });
+                if let Some(point) = resolved.filter(|point| Some(point.pane) == release_pane) {
                     self.update_selection_with_point(point, true);
                 }
                 if self.copy_selection_mode {
@@ -530,7 +598,10 @@ impl App {
                 {
                     return None;
                 }
+                // The composer is not wheel-scrollable: let wheel events over it
+                // fall through to the normal chat scroll handling.
                 point
+                    .filter(|point| point.pane != crate::tui::CopySelectionPane::Input)
                     .map(|point| self.scroll_copy_selection_pane(point.pane, true))
                     .or_else(|| {
                         self.copy_selection_dragging
@@ -547,6 +618,7 @@ impl App {
                     return None;
                 }
                 point
+                    .filter(|point| point.pane != crate::tui::CopySelectionPane::Input)
                     .map(|point| self.scroll_copy_selection_pane(point.pane, false))
                     .or_else(|| {
                         self.copy_selection_dragging

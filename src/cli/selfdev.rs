@@ -226,7 +226,8 @@ pub async fn run_self_dev(should_build: bool, resume_session: Option<String>) ->
 
     output::stderr_info("Starting self-dev TUI...");
 
-    super::tui_launch::run_tui_client(Some(session_id), None, !server_running, false).await
+    super::tui_launch::run_tui_client(Some(session_id), None, !server_running, false, None, false)
+        .await
 }
 #[cfg(test)]
 #[path = "selfdev_tests.rs"]

@@ -33,6 +33,12 @@ fn create_scroll_test_app(
     crate::tui::mermaid::clear_streaming_preview_diagram();
 
     let mut app = create_test_app();
+    if diagrams == 0 {
+        // Process-global diagrams can be registered by sibling tests after the
+        // clear above. Keep text-only geometry deterministic at the App level.
+        app.diagram_mode = crate::config::DiagramDisplayMode::None;
+        app.diagram_pane_enabled = false;
+    }
     let content = App::build_scroll_test_content(diagrams, padding, None);
     app.display_messages = vec![
         DisplayMessage {
@@ -56,7 +62,7 @@ fn create_scroll_test_app(
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     // Set deterministic session name for snapshot stability
     app.session.short_name = Some("test".to_string());
@@ -90,7 +96,41 @@ fn create_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend::TestBacke
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
+    app.status = ProcessingStatus::Idle;
+    app.session.short_name = Some("test".to_string());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
+    (app, terminal)
+}
+
+fn create_blockquote_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
+    let mut app = create_test_app();
+    app.display_messages = vec![
+        DisplayMessage {
+            role: "user".to_string(),
+            content: "Quote something".to_string(),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        },
+        DisplayMessage {
+            role: "assistant".to_string(),
+            content: "As they say:\n\n> the quick brown fox\n> jumps over the lazy dog\n\nDone."
+                .to_string(),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        },
+    ];
+    app.bump_display_messages_version();
+    app.scroll_offset = 0;
+    app.auto_scroll_paused = false;
+    app.is_processing = false;
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -109,7 +149,7 @@ fn create_error_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend::Tes
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -128,15 +168,14 @@ fn create_tool_error_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend
                 id: "tool_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat /root/secret"}),
-                intent: None,
-            },
+                intent: None, thought_signature: None, },
         ),
     ];
     app.bump_display_messages_version();
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -156,15 +195,14 @@ fn create_tool_failed_output_copy_test_app()
                 id: "tool_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat /root/secret"}),
-                intent: None,
-            },
+                intent: None, thought_signature: None, },
         ),
     ];
     app.bump_display_messages_version();
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -215,13 +253,65 @@ fn prompt_up_key(app: &App) -> (KeyCode, KeyModifiers) {
     )
 }
 
+/// Delegates to the single shared render-state lock so scroll/render tests
+/// serialize against viewport-snapshot tests too, not just each other (#593).
 fn scroll_render_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
+    crate::tui::ui::render_state_test_lock()
+}
 
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// RAII guard that routes clipboard writes into an in-process sink for the
+/// duration of a test.
+///
+/// Copy tests assert shortcut wiring, not that the host has a working
+/// clipboard. On a headless runner every real clipboard path fails correctly
+/// (no Wayland socket, no X11 display, non-terminal stdout), so without this
+/// the tests report "Failed to copy" for an environment reason (refs #596).
+struct CapturedClipboard;
+
+impl CapturedClipboard {
+    fn new() -> Self {
+        crate::tui::app::helpers::capture_clipboard_for_tests();
+        Self
+    }
+
+    /// The text most recently copied while this guard was active.
+    fn text(&self) -> Option<String> {
+        crate::tui::app::helpers::captured_clipboard_for_tests()
+    }
+}
+
+impl Drop for CapturedClipboard {
+    fn drop(&mut self) {
+        crate::tui::app::helpers::stop_capturing_clipboard_for_tests();
+    }
+}
+
+/// Whether wall-clock performance budgets should be asserted rather than merely
+/// reported.
+///
+/// Latency budgets (e.g. a 60fps frame budget) measure the host scheduler as
+/// much as jcode. On a loaded developer machine or a shared CI runner they fail
+/// for reasons unrelated to the code under test, which trains everyone to
+/// ignore the suite. Correctness assertions stay always-on; opt into the timing
+/// ones with `JCODE_TEST_PERF_ASSERTIONS=1` on an idle machine (refs #592).
+fn perf_assertions_enabled() -> bool {
+    std::env::var("JCODE_TEST_PERF_ASSERTIONS")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+}
+
+/// Assert a wall-clock performance budget only when [`perf_assertions_enabled`],
+/// otherwise report the breach so the signal survives without failing the run.
+#[track_caller]
+fn assert_perf_budget(within_budget: bool, message: impl FnOnce() -> String) {
+    if perf_assertions_enabled() {
+        assert!(within_budget, "{}", message());
+    } else if !within_budget {
+        eprintln!(
+            "note: perf budget exceeded ({}); set JCODE_TEST_PERF_ASSERTIONS=1 \
+             on an idle machine to enforce it",
+            message()
+        );
+    }
 }
 
 /// Render app to TestBackend and return the buffer text.
@@ -333,16 +423,17 @@ fn test_chat_native_scrollbar_hides_scroll_counters() {
 
 #[test]
 fn test_streaming_repaint_does_not_leave_bracket_artifact() {
+    let _render_lock = scroll_render_test_lock();
     let mut app = create_test_app();
     let backend = ratatui::backend::TestBackend::new(90, 20);
     let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
 
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
-    app.streaming_text = "[".to_string();
+    app.streaming.streaming_text = "[".to_string();
     let _ = render_and_snap(&app, &mut terminal);
 
-    app.streaming_text = "Process A: |██████████|".to_string();
+    app.streaming.streaming_text = "Process A: |██████████|".to_string();
     let text = render_and_snap(&app, &mut terminal);
 
     assert!(
@@ -392,11 +483,39 @@ fn test_chat_mouse_scroll_requests_immediate_redraw_during_streaming() {
 }
 
 #[test]
+fn test_chat_mouse_wheel_scroll_does_not_recall_prompt_history() {
+    let _lock = scroll_render_test_lock();
+
+    let (mut app, mut terminal) = create_scroll_test_app(50, 12, 0, 36);
+    render_and_snap(&app, &mut terminal);
+    assert!(app.input.is_empty());
+    assert!(
+        crate::tui::ui::last_max_scroll() > 2,
+        "expected scrollable chat content"
+    );
+
+    app.handle_mouse_event(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    assert!(
+        app.input.is_empty(),
+        "mouse-wheel scrolling must not copy the previous prompt into the editor"
+    );
+    assert!(app.auto_scroll_paused, "wheel-up should pause auto-scroll");
+    assert_ne!(app.scroll_offset, 0, "wheel-up should move the transcript");
+}
+
+#[test]
 fn test_chat_mouse_scroll_down_reaches_bottom_without_dead_zone() {
     let _lock = scroll_render_test_lock();
 
     let (mut app, mut terminal) = create_scroll_test_app(50, 12, 0, 36);
-    let bottom = render_and_snap(&app, &mut terminal);
+    render_and_snap(&app, &mut terminal);
+    let bottom_scroll = crate::tui::ui::last_resolved_chat_scroll();
 
     assert!(
         crate::tui::ui::last_max_scroll() > 2,
@@ -409,8 +528,12 @@ fn test_chat_mouse_scroll_down_reaches_bottom_without_dead_zone() {
         row: 5,
         modifiers: KeyModifiers::empty(),
     });
-    let scrolled_up = render_and_snap(&app, &mut terminal);
-    assert_ne!(scrolled_up, bottom, "first wheel-up should visibly move");
+    render_and_snap(&app, &mut terminal);
+    let scrolled_up_scroll = crate::tui::ui::last_resolved_chat_scroll();
+    assert!(
+        scrolled_up_scroll < bottom_scroll,
+        "first wheel-up should move the resolved transcript viewport"
+    );
     assert!(app.auto_scroll_paused);
 
     app.handle_mouse_event(MouseEvent {
@@ -419,10 +542,11 @@ fn test_chat_mouse_scroll_down_reaches_bottom_without_dead_zone() {
         row: 5,
         modifiers: KeyModifiers::empty(),
     });
-    let back_at_bottom = render_and_snap(&app, &mut terminal);
+    render_and_snap(&app, &mut terminal);
+    let back_at_bottom_scroll = crate::tui::ui::last_resolved_chat_scroll();
 
     assert_eq!(
-        back_at_bottom, bottom,
+        back_at_bottom_scroll, bottom_scroll,
         "one opposite wheel detent should return to bottom"
     );
     assert!(
@@ -525,12 +649,23 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         lines.push(format!("filler line {idx:02}"));
     }
 
-    app.display_messages = vec![DisplayMessage::assistant(lines.join("\n"))];
+    // Join as separate markdown paragraphs: the repro depends on the file
+    // activity line owning its row with trailing blank cells (so a blank->blank
+    // diff skips repainting the injected ghost). Single newlines now soft-wrap
+    // into one flowing paragraph, which would repaint over the ghost cells.
+    app.display_messages = vec![DisplayMessage::assistant(lines.join("\n\n"))];
     app.bump_display_messages_version();
     app.auto_scroll_paused = true;
     app.scroll_offset = 0;
 
-    let clean = render_and_snap(&app, &mut terminal);
+    // The transcript begins with the persistent header, which can be taller
+    // than this 12-row viewport. Scroll until the file activity line is
+    // actually on screen instead of assuming it sits at the top.
+    let mut clean = render_and_snap(&app, &mut terminal);
+    while !clean.contains("read lines") && app.scroll_offset < 200 {
+        app.scroll_offset += 1;
+        clean = render_and_snap(&app, &mut terminal);
+    }
     assert!(
         !clean.contains('Z'),
         "ghost marker must not be present before injection:\n{clean}"
@@ -556,7 +691,7 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         .draw(updates)
         .expect("inject trailing nines after file activity line");
 
-    app.scroll_offset = 1;
+    app.scroll_offset += 1;
     let scrolled = render_and_snap(&app, &mut terminal);
 
     assert!(
@@ -579,6 +714,53 @@ fn test_remote_typing_resumes_bottom_follow_mode() {
     assert!(
         !app.auto_scroll_paused,
         "typing in remote mode should follow newest content, not pin top"
+    );
+}
+
+#[test]
+fn test_local_typing_resumes_bottom_follow_mode() {
+    let mut app = create_test_app();
+    app.scroll_offset = 7;
+    app.auto_scroll_paused = true;
+
+    app.handle_key(KeyCode::Char('x'), KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.input, "x");
+    assert_eq!(app.cursor_pos, 1);
+    assert_eq!(app.scroll_offset, 0);
+    assert!(
+        !app.auto_scroll_paused,
+        "local typing should follow newest content just like remote typing"
+    );
+}
+
+#[test]
+fn test_local_typing_snaps_rendered_viewport_to_bottom_in_one_frame() {
+    let _lock = scroll_render_test_lock();
+    crate::tui::ui::clear_test_render_state_for_tests();
+
+    let (mut app, mut terminal) = create_scroll_test_app(50, 12, 0, 32);
+    let _ = render_and_snap(&app, &mut terminal);
+    let max_scroll = crate::tui::ui::last_max_scroll();
+    assert!(max_scroll > 8, "expected a long transcript, got {max_scroll}");
+
+    app.auto_scroll_paused = true;
+    app.scroll_offset = max_scroll - 8;
+    let _ = render_and_snap(&app, &mut terminal);
+    assert_eq!(
+        crate::tui::ui::last_resolved_chat_scroll(),
+        max_scroll - 8
+    );
+
+    app.handle_key(KeyCode::Char('x'), KeyModifiers::empty())
+        .unwrap();
+    let _ = render_and_snap(&app, &mut terminal);
+
+    assert_eq!(
+        crate::tui::ui::last_resolved_chat_scroll(),
+        crate::tui::ui::last_max_scroll(),
+        "typing should explicitly snap to the exact transcript tail, not use content catch-up"
     );
 }
 
@@ -704,7 +886,10 @@ fn test_local_alt_m_falls_back_to_diagram_pane_when_side_panel_is_empty() {
 }
 
 #[test]
-fn test_local_alt_m_toggles_image_side_panel_visibility() {
+fn test_images_do_not_drive_side_panel_visibility() {
+    // Images now render inline in the transcript flow, so they must not flip the
+    // side panel on, arm an auto-hide timer, or otherwise behave like the old
+    // pinned-image side pane.
     let mut app = create_test_app();
     app.is_remote = true;
     app.side_panel = crate::side_panel::SidePanelSnapshot::default();
@@ -713,95 +898,13 @@ fn test_local_alt_m_toggles_image_side_panel_visibility() {
         data: "image-data".to_string(),
         label: Some("preview.png".to_string()),
         source: crate::session::RenderedImageSource::UserInput,
+        anchor: None,
     });
 
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(app.side_panel_user_hidden);
-    assert_eq!(app.status_notice(), Some("Image side panel: OFF".to_string()));
-
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(!app.side_panel_user_hidden);
-    assert_eq!(app.status_notice(), Some("Image side panel: ON".to_string()));
-}
-
-#[test]
-fn test_explicitly_hidden_image_side_panel_stays_hidden_after_server_reload() {
-    // Reproduces an Alt+M hide being undone by a server reload/reconnect: the
-    // history snapshot repopulates remote_side_pane_images while
-    // pinned_images_seen_count resets to 0, which previously looked like new
-    // images and re-revealed the panel.
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.side_panel = crate::side_panel::SidePanelSnapshot::default();
-    app.remote_side_pane_images.push(crate::session::RenderedImage {
-        media_type: "image/png".to_string(),
-        data: "image-data".to_string(),
-        label: Some("preview.png".to_string()),
-        source: crate::session::RenderedImageSource::UserInput,
-    });
-
-    // User explicitly hides the image side panel.
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(app.side_panel_user_hidden);
-    assert!(app.side_panel_explicit_hidden);
-
-    // Simulate a server reload/reconnect: the seen count is reset while the
-    // image snapshot is re-applied with the same images.
-    app.pinned_images_seen_count = 0;
-    app.remote_side_pane_images = vec![crate::session::RenderedImage {
-        media_type: "image/png".to_string(),
-        data: "image-data".to_string(),
-        label: Some("preview.png".to_string()),
-        source: crate::session::RenderedImageSource::UserInput,
-    }];
-
-    app.update_pinned_images_auto_hide();
-
-    // The panel must remain hidden because the user explicitly closed it.
-    assert!(app.side_panel_user_hidden);
-    assert!(app.side_panel_explicit_hidden);
+    // Auto-hide bookkeeping is now a no-op for images.
+    assert!(!app.update_pinned_images_auto_hide());
     assert!(app.pinned_images_auto_hide_deadline.is_none());
-
-    // Alt+M still toggles it back on.
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
     assert!(!app.side_panel_user_hidden);
-    assert!(!app.side_panel_explicit_hidden);
-    assert_eq!(app.status_notice(), Some("Image side panel: ON".to_string()));
-}
-
-#[test]
-fn test_pinned_image_side_panel_auto_hides_and_mentions_alt_m() {
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.side_panel = crate::side_panel::SidePanelSnapshot::default();
-    app.remote_side_pane_images.push(crate::session::RenderedImage {
-        media_type: "image/png".to_string(),
-        data: "image-data".to_string(),
-        label: Some("preview.png".to_string()),
-        source: crate::session::RenderedImageSource::UserInput,
-    });
-
-    assert!(app.update_pinned_images_auto_hide());
-    assert!(!app.side_panel_user_hidden);
-    assert!(app.pinned_images_auto_hide_deadline.is_some());
-
-    app.pinned_images_auto_hide_deadline =
-        Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-    assert!(app.update_pinned_images_auto_hide());
-
-    assert!(app.side_panel_user_hidden);
-    assert!(app.pinned_images_auto_hide_deadline.is_none());
-    let notice = app
-        .display_messages
-        .last()
-        .map(|message| message.content.clone())
-        .unwrap_or_default();
-    assert!(notice.contains("Pinned image side panel hidden automatically"));
-    assert!(notice.contains(crate::tui::keybind::side_panel_toggle_key_label()));
 }
 
 #[test]
@@ -844,6 +947,26 @@ fn test_remote_typing_scroll_lock_preserves_scroll_position() {
     assert!(
         app.auto_scroll_paused,
         "typing scroll lock should preserve paused scroll state"
+    );
+}
+
+#[test]
+fn test_local_typing_scroll_lock_preserves_scroll_position() {
+    let mut app = create_test_app();
+    app.scroll_offset = 7;
+    app.auto_scroll_paused = true;
+
+    app.handle_key(KeyCode::Char('s'), KeyModifiers::ALT)
+        .unwrap();
+    app.handle_key(KeyCode::Char('x'), KeyModifiers::empty())
+        .unwrap();
+
+    assert_eq!(app.input, "x");
+    assert_eq!(app.cursor_pos, 1);
+    assert_eq!(app.scroll_offset, 7);
+    assert!(
+        app.auto_scroll_paused,
+        "typing scroll lock should preserve local paused scroll state"
     );
 }
 
@@ -978,6 +1101,7 @@ fn test_prompt_jump_ctrl_brackets() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_prompt_jump_ctrl_esc_fallback_on_macos() {
+    let _render_lock = scroll_render_test_lock();
     let (mut app, mut terminal) = create_scroll_test_app(100, 30, 1, 20);
 
     render_and_snap(&app, &mut terminal);
@@ -1022,12 +1146,15 @@ fn test_chat_overscroll_reveals_status_line_then_rebounds() {
     };
     app.context_limit = 200_000;
 
-    // Pinned to the bottom: no overscroll line yet.
+    // Pinned to the bottom: no overscroll line yet. (The idle status line now
+    // renders its own short ▰▱ context bar, so the overscroll-specific
+    // affordance to assert on is the `(overscroll x.x)` countdown, not the
+    // glyphs alone.)
     let pinned = render_and_snap(&app, &mut terminal);
     assert!(!app.chat_overscroll_active(), "should start without overscroll");
     assert!(
-        !pinned.contains("▰") && !pinned.contains("▱"),
-        "overscroll bar should be hidden while pinned"
+        !pinned.contains("(overscroll"),
+        "overscroll countdown should be hidden while pinned: {pinned:?}"
     );
 
     // Scroll down at the bottom => overscroll registered, line revealed.
@@ -1043,8 +1170,8 @@ fn test_chat_overscroll_reveals_status_line_then_rebounds() {
     );
     let revealed = render_and_snap(&app, &mut terminal);
     assert!(
-        revealed.contains("▰") || revealed.contains("▱"),
-        "overscroll status line should show context bar: {revealed:?}"
+        revealed.contains("(overscroll"),
+        "overscroll status line should show the countdown affordance: {revealed:?}"
     );
 
     // Scrolling up cancels the overscroll line immediately.

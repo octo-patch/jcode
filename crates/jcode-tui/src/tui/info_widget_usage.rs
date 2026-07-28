@@ -66,20 +66,24 @@ pub(super) fn render_usage_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
                         .add_modifier(ratatui::style::Modifier::DIM),
                 )]));
             }
-            lines.push(render_labeled_bar(
-                "5-hour",
-                five_hr_used,
-                five_hr_left,
-                five_hr_reset.as_deref(),
-                inner.width,
-            ));
-            lines.push(render_labeled_bar(
-                "Weekly",
-                seven_day_used,
-                seven_day_left,
-                seven_day_reset.as_deref(),
-                inner.width,
-            ));
+            if let Some(primary_label) = info.primary_limit_label.as_deref() {
+                lines.push(render_labeled_bar(
+                    primary_label,
+                    five_hr_used,
+                    five_hr_left,
+                    five_hr_reset.as_deref(),
+                    inner.width,
+                ));
+            }
+            if let Some(secondary_label) = info.secondary_limit_label.as_deref() {
+                lines.push(render_labeled_bar(
+                    secondary_label,
+                    seven_day_used,
+                    seven_day_left,
+                    seven_day_reset.as_deref(),
+                    inner.width,
+                ));
+            }
             if let Some(spark_usage) = info.spark {
                 let spark_used = (spark_usage * 100.0).round().clamp(0.0, 100.0) as u8;
                 let spark_left = 100u8.saturating_sub(spark_used);
@@ -94,9 +98,6 @@ pub(super) fn render_usage_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
                     spark_reset.as_deref(),
                     inner.width,
                 ));
-            }
-            if let Some(line) = estimated_cost_line(info) {
-                lines.push(line);
             }
             lines
         }
@@ -143,20 +144,24 @@ pub(super) fn render_usage_compact(info: &UsageInfo, width: u16) -> Vec<Line<'st
                 .add_modifier(ratatui::style::Modifier::DIM),
         )]));
     }
-    lines.push(render_labeled_bar(
-        "5-hour",
-        five_hr_used,
-        five_hr_left,
-        five_hr_reset.as_deref(),
-        width,
-    ));
-    lines.push(render_labeled_bar(
-        "Weekly",
-        seven_day_used,
-        seven_day_left,
-        seven_day_reset.as_deref(),
-        width,
-    ));
+    if let Some(primary_label) = info.primary_limit_label.as_deref() {
+        lines.push(render_labeled_bar(
+            primary_label,
+            five_hr_used,
+            five_hr_left,
+            five_hr_reset.as_deref(),
+            width,
+        ));
+    }
+    if let Some(secondary_label) = info.secondary_limit_label.as_deref() {
+        lines.push(render_labeled_bar(
+            secondary_label,
+            seven_day_used,
+            seven_day_left,
+            seven_day_reset.as_deref(),
+            width,
+        ));
+    }
     if let Some(spark_usage) = info.spark {
         let spark_used = (spark_usage * 100.0).round().clamp(0.0, 100.0) as u8;
         let spark_left = 100u8.saturating_sub(spark_used);
@@ -172,28 +177,7 @@ pub(super) fn render_usage_compact(info: &UsageInfo, width: u16) -> Vec<Line<'st
             width,
         ));
     }
-    if let Some(line) = estimated_cost_line(info) {
-        lines.push(line);
-    }
     lines
-}
-
-/// Estimated equivalent API cost line for subscription/OAuth providers.
-/// Shown for plans where the user is not billed per token (e.g. Claude
-/// subscription) but we can still surface what the usage would have cost.
-fn estimated_cost_line(info: &UsageInfo) -> Option<Line<'static>> {
-    let cost = info.estimated_cost?;
-    if cost <= 0.0 {
-        return None;
-    }
-    Some(Line::from(vec![
-        Span::styled("~", Style::default().fg(rgb(120, 120, 130))),
-        Span::styled(
-            format!("${:.2}", cost),
-            Style::default().fg(rgb(180, 180, 190)).bold(),
-        ),
-        Span::styled(" est. API cost", Style::default().fg(rgb(120, 120, 130))),
-    ]))
 }
 
 fn render_labeled_bar(
@@ -211,11 +195,37 @@ fn render_labeled_bar(
         rgb(100, 200, 100)
     };
 
-    let label_width = 7;
-    let suffix_width = 10;
-    let bar_width = width
-        .saturating_sub(label_width + 1 + suffix_width)
-        .clamp(4, 12) as usize;
+    const LABEL_WIDTH: usize = 7;
+    const MIN_BAR_WIDTH: usize = 4;
+
+    let full_suffix = match reset_time {
+        Some(reset) if left_pct == 0 => format!(" resets {}", reset),
+        Some(reset) => format!(" {}% left · {}", left_pct, reset),
+        None => format!(" {}% left", left_pct),
+    };
+    // On narrow widgets keep the reset visible and progressively shorten the
+    // percentage wording before sacrificing the bar. The exhausted wording is
+    // already compact and remains unchanged.
+    let suffix = match reset_time {
+        Some(reset) if left_pct > 0 => {
+            let compact = format!(" {}% · {}", left_pct, reset);
+            let reset_only = format!(" · {}", reset);
+            let budget = usize::from(width).saturating_sub(LABEL_WIDTH + MIN_BAR_WIDTH);
+            if UnicodeWidthStr::width(full_suffix.as_str()) <= budget {
+                full_suffix
+            } else if UnicodeWidthStr::width(compact.as_str()) <= budget {
+                compact
+            } else {
+                reset_only
+            }
+        }
+        _ => full_suffix,
+    };
+    let suffix_width = UnicodeWidthStr::width(suffix.as_str());
+    let label_width = LABEL_WIDTH.min(usize::from(width).saturating_sub(suffix_width));
+    let bar_width = usize::from(width)
+        .saturating_sub(label_width + suffix_width)
+        .min(12);
 
     let filled = ((used_pct as f32 / 100.0) * bar_width as f32).round() as usize;
     let empty = bar_width.saturating_sub(filled);
@@ -223,17 +233,8 @@ fn render_labeled_bar(
     let bar_filled = "▰".repeat(filled);
     let bar_empty = "▱".repeat(empty);
 
-    let suffix = if left_pct == 0 {
-        if let Some(reset) = reset_time {
-            format!(" resets {}", reset)
-        } else {
-            " 0% left".to_string()
-        }
-    } else {
-        format!(" {}% left", left_pct)
-    };
-
-    let padded_label = format!("{:<7}", label);
+    let visible_label: String = label.chars().take(label_width).collect();
+    let padded_label = format!("{visible_label:<label_width$}");
 
     Line::from(vec![
         Span::styled(padded_label, Style::default().fg(rgb(140, 140, 150))),
@@ -241,6 +242,63 @@ fn render_labeled_bar(
         Span::styled(bar_empty, Style::default().fg(rgb(50, 50, 60))),
         Span::styled(suffix, Style::default().fg(color)),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn usage_bar_shows_reset_countdown_before_exhaustion() {
+        let text = line_text(&render_labeled_bar("5-hour", 38, 62, Some("4h 5m"), 40));
+
+        assert!(text.contains("62% left · 4h 5m"));
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 40);
+    }
+
+    #[test]
+    fn usage_bar_keeps_countdown_within_narrow_width() {
+        let text = line_text(&render_labeled_bar("Weekly", 19, 81, Some("1d 4h"), 23));
+
+        assert!(text.contains("81% · 1d 4h"));
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 23);
+        assert!(text.contains('▰') || text.contains('▱'));
+    }
+
+    #[test]
+    fn exhausted_usage_bar_preserves_resets_wording_and_width() {
+        let text = line_text(&render_labeled_bar("5-hour", 100, 0, Some("12m"), 24));
+
+        assert!(text.contains("resets 12m"));
+        assert!(!text.contains("0% left"));
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 24);
+    }
+
+    #[test]
+    fn openai_monthly_usage_renders_only_the_reported_window() {
+        let info = UsageInfo {
+            provider: UsageProvider::OpenAI,
+            primary_limit_label: Some("Monthly".to_string()),
+            five_hour: 1.0,
+            available: true,
+            ..Default::default()
+        };
+
+        let lines = render_usage_compact(&info, 40);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("Monthly"));
+        assert!(!text.contains("5-hour"));
+        assert!(!text.contains("Weekly"));
+        assert_eq!(lines.len(), 2); // Provider label plus one quota bar.
+    }
 }
 
 pub(super) fn render_usage_pill(

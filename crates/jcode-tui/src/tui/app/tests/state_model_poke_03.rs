@@ -37,8 +37,8 @@ fn test_model_picker_preview_arrow_keys_navigate() {
     assert!(picker.preview, "should remain in preview mode");
     assert_eq!(picker.selected, initial_selected);
 
-    // Input should be preserved
-    assert_eq!(app.input(), "/model");
+    // Opening the preview should place the cursor in the model filter argument.
+    assert_eq!(app.input(), "/model ");
 }
 
 #[test]
@@ -604,7 +604,7 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
         "JCODE_OPENROUTER_DYNAMIC_BEARER_PROVIDER",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]);
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
@@ -669,12 +669,13 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
     let mut saw_saved = false;
     let mut saw_catalog_started = false;
     let mut saw_activation = false;
+    let mut saw_catalog_ready = false;
     let mut login_success_events = 0;
     let mut login_failure_events = 0;
     let mut catalog_warning_events = 0;
     let mut activation_events = 0;
     rt.block_on(async {
-        while !(saw_saved && saw_catalog_started && saw_activation) {
+        while !(saw_saved && saw_catalog_started && saw_activation && saw_catalog_ready) {
             match tokio::time::timeout(Duration::from_secs(2), bus_rx.recv()).await {
                 Ok(Ok(crate::bus::BusEvent::LoginCompleted(login))) => {
                     if login.success {
@@ -734,6 +735,10 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
                     super::local::handle_bus_event(&mut app, Ok(event));
                     saw_activation = true;
                 }
+                Ok(Ok(event @ crate::bus::BusEvent::AuthCatalogRefreshReady)) => {
+                    super::local::handle_bus_event(&mut app, Ok(event));
+                    saw_catalog_ready = true;
+                }
                 Ok(Ok(_)) => {}
                 other => panic!("expected local Cerebras auth lifecycle event, got {other:?}"),
             }
@@ -772,6 +777,9 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
                 assert_eq!(model, "qwen-3-235b-a22b-instruct-2507");
                 assert_eq!(provider_key.as_deref(), Some("cerebras"));
                 assert!(message.contains("Cerebras is ready."), "{message}");
+            }
+            event @ crate::bus::BusEvent::AuthCatalogRefreshReady => {
+                super::local::handle_bus_event(&mut app, Ok(event));
             }
             _ => {}
         }
@@ -877,6 +885,15 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
             && route.api_method == "openai-compatible:cerebras"
             && route.available
     }));
+    let llama_cerebras_option = llama_entry
+        .options
+        .iter()
+        .position(|route| {
+            route.provider == "Cerebras"
+                && route.api_method == "openai-compatible:cerebras"
+                && route.available
+        })
+        .expect("alternate model should expose its authenticated Cerebras route");
     assert!(
         !llama_entry
             .options
@@ -890,8 +907,11 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
         .position(|&idx| idx == llama_idx)
         .expect("alternate Cerebras model should be selectable in filtered picker list");
 
-    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
-    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+    let picker = app.inline_interactive_state.as_mut().unwrap();
+    picker.selected = filtered_pos;
+    picker.entries[llama_idx].selected_option = llama_cerebras_option;
+    picker.column = picker.max_navigable_column();
+    app.handle_inline_interactive_key(KeyCode::Enter, KeyModifiers::empty())
         .expect("Cerebras picker selection should switch models");
 
     assert_eq!(app.session.model.as_deref(), Some("llama3.1-8b"));
@@ -1107,12 +1127,14 @@ fn test_model_picker_state_space_preserves_provider_labels_after_route_hydration
         );
     }
 
+    // Models with reasoning-effort support expand into effort rows (issue
+    // #458); the hydrated route must be preserved on each variant.
     assert_eq!(
-        routes_by_model.get("gpt-5.5"),
+        routes_by_model.get("gpt-5.5 (high)"),
         Some(&("OpenAI".to_string(), "openai-oauth".to_string()))
     );
     assert_eq!(
-        routes_by_model.get("claude-opus-4-6"),
+        routes_by_model.get("claude-opus-4-6 (high)"),
         Some(&("Anthropic".to_string(), "claude-oauth".to_string()))
     );
     assert_eq!(
@@ -1120,7 +1142,7 @@ fn test_model_picker_state_space_preserves_provider_labels_after_route_hydration
         Some(&("Chutes".to_string(), "openai-compatible:chutes".to_string()))
     );
     assert_eq!(
-        routes_by_model.get("deepseek/deepseek-v4-pro"),
+        routes_by_model.get("deepseek/deepseek-v4-pro (high)"),
         Some(&("auto".to_string(), "openrouter".to_string()))
     );
 
@@ -1243,6 +1265,91 @@ fn test_login_completed_spawns_auth_refresh_when_runtime_is_available() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn test_model_picker_waits_for_async_post_login_catalog_activation() {
+    ensure_test_jcode_home_if_unset();
+    clear_persisted_test_ui_state();
+    crate::tui::ui::clear_test_render_state_for_tests();
+
+    let logged_in = StdArc::new(StdMutex::new(false));
+    let provider: Arc<dyn Provider> = Arc::new(AuthRefreshingMockProvider {
+        logged_in: StdArc::clone(&logged_in),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
+    let mut app = App::new_for_test_harness(provider, registry);
+    let mut bus_rx = crate::bus::Bus::global().subscribe();
+
+    {
+        let _guard = rt.enter();
+        app.handle_login_completed(crate::bus::LoginCompleted {
+            provider: "auto-import".to_string(),
+            success: true,
+            message: "Imported existing logins".to_string(),
+        });
+        app.open_model_picker();
+    }
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("loading model picker should be open");
+    assert_eq!(picker.entries.len(), 1);
+    assert!(
+        picker.entries[0].options[0]
+            .detail
+            .contains("updating model list")
+    );
+    // The single loading row labels the *current* model (which may legitimately
+    // still be the pre-import one until async activation lands), so check the
+    // route metadata: the stale pre-import catalog route must not be shown as a
+    // selectable ready entry.
+    assert!(
+        !picker
+            .entries
+            .iter()
+            .flat_map(|entry| entry.options.iter())
+            .any(|option| option.api_method == "openai-oauth"),
+        "the stale pre-import catalog must not be presented as ready"
+    );
+
+    let ready = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = bus_rx.recv().await.expect("auth catalog event");
+                if matches!(event, crate::bus::BusEvent::AuthCatalogRefreshReady) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("post-login activation should finish")
+    });
+    assert!(crate::tui::app::local::handle_bus_event(
+        &mut app,
+        Ok(ready)
+    ));
+    assert!(*logged_in.lock().unwrap());
+    wait_for_model_picker_load(&mut app);
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("model picker should refresh in place");
+    assert!(
+        picker
+            .entries
+            .iter()
+            .any(|entry| entry.name == "claude-opus-4.6")
+    );
+    assert!(
+        picker
+            .entries
+            .iter()
+            .any(|entry| entry.name == "grok-code-fast-1")
+    );
 }
 
 #[test]
@@ -1404,7 +1511,7 @@ fn test_azure_login_completion_switches_local_model_without_completion() {
         "JCODE_OPENROUTER_MODEL",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
-        "JCODE_FORCE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
     ]);
     crate::env::set_var("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com");
     crate::env::set_var("AZURE_OPENAI_MODEL", "azure-deployment");
@@ -1426,6 +1533,14 @@ fn test_azure_login_completion_switches_local_model_without_completion() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
     let mut app = App::new_for_test_harness(provider, registry);
+    // This test asserts the login-completed status notice; a brand-new-install
+    // classification would let first-run onboarding overwrite it with the
+    // StartChoice prompt. Pre-commit the onboarding guard so the flow never
+    // starts.
+    app.onboarding_startup_checked = true;
+    app.onboarding_flow = Some(crate::tui::app::onboarding_flow::OnboardingFlow {
+        phase: crate::tui::app::onboarding_flow::OnboardingPhase::Done,
+    });
     app.queue_mode = false;
     app.diff_mode = crate::config::DiffDisplayMode::Inline;
     app.provider_session_id = Some("stale-upstream".to_string());
@@ -1575,59 +1690,117 @@ fn test_agent_model_picker_openrouter_bare_openai_route_saves_openai_catalog_pre
 #[test]
 fn test_local_model_picker_render_shows_antigravity_models_exactly_as_user_sees_them() {
     let mut app = create_antigravity_picker_test_app();
-    let text = render_model_picker_text(&mut app, 90, 12);
+    app.display_messages = vec![DisplayMessage::system("seed render state")];
+    app.bump_display_messages_version();
+    app.open_model_picker();
+    wait_for_model_picker_load(&mut app);
+
+    let render_filtered = |app: &mut App, filter: &str| {
+        let picker = app
+            .inline_interactive_state
+            .as_mut()
+            .expect("model picker should be open");
+        picker.filter = filter.to_string();
+        App::apply_inline_interactive_filter(picker);
+        let _render_lock = scroll_render_test_lock();
+        let backend = ratatui::backend::TestBackend::new(90, 14);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("failed to create test terminal");
+        render_and_snap(app, &mut terminal)
+    };
+    let claude_text = render_filtered(&mut app, "claude-sonnet-4-6");
+    let gpt_text = render_filtered(&mut app, "gpt-oss-120b-medium");
 
     assert!(
-        text.contains("MODEL") && text.contains("PROVIDER") && text.contains("METHOD"),
+        claude_text.contains("MODEL")
+            && claude_text.contains("PROVIDER")
+            && claude_text.contains("METHOD"),
         "rendered /model view should include picker columns, got:
 {}",
-        text
+        claude_text
     );
     assert!(
-        text.contains("claude-sonnet-4-6"),
+        claude_text.contains("Claude Sonnet 4.6"),
         "rendered /model view should show the Antigravity Claude row, got:
 {}",
-        text
+        claude_text
     );
     assert!(
-        text.contains("gpt-oss-120b-medium"),
+        gpt_text.contains("gpt-oss-120b-medium"),
         "rendered /model view should show the Antigravity GPT row, got:
 {}",
-        text
+        gpt_text
     );
     assert!(
-        text.contains("Antigravity"),
+        claude_text.contains("Antigravity") && gpt_text.contains("Antigravity"),
         "rendered /model view should show the Antigravity provider column, got:
+Claude:
+{}
+GPT:
 {}",
-        text
+        claude_text,
+        gpt_text
     );
     assert!(
-        text.contains("cli"),
+        claude_text.contains("cli") && gpt_text.contains("cli"),
         "rendered /model view should show the route transport column, got:
+Claude:
+{}
+GPT:
 {}",
-        text
+        claude_text,
+        gpt_text
     );
 }
 
 #[test]
 fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
     let mut app = create_login_smoke_model_app();
-    let text = render_model_picker_text(&mut app, 110, 18);
+    app.display_messages = vec![DisplayMessage::system("seed render state")];
+    app.bump_display_messages_version();
+    app.open_model_picker();
+    wait_for_model_picker_load(&mut app);
+
+    let render_filtered = |app: &mut App, filter: &str| {
+        let picker = app
+            .inline_interactive_state
+            .as_mut()
+            .expect("model picker should be open");
+        picker.filter = filter.to_string();
+        App::apply_inline_interactive_filter(picker);
+        let _render_lock = scroll_render_test_lock();
+        let backend = ratatui::backend::TestBackend::new(180, 48);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("failed to create test terminal");
+        render_and_snap(app, &mut terminal)
+    };
+
+    // Effort-capable routes now expand into multiple rows. Render focused
+    // slices so each provider remains observable without assuming the complete
+    // catalog fits in one terminal viewport.
+    let openai_text = render_filtered(&mut app, "gpt-5.4");
+    let comtegra_text = render_filtered(&mut app, "glm-51-nvfp4");
+    let copilot_text = render_filtered(&mut app, "claude-opus-4.6");
+    let deepseek_text = render_filtered(&mut app, "deepseek/deepseek-v4-pro");
+    let kimi_text = render_filtered(&mut app, "moonshotai/kimi-k2.5");
+    let openrouter_openai_text = render_filtered(&mut app, "openai/gpt-5.5");
 
     assert!(
-        text.contains("MODEL") && text.contains("PROVIDER") && text.contains("METHOD"),
+        openai_text.contains("MODEL")
+            && openai_text.contains("PROVIDER")
+            && openai_text.contains("METHOD"),
         "rendered /model view should include user-visible picker columns, got:\n{}",
-        text
+        openai_text
     );
     assert!(
-        text.contains("gpt-5.4")
-            && text.contains("OpenAI")
-            && text.contains("oauth")
-            && text.contains("api key"),
+        openai_text.contains("GPT-5.4")
+            && openai_text.contains("OpenAI")
+            && openai_text.contains("oauth")
+            && openai_text.contains("api key"),
         "OpenAI OAuth and API-key routes should be separately visible, got:\n{}",
-        text
+        openai_text
     );
-    let glm_row = text
+    let glm_row = comtegra_text
         .lines()
         .find(|line| line.contains("glm-51-nvfp4"))
         .unwrap_or("");
@@ -1637,30 +1810,31 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
             && !glm_row.contains("copilot"),
         "Comtegra GLM row should show its provider and API-key method, got row `{}` in:\n{}",
         glm_row,
-        text
+        comtegra_text
     );
     assert!(
-        text.contains("glm-51-nvfp4")
-            && text.contains("Comtegra GPU Cloud")
-            && text.contains("new"),
+        comtegra_text.contains("glm-51-nvfp4")
+            && comtegra_text.contains("Comtegra GPU Cloud")
+            && comtegra_text.contains("new"),
         "Comtegra login route should be visible and marked new, got:\n{}",
-        text
+        comtegra_text
     );
     assert!(
-        text.contains("claude-opus-4.6") && text.contains("Copilot"),
+        copilot_text.contains("Claude Opus 4.6") && copilot_text.contains("Copilot"),
         "Copilot route should be visible, got:\n{}",
-        text
+        copilot_text
     );
     assert!(
-        text.contains("deepseek/deepseek-v4-pro") && text.contains("openrouter"),
+        deepseek_text.contains("deepseek/deepseek-v4-pro")
+            && deepseek_text.contains("openrouter"),
         "OpenRouter route should be visible, got:\n{}",
-        text
+        deepseek_text
     );
-    let deepseek_auto_row = text
+    let deepseek_auto_row = deepseek_text
         .lines()
         .find(|line| line.contains("deepseek/deepseek-v4-pro") && line.contains("auto"))
         .unwrap_or("");
-    let deepseek_provider_row = text
+    let deepseek_provider_row = deepseek_text
         .lines()
         .find(|line| line.contains("deepseek/deepseek-v4-pro") && line.contains("DeepSeek"))
         .unwrap_or("");
@@ -1668,15 +1842,15 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
         !deepseek_auto_row.contains('★'),
         "OpenRouter auto route should not carry the recommended marker, got row `{}` in:\n{}",
         deepseek_auto_row,
-        text
+        deepseek_text
     );
     assert!(
         !deepseek_provider_row.contains('★'),
         "OpenRouter provider-specific routes should not carry the recommended marker, got row `{}` in:\n{}",
         deepseek_provider_row,
-        text
+        deepseek_text
     );
-    let kimi25_row = text
+    let kimi25_row = kimi_text
         .lines()
         .find(|line| line.contains("moonshotai/kimi-k2.5"))
         .unwrap_or("");
@@ -1684,18 +1858,34 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
         !kimi25_row.contains('★'),
         "Kimi K2.5 should not be recommended, got row `{}` in:\n{}",
         kimi25_row,
-        text
+        kimi_text
     );
+    let openrouter_openai_row = openrouter_openai_text
+        .lines()
+        .find(|line| line.contains("openai/gpt-5.5"))
+        .unwrap_or("");
     assert!(
-        text.contains("openai/gpt-5.5") && text.contains("OpenRouter/OpenAI"),
-        "OpenRouter endpoint routes should not look like native OpenAI API-key rows, got:\n{}",
-        text
+        openrouter_openai_row.contains("OpenRou")
+            && openrouter_openai_row.contains("openrouter")
+            && !openrouter_openai_row.contains("api key"),
+        "OpenRouter endpoint routes should not look like native OpenAI API-key rows, got row `{}` in:\n{}",
+        openrouter_openai_row,
+        openrouter_openai_text
     );
-    assert!(
-        !text.contains("(2)"),
-        "provider routes should not be hidden behind stacked option counts, got:\n{}",
-        text
-    );
+    for text in [
+        &openai_text,
+        &comtegra_text,
+        &copilot_text,
+        &deepseek_text,
+        &kimi_text,
+        &openrouter_openai_text,
+    ] {
+        assert!(
+            !text.contains("(2)"),
+            "provider routes should not be hidden behind stacked option counts, got:\n{}",
+            text
+        );
+    }
 }
 
 #[test]
@@ -1779,6 +1969,93 @@ fn test_login_picker_preview_enter_starts_login_flow() {
 }
 
 #[test]
+fn test_typing_login_auto_inserts_filter_space() {
+    let mut app = create_test_app();
+
+    for c in "/login".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+
+    // The trailing space arms provider filtering immediately, so the next
+    // keystrokes filter the login picker instead of extending the command.
+    assert_eq!(app.input(), "/login ");
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("login picker preview should be open");
+    assert!(picker.preview);
+    assert_eq!(picker.kind, crate::tui::PickerKind::Login);
+    assert_eq!(picker.filter, "");
+
+    // A habitual manually-typed space is swallowed instead of doubling up.
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::empty())
+        .unwrap();
+    assert_eq!(app.input(), "/login ");
+
+    for c in "za".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    assert_eq!(app.input(), "/login za");
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("login picker preview should stay open");
+    assert_eq!(picker.filter, "za");
+}
+
+#[test]
+fn test_login_preview_enter_without_selection_focuses_picker_instead_of_logging_in() {
+    let mut app = create_test_app();
+
+    for c in "/login".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    // No filter and no explicit selection: Enter must not launch the first
+    // provider's login flow. It focuses the picker for a deliberate choice.
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("login picker should stay open after bare Enter");
+    assert!(!picker.preview, "picker should be focused (not preview)");
+    assert_eq!(picker.kind, crate::tui::PickerKind::Login);
+    assert!(app.pending_login.is_none());
+    assert_eq!(app.input(), "");
+}
+
+#[test]
+fn test_login_preview_enter_after_navigation_starts_selected_login() {
+    let mut app = create_test_app();
+
+    for c in "/login".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    // Explicit navigation makes the selection deliberate, so Enter activates.
+    // Navigate to the Anthropic API key row (an offline api-key prompt flow).
+    app.handle_key(KeyCode::Down, KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Down, KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(
+        app.inline_interactive_state.is_none(),
+        "picker should close after selecting a provider"
+    );
+    assert!(
+        app.pending_login.is_some(),
+        "selected provider login flow should start"
+    );
+}
+
+#[test]
 fn test_subagent_model_command_sets_and_resets_session_preference() {
     let mut app = create_test_app();
 
@@ -1858,6 +2135,7 @@ fn test_poke_arms_auto_poke_until_todos_are_done() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Finish the remaining task".to_string(),
                 status: "pending".to_string(),
@@ -1866,6 +2144,7 @@ fn test_poke_arms_auto_poke_until_todos_are_done() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1875,7 +2154,7 @@ fn test_poke_arms_auto_poke_until_todos_are_done() {
         assert!(app.auto_poke_incomplete_todos);
         assert!(app.pending_turn);
         assert!(app.display_messages().iter().any(|msg| {
-            msg.content.contains("Poking model: 1 incomplete todo")
+            msg.content.contains("1 incomplete todo. We poked the agent")
                 && msg.content.contains("/poke off")
         }));
     });
@@ -1888,6 +2167,7 @@ fn test_poke_status_reports_current_state() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Finish the remaining task".to_string(),
                 status: "pending".to_string(),
@@ -1896,6 +2176,7 @@ fn test_poke_status_reports_current_state() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1940,6 +2221,7 @@ fn test_poke_off_disarms_and_clears_queued_followup() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Keep going".to_string(),
                 status: "pending".to_string(),
@@ -1948,6 +2230,7 @@ fn test_poke_off_disarms_and_clears_queued_followup() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1987,6 +2270,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Finish the remaining task".to_string(),
                 status: "pending".to_string(),
@@ -1995,6 +2279,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -2014,13 +2299,14 @@ fn test_poke_queues_when_turn_is_in_progress() {
         assert!(app.queued_messages().is_empty());
         assert!(app.display_messages().iter().any(|msg| {
             msg.content
-                .contains("/poke queued. Re-checking incomplete todos after this turn")
+                .contains("Poke queued. We'll re-check for unfinished todos after this turn")
         }));
 
         crate::todo::save_todos(
             &app.session.id,
             &[
                 crate::todo::TodoItem {
+                    group: None,
                     id: "todo-1".to_string(),
                     content: "Finish the remaining task".to_string(),
                     status: "pending".to_string(),
@@ -2029,8 +2315,10 @@ fn test_poke_queues_when_turn_is_in_progress() {
                     assigned_to: None,
                     confidence: None,
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
                 crate::todo::TodoItem {
+                    group: None,
                     id: "todo-2".to_string(),
                     content: "Pick up the newly discovered task".to_string(),
                     status: "pending".to_string(),
@@ -2039,6 +2327,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
                     assigned_to: None,
                     confidence: None,
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
             ],
         )
@@ -2055,7 +2344,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
 }
 
 #[test]
-fn test_btw_does_not_present_as_queued_when_turn_is_in_progress() {
+fn test_btw_forks_even_when_turn_is_in_progress() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
         app.is_processing = true;
@@ -2065,19 +2354,13 @@ fn test_btw_does_not_present_as_queued_when_turn_is_in_progress() {
             "/btw should this fork context?"
         ));
 
-        assert!(app.is_processing);
-        assert_eq!(app.status_notice(), Some("/btw noted".to_string()));
+        assert!(app.is_processing, "parent turn should keep running");
         assert!(app.queued_messages().is_empty());
-        assert_eq!(app.hidden_queued_system_messages.len(), 1);
+        assert!(app.hidden_queued_system_messages.is_empty());
         assert!(app.display_messages().iter().any(|msg| {
-            msg.content
-                .contains("/btw noted - answer will appear in the side panel.")
+            msg.content.contains("created for the next prompt")
+                || msg.content.contains("Next prompt launched in")
         }));
-        assert!(
-            !app.display_messages()
-                .iter()
-                .any(|msg| { msg.content.to_ascii_lowercase().contains("queued /btw") })
-        );
     });
 }
 
@@ -2088,6 +2371,7 @@ fn test_finish_turn_auto_pokes_again_when_todos_remain() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Keep going".to_string(),
                 status: "in_progress".to_string(),
@@ -2096,6 +2380,7 @@ fn test_finish_turn_auto_pokes_again_when_todos_remain() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -2118,6 +2403,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
             &app.session.id,
             &[
                 crate::todo::TodoItem {
+                    group: None,
                     id: "todo-1".to_string(),
                     content: "Finish risky provider path".to_string(),
                     status: "completed".to_string(),
@@ -2126,8 +2412,10 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
                     assigned_to: None,
                     confidence: Some(70),
                     completion_confidence: Some(80),
+                    confidence_history: Vec::new(),
                 },
                 crate::todo::TodoItem {
+                    group: None,
                     id: "todo-2".to_string(),
                     content: "Document straightforward behavior".to_string(),
                     status: "completed".to_string(),
@@ -2136,6 +2424,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
                     assigned_to: None,
                     confidence: Some(90),
                     completion_confidence: Some(95),
+                    confidence_history: Vec::new(),
                 },
             ],
         )
@@ -2145,28 +2434,144 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         app.is_processing = true;
         super::local::finish_turn(&mut app);
 
-        assert!(!app.auto_poke_incomplete_todos);
+        assert!(app.auto_poke_incomplete_todos);
         assert!(app.pending_queued_dispatch);
-        assert!(app.queued_messages().is_empty());
-        assert_eq!(app.hidden_queued_system_messages.len(), 1);
-        let summary = &app.hidden_queued_system_messages[0];
+        assert_eq!(app.queued_messages.len(), 1);
+        let summary = app.queued_messages[0].clone();
+        let summary = &summary;
         assert!(super::commands::is_poke_message(summary));
         assert!(super::commands::is_todo_confidence_summary_message(summary));
-        assert!(summary.starts_with("All todos are done. Todo confidence summary:"));
-        assert!(summary.contains("\n- Completed todos: 2."));
-        assert!(summary.contains("\n- Weighted completion confidence: 86%."));
-        assert!(summary.contains("\n- Confidence threshold: 90%."));
-        assert!(summary.contains("\n- Weighted planning confidence: 78%."));
-        assert!(summary.contains("\n- Lowest completed todo confidence: 80%."));
+        assert_eq!(summary, crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE);
+        assert!(!summary.chars().any(|ch| ch.is_ascii_digit()));
+        assert!(summary.contains("completion confidence"));
+        // The continuation self-identifies as an automated gate so the model
+        // does not mistake it for a user message, but never discloses the
+        // numeric threshold.
+        assert!(summary.contains("automated todo completion gate"));
+        assert!(!summary.to_ascii_lowercase().contains("threshold"));
         assert!(!summary.contains("Finish risky provider path"));
-        assert!(!summary.contains("Confidence meets the threshold"));
-        assert!(summary.contains("1 completed todo is below the 90% confidence threshold"));
-        assert!(summary.contains("\n- Suggested action: validate or test before finalizing."));
         assert!(
             app.display_messages()
                 .iter()
-                .any(|msg| msg.content.contains("queued hidden confidence reminder"))
+                .any(|msg| msg.content.contains(
+                    "marked its work done without strong enough validation"
+                ))
         );
+
+        // Dispatching the follow-up does not disarm the gate. If the model
+        // finishes another turn without improving completion confidence, the
+        // same validation follow-up is queued again.
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        app.is_processing = true;
+        super::local::finish_turn(&mut app);
+        assert!(app.auto_poke_incomplete_todos);
+        assert!(app.pending_queued_dispatch);
+        assert_eq!(app.queued_messages.len(), 1);
+
+        // Once the model records sufficient completion confidence through the
+        // todo tool, the next completion check passes and disarms auto-poke.
+        let mut validated = crate::todo::load_todos(&app.session.id).expect("load todos");
+        for todo in &mut validated {
+            todo.completion_confidence = Some(100);
+            todo.confidence_history = match todo.id.as_str() {
+                "todo-1" => vec![70, 80, 90, 100],
+                _ => vec![90, 100],
+            };
+        }
+        crate::todo::save_todos(&app.session.id, &validated).expect("save validated todos");
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        app.is_processing = true;
+        super::local::finish_turn(&mut app);
+        assert!(!app.auto_poke_incomplete_todos);
+        assert!(!app.pending_queued_dispatch);
+        assert!(app.queued_messages.is_empty());
+        assert!(app.hidden_queued_system_messages.is_empty());
+        assert!(app.display_messages().iter().any(|msg| {
+            msg.content
+                .contains("All todos done. Completion confidence: 100%.")
+        }));
+    });
+}
+
+#[test]
+fn test_todo_completion_gate_detects_abrupt_confidence_increase() {
+    let summary = super::commands::todo_confidence_summary(&[crate::todo::TodoItem {
+        status: "completed".to_string(),
+        priority: "high".to_string(),
+        confidence: Some(0),
+        completion_confidence: Some(100),
+        confidence_history: vec![0, 100],
+        ..Default::default()
+    }]);
+
+    assert_eq!(summary.completion_average, Some(100));
+    assert!(!summary.completion_confidence_needs_validation);
+    assert!(summary.confidence_spike_detected);
+    assert!(summary.needs_more_work);
+}
+
+#[test]
+fn test_todo_completion_gate_allows_evidence_backed_confidence_steps() {
+    let summary = super::commands::todo_confidence_summary(&[crate::todo::TodoItem {
+        status: "completed".to_string(),
+        priority: "high".to_string(),
+        confidence: Some(100),
+        completion_confidence: Some(100),
+        confidence_history: vec![70, 80, 90, 100],
+        ..Default::default()
+    }]);
+
+    assert_eq!(summary.completion_average, Some(100));
+    assert!(!summary.completion_confidence_needs_validation);
+    assert!(!summary.confidence_spike_detected);
+    assert!(!summary.needs_more_work);
+}
+
+#[test]
+fn test_finish_turn_challenges_confidence_spike_once() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                id: "todo-1".to_string(),
+                content: "Validate provider result".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                confidence: Some(100),
+                completion_confidence: Some(100),
+                confidence_history: vec![70, 100],
+                ..Default::default()
+            }],
+        )
+        .expect("save todos");
+
+        app.auto_poke_incomplete_todos = true;
+        app.is_processing = true;
+        super::local::finish_turn(&mut app);
+
+        assert!(app.auto_poke_incomplete_todos);
+        assert!(app.todo_confidence_spike_challenged);
+        assert!(app.pending_queued_dispatch);
+        assert_eq!(
+            app.queued_messages,
+            vec![crate::todo::TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE]
+        );
+        assert!(app.display_messages().iter().any(|msg| {
+            msg.content
+                .contains("confidence jumped suddenly")
+        }));
+
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        app.is_processing = true;
+        super::local::finish_turn(&mut app);
+
+        assert!(!app.auto_poke_incomplete_todos);
+        assert!(!app.todo_confidence_spike_challenged);
+        assert!(!app.pending_queued_dispatch);
     });
 }
 
@@ -2191,6 +2596,7 @@ fn test_finish_turn_without_auto_poke_does_not_queue_confidence_summary() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Done without poke".to_string(),
                 status: "completed".to_string(),
@@ -2199,6 +2605,7 @@ fn test_finish_turn_without_auto_poke_does_not_queue_confidence_summary() {
                 assigned_to: None,
                 confidence: Some(90),
                 completion_confidence: Some(90),
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -2224,6 +2631,7 @@ fn test_finish_turn_auto_poke_preserves_visible_turn_started() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Keep going".to_string(),
                 status: "in_progress".to_string(),
@@ -2232,6 +2640,7 @@ fn test_finish_turn_auto_poke_preserves_visible_turn_started() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");

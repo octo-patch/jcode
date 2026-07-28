@@ -1,5 +1,47 @@
 use super::*;
 
+/// Largest byte index `<= index` that is a UTF-8 char boundary in `text`.
+/// Equivalent to the unstable `str::floor_char_boundary`, reimplemented so the
+/// incremental marker scan can clamp its scan-window start onto a valid
+/// boundary without re-scanning the whole accumulated response.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut boundary = index;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+/// The wrapped-tool-call markers emitted by some models inside plain text.
+const WRAP_TOOL_MARKERS: [&str; 2] = ["to=functions.", "+#+#"];
+
+/// Find the first wrapped-tool-call marker in `accumulated`, scanning only the
+/// newly appended `delta` plus a short overlap from the previous tail (so a
+/// marker straddling the append boundary is still found).
+///
+/// This avoids re-scanning the entire accumulated response on every streamed
+/// delta, which was O(response) per token and O(response^2) over a full answer.
+fn find_wrap_marker_incremental(accumulated: &str, appended_len: usize) -> Option<usize> {
+    let max_marker_len = WRAP_TOOL_MARKERS
+        .iter()
+        .map(|marker| marker.len())
+        .max()
+        .unwrap_or(0);
+    let scan_start = accumulated
+        .len()
+        .saturating_sub(appended_len + max_marker_len.saturating_sub(1));
+    let scan_start = floor_char_boundary(accumulated, scan_start);
+    let window = &accumulated[scan_start..];
+    WRAP_TOOL_MARKERS
+        .iter()
+        .filter_map(|marker| window.find(marker))
+        .min()
+        .map(|rel_idx| scan_start + rel_idx)
+}
+
 fn reload_interrupted_tool_result(tc: &ToolCall, elapsed_secs: f64) -> (String, bool) {
     if tc.name == "selfdev" {
         return ("Reload initiated. Process restarting...".to_string(), false);
@@ -10,8 +52,8 @@ fn reload_interrupted_tool_result(tc: &ToolCall, elapsed_secs: f64) -> (String, 
         .get("action")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    let is_wait_like =
-        (tc.name == "bg" && action == "wait") || (tc.name == "swarm" && action == "await_members");
+    let is_wait_like = (tc.name == "bg" && action == "wait")
+        || (tc.name == "swarm" && matches!(action, "await_members" | "run_plan"));
 
     if is_wait_like {
         let input = serde_json::to_string(&tc.input).unwrap_or_else(|_| "{}".to_string());
@@ -39,6 +81,17 @@ impl Agent {
         event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<()> {
         self.set_log_context();
+        // Mark this session as actively streaming for presence UIs (e.g. the
+        // macOS menu bar indicator). Cleared automatically on every exit path.
+        let _streaming_guard = crate::session::StreamingGuard::new(self.session.id.clone());
+        // Register this turn's cancel signal in the process-global registry so
+        // a cancel routed through *any* control handle for this session (even a
+        // stale one built for a different agent object, e.g. after a
+        // reattach/reload) aborts this in-flight stream immediately (issue #428).
+        let _turn_cancel_guard = crate::turn_cancel_registry::register_active_turn(
+            &self.session.id,
+            self.graceful_shutdown.clone(),
+        );
         let trace = trace_enabled();
         let mut context_limit_retries = 0u32;
         let mut incomplete_continuations = 0u32;
@@ -98,6 +151,11 @@ impl Agent {
             // false-positive violations every turn (prior turn's memory ≠ current history prefix).
             self.record_client_cache_request(&messages);
 
+            // `messages` now owns the provider-facing request snapshot. Do not
+            // retain the session's second, derived copy for the entire network
+            // wait and response stream.
+            self.session.release_provider_messages_cache();
+
             let mut cache_signature_messages =
                 if crate::config::config().features.message_timestamps {
                     Message::with_timestamps(&messages)
@@ -140,14 +198,20 @@ impl Agent {
             ));
             let api_start = Instant::now();
 
-            let stamped;
-            let send_messages: &[Message] = if crate::config::config().features.message_timestamps {
-                stamped = Message::with_timestamps(&messages_with_memory);
-                &stamped
-            } else {
-                &messages_with_memory
-            };
+            let stamped = crate::config::config()
+                .features
+                .message_timestamps
+                .then(|| Message::with_timestamps(&messages_with_memory));
+            let send_messages = stamped.as_deref().unwrap_or(&messages_with_memory);
             let provider = Arc::clone(&self.provider);
+            // Capture the model id the request was issued with. A provider may
+            // transparently switch models mid-request (e.g. Anthropic's retired
+            // `claude-fable-5` falls back to `claude-opus-4-8`). When that
+            // happens the provider mutates its own model state, but the session
+            // and clients still believe they are on the originally requested
+            // model. Compare against this after the stream so we can emit a
+            // `ModelChanged` and resync the UI/context-limit.
+            let model_at_request_start = provider.model().to_string();
             let resume_session_id = self.provider_session_id.clone();
             self.last_status_detail = None;
             let _ = event_tx.send(kv_cache_request_event(
@@ -156,6 +220,11 @@ impl Agent {
                 &split_prompt.static_part,
                 &ephemeral_signature_messages,
             ));
+            // These vectors are only needed to build the cache telemetry event.
+            // Explicitly release their deeply cloned transcript strings before
+            // waiting for the provider stream.
+            drop(cache_signature_messages);
+            drop(ephemeral_signature_messages);
             let mut keepalive = stream_keepalive_ticker();
             let mut stream = {
                 let mut complete_future = std::pin::pin!(provider.complete_split(
@@ -212,6 +281,15 @@ impl Agent {
                 }
             };
 
+            // `complete_split` has consumed the request and returned an owned
+            // response stream. Keeping these full transcript snapshots alive
+            // while tokens arrive needlessly multiplies active-session memory.
+            drop(stamped);
+            drop(messages_with_memory);
+            drop(memory_pending);
+            drop(messages);
+            drop(split_prompt);
+
             // Successful API call - reset retry counter
             context_limit_retries = 0;
 
@@ -229,6 +307,19 @@ impl Agent {
 
             let mut text_content = String::new();
             let mut text_wrapped_detected = false;
+            // Inline swarm worker output tap: publish a throttled tail of the
+            // in-progress assistant text to the bus so a coordinator can render
+            // a live inline gallery viewport.
+            let inline_output_tap = self.inline_output_tap();
+            let mut inline_tap_last = Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1000))
+                .unwrap_or_else(Instant::now);
+            // Throttled "this session is alive" marks while tokens stream, so
+            // swarm status can distinguish a busy worker from a dead one
+            // without paying a registry lock per token.
+            let mut activity_mark_last = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(10))
+                .unwrap_or_else(Instant::now);
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut current_tool: Option<ToolCall> = None;
             let mut current_tool_input = String::new();
@@ -246,6 +337,14 @@ impl Agent {
                 crate::provider::stores_reasoning_content_for_context(&provider_name);
             let mut reasoning_content = String::new();
             let mut reasoning_signature = String::new();
+            // Whether a live reasoning region is currently streaming to the client.
+            // Raw reasoning deltas are sent as `ReasoningDelta`; the client owns the
+            // dim/italic styling and live partial-line rendering. We close the region
+            // (via `ReasoningDone`) before real output or a tool call begins.
+            let mut reasoning_open = false;
+            // Last time hidden (non-displayed) reasoning activity was relayed
+            // to clients as a keepalive; throttles issue #451 keepalives.
+            let mut hidden_activity_last = Instant::now();
             let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             let mut openai_native_compaction: Option<(String, usize)> = None;
             let mut tool_id_to_name: std::collections::HashMap<String, String> =
@@ -278,6 +377,11 @@ impl Agent {
                     }
                     event = next_event => event,
                 };
+
+                if activity_mark_last.elapsed() >= std::time::Duration::from_secs(2) {
+                    activity_mark_last = Instant::now();
+                    crate::session_metrics::record_activity(&self.session.id);
+                }
                 let Some(event) = event else {
                     log_agent_provider_stream_lifecycle(
                         if saw_message_end {
@@ -366,26 +470,61 @@ impl Agent {
                     }
                     StreamEvent::ThinkingDelta(thinking_text) => {
                         // Only send thinking content if enabled in config
-                        if crate::config::config().display.show_thinking {
-                            let _ = event_tx.send(ServerEvent::TextDelta {
-                                text: format!("💭 {}\n", thinking_text),
+                        if crate::config::config().display.show_thinking
+                            && !thinking_text.is_empty()
+                        {
+                            reasoning_open = true;
+                            let _ = event_tx.send(ServerEvent::ReasoningDelta {
+                                text: thinking_text.clone(),
                             });
+                        } else if hidden_activity_last.elapsed()
+                            >= std::time::Duration::from_secs(5)
+                        {
+                            // Hidden reasoning is real provider activity, but it
+                            // emits nothing over the client socket, so a long
+                            // silent thinking phase looks identical to a dead
+                            // connection and the client stall guard cancels a
+                            // healthy stream (issue #451). Send a throttled
+                            // non-rendered keepalive so clients track provider
+                            // activity, not just displayable events.
+                            hidden_activity_last = Instant::now();
+                            send_stream_keepalive_mpsc(&event_tx);
                         }
-                        if store_reasoning_content {
-                            reasoning_content.push_str(&thinking_text);
-                        }
+                        // Always capture reasoning text so it can be persisted as a
+                        // history-only trace, regardless of provider replay support.
+                        reasoning_content.push_str(&thinking_text);
                     }
                     StreamEvent::ThinkingDone { duration_secs } => {
-                        let _ = event_tx.send(ServerEvent::TextDelta {
-                            text: format!("Thought for {:.1}s\n", duration_secs),
-                        });
+                        if reasoning_open {
+                            reasoning_open = false;
+                            let _ = event_tx.send(ServerEvent::ReasoningDone {
+                                duration_secs: Some(duration_secs),
+                            });
+                        }
                     }
                     StreamEvent::TextDelta(text) => {
+                        // Close any open reasoning region before real output so the
+                        // answer renders as a normal paragraph rather than as reasoning.
+                        if reasoning_open && !text.trim().is_empty() {
+                            reasoning_open = false;
+                            let _ = event_tx.send(ServerEvent::ReasoningDone {
+                                duration_secs: None,
+                            });
+                        }
                         text_content.push_str(&text);
+                        if inline_output_tap {
+                            self.inline_tail.set_live(&text_content);
+                            if inline_tap_last.elapsed() >= std::time::Duration::from_millis(200) {
+                                inline_tap_last = Instant::now();
+                                self.publish_inline_tail();
+                            }
+                        }
                         if !text_wrapped_detected {
-                            if let Some(marker_idx) = text_content
-                                .find("to=functions.")
-                                .or_else(|| text_content.find("+#+#"))
+                            // Scan only the new delta (plus a short overlap for
+                            // markers straddling the boundary) instead of the
+                            // whole accumulated response on every token.
+                            if let Some(marker_idx) =
+                                find_wrap_marker_incremental(&text_content, text.len())
                             {
                                 text_wrapped_detected = true;
                                 let clean_prefix =
@@ -410,6 +549,12 @@ impl Agent {
                         }
                     }
                     StreamEvent::ToolUseStart { id, name } => {
+                        if reasoning_open {
+                            reasoning_open = false;
+                            let _ = event_tx.send(ServerEvent::ReasoningDone {
+                                duration_secs: None,
+                            });
+                        }
                         let _ = event_tx.send(ServerEvent::ToolStart {
                             id: id.clone(),
                             name: name.clone(),
@@ -420,6 +565,7 @@ impl Agent {
                             name,
                             input: serde_json::Value::Null,
                             intent: None,
+                            thought_signature: None,
                         });
                         current_tool_input.clear();
                     }
@@ -442,6 +588,15 @@ impl Agent {
 
                             tool_calls.push(tool);
                             current_tool_input.clear();
+                        }
+                    }
+                    StreamEvent::ToolUseSignature(signature) => {
+                        // Attach Gemini 3 thought signature to the most recent
+                        // tool call so it can be persisted and replayed.
+                        if let Some(tool) = tool_calls.last_mut()
+                            && !signature.is_empty()
+                        {
+                            tool.thought_signature = Some(signature);
                         }
                     }
                     StreamEvent::ToolResult {
@@ -472,15 +627,11 @@ impl Agent {
                         output_format,
                         revised_prompt,
                     } => {
-                        if let Some(snapshot) = self.update_generated_image_side_panel(
+                        let rendered_image = crate::message::generated_image_rendered_image(
                             &id,
                             &path,
-                            metadata_path.as_deref(),
                             &output_format,
-                            revised_prompt.as_deref(),
-                        ) {
-                            let _ = event_tx.send(ServerEvent::SidePanelState { snapshot });
-                        }
+                        );
                         if self.provider.supports_image_input() {
                             if let Some(blocks) =
                                 crate::message::generated_image_visual_context_blocks(
@@ -505,6 +656,12 @@ impl Agent {
                             output_format,
                             revised_prompt,
                         });
+                        if let Some(image) = rendered_image {
+                            let _ = event_tx.send(ServerEvent::SidePaneImages {
+                                session_id: self.session.id.clone(),
+                                images: vec![image],
+                            });
+                        }
                     }
                     StreamEvent::TokenUsage {
                         input_tokens,
@@ -546,14 +703,82 @@ impl Agent {
                         self.last_status_detail = Some(detail.clone());
                         let _ = event_tx.send(ServerEvent::StatusDetail { detail });
                     }
+                    StreamEvent::RetryRollback { attempt, max } => {
+                        // A transient transport fault hit mid-stream after partial
+                        // output was already emitted; the provider is replaying the
+                        // request from the top. Discard everything accumulated for
+                        // this attempt so the replay doesn't duplicate output, and
+                        // tell the client to do the same.
+                        logging::warn(&format!(
+                            "Mid-stream retry rollback (attempt {}/{}): discarding partial output ({} text chars, {} tool calls)",
+                            attempt,
+                            max,
+                            text_content.len(),
+                            tool_calls.len(),
+                        ));
+                        log_agent_provider_stream_lifecycle(
+                            logging::LogLevel::Warn,
+                            self,
+                            "retry_rollback",
+                            api_start,
+                            vec![
+                                ("mode", "mpsc".to_string()),
+                                ("attempt", attempt.to_string()),
+                                ("max", max.to_string()),
+                                ("text_chars", text_content.len().to_string()),
+                                ("tool_calls", tool_calls.len().to_string()),
+                            ],
+                        );
+                        text_content.clear();
+                        if inline_output_tap {
+                            // The provider replays from the top; drop the
+                            // discarded partial from the live tail too.
+                            self.inline_tail.clear_live();
+                        }
+                        text_wrapped_detected = false;
+                        tool_calls.clear();
+                        current_tool = None;
+                        current_tool_input.clear();
+                        tool_id_to_name.clear();
+                        sdk_tool_results.clear();
+                        generated_image_contexts.clear();
+                        reasoning_content.clear();
+                        reasoning_signature.clear();
+                        reasoning_open = false;
+                        openai_reasoning_items.clear();
+                        openai_native_compaction = None;
+                        saw_message_end = false;
+                        stop_reason = None;
+                        let _ = event_tx.send(ServerEvent::RetryRollback { attempt, max });
+                        let _ = event_tx.send(ServerEvent::ConnectionPhase {
+                            phase: crate::message::ConnectionPhase::Retrying { attempt, max }
+                                .to_string(),
+                        });
+                    }
                     StreamEvent::MessageEnd {
                         stop_reason: reason,
                     } => {
                         saw_message_end = true;
+                        if inline_output_tap {
+                            // Fold the finished text into the rolling tail so
+                            // it survives the next turn/continuation.
+                            self.inline_tail.set_live(&text_content);
+                            self.inline_tail.commit_live();
+                        }
+                        // Close any still-open reasoning region (e.g. a reasoning-only
+                        // step) so the client flushes its live partial line.
+                        if reasoning_open {
+                            reasoning_open = false;
+                            let _ = event_tx.send(ServerEvent::ReasoningDone {
+                                duration_secs: None,
+                            });
+                        }
                         if reason.is_some() {
                             stop_reason = reason;
                         }
-                        let _ = event_tx.send(ServerEvent::MessageEnd);
+                        let _ = event_tx.send(ServerEvent::MessageEnd {
+                            stop_reason: stop_reason.clone(),
+                        });
                     }
                     StreamEvent::SessionId(sid) => {
                         self.provider_session_id = Some(sid.clone());
@@ -711,6 +936,10 @@ impl Agent {
                 vec![
                     ("mode", "mpsc".to_string()),
                     ("saw_message_end", saw_message_end.to_string()),
+                    (
+                        "stop_reason",
+                        stop_reason.clone().unwrap_or_else(|| "none".to_string()),
+                    ),
                     ("input_tokens", usage_input.unwrap_or(0).to_string()),
                     ("output_tokens", usage_output.unwrap_or(0).to_string()),
                     ("cache_read", usage_cache_read.unwrap_or(0).to_string()),
@@ -729,6 +958,14 @@ impl Agent {
                     usage_cache_read,
                     usage_cache_creation,
                 );
+
+                let input = usage_input.unwrap_or(0);
+                let output = usage_output.unwrap_or(0);
+                let total = input
+                    .saturating_add(output)
+                    .saturating_add(usage_cache_read.unwrap_or(0))
+                    .saturating_add(usage_cache_creation.unwrap_or(0));
+                crate::session_metrics::record_token_usage(&self.session.id, total, output);
             }
 
             if usage_input.is_some()
@@ -751,6 +988,35 @@ impl Agent {
                 cache_read_input_tokens: usage_cache_read,
                 cache_creation_input_tokens: usage_cache_creation,
             };
+
+            // Detect a transparent mid-request model switch (e.g. Anthropic's
+            // retired `claude-fable-5` falling back to `claude-opus-4-8`). The
+            // provider mutates its own model state during the stream, so the
+            // session and clients would otherwise keep showing the originally
+            // requested model with a stale context-limit. Resync the session and
+            // notify clients with a `ModelChanged` so the header, picker, and
+            // context budget all reflect the model that actually served.
+            let model_after_stream = self.provider.model();
+            if model_after_stream != model_at_request_start {
+                let provider_name = self.provider.display_name();
+                logging::warn(&format!(
+                    "Provider switched model mid-request: '{}' -> '{}' (resyncing session/UI)",
+                    model_at_request_start, model_after_stream
+                ));
+                self.session.model = Some(model_after_stream.clone());
+                self.provider_runtime_state.apply(
+                    crate::provider::ProviderStateEvent::RuntimeModelObserved {
+                        model: model_after_stream.clone(),
+                    },
+                );
+                self.persist_session_best_effort("model fallback");
+                let _ = event_tx.send(ServerEvent::ModelChanged {
+                    id: 0,
+                    model: model_after_stream,
+                    provider_name: Some(provider_name),
+                    error: None,
+                });
+            }
 
             let had_tool_calls_before = !tool_calls.is_empty();
             self.recover_text_wrapped_tool_call(&mut text_content, &mut tool_calls);
@@ -785,13 +1051,14 @@ impl Agent {
                     cache_control: None,
                 });
             }
+            crate::message::push_reasoning_blocks(
+                &mut content_blocks,
+                &provider_name,
+                &reasoning_content,
+                Some(&reasoning_signature),
+                store_reasoning_content,
+            );
             if store_reasoning_content {
-                crate::message::push_reasoning_content_block(
-                    &mut content_blocks,
-                    &provider_name,
-                    &reasoning_content,
-                    Some(&reasoning_signature),
-                );
                 content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
@@ -799,6 +1066,7 @@ impl Agent {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
+                    thought_signature: None,
                 });
             }
 
@@ -821,6 +1089,23 @@ impl Agent {
 
             if let Some((encrypted_content, compacted_count)) = openai_native_compaction.take() {
                 self.apply_openai_native_compaction(encrypted_content, compacted_count)?;
+                // Native OpenAI compaction is applied after the provider stream,
+                // so `messages_for_provider()` did not have an event to emit at
+                // the top of this iteration. Notify clients now, before any
+                // tool-driven continuation can enqueue its next KvCacheRequest.
+                // The FIFO event ordering lets the TUI invalidate its old
+                // append-only baseline before seeing the compacted signature.
+                let _ = event_tx.send(ServerEvent::Compaction {
+                    trigger: "openai_native".to_string(),
+                    pre_tokens: usage_input,
+                    post_tokens: None,
+                    tokens_saved: None,
+                    duration_ms: None,
+                    messages_dropped: None,
+                    messages_compacted: Some(compacted_count),
+                    summary_chars: None,
+                    active_messages: None,
+                });
             }
 
             // If stop_reason indicates truncation (e.g. max_tokens), discard tool calls
@@ -851,7 +1136,33 @@ impl Agent {
                     stop_reason.as_deref(),
                     &mut incomplete_continuations,
                 )? {
-                    NoToolCallOutcome::Break => break,
+                    NoToolCallOutcome::Break => {
+                        // Surface silent guardrail/refusal stops: the provider
+                        // ended the turn with no visible output (e.g. Anthropic
+                        // stop_reason "refusal", or a reasoning-only response).
+                        // Only when the provider actually finished the message
+                        // (saw_message_end) and the user did not cancel, so
+                        // interrupted turns never show a spurious notice.
+                        if saw_message_end
+                            && !self.is_graceful_shutdown()
+                            && let Some(notice) = Self::provider_guardrail_notice(
+                                stop_reason.as_deref(),
+                                text_content.trim().is_empty(),
+                                !reasoning_content.trim().is_empty(),
+                            )
+                        {
+                            logging::warn(&format!(
+                                "PROVIDER_GUARDRAIL: turn ended with no visible output (stop_reason={:?}, reasoning_chars={})",
+                                stop_reason,
+                                reasoning_content.len()
+                            ));
+                            let _ = event_tx.send(ServerEvent::ProviderGuardrail {
+                                stop_reason: stop_reason.clone(),
+                                message: notice,
+                            });
+                        }
+                        break;
+                    }
                     NoToolCallOutcome::ContinueWithoutEvent => continue,
                     NoToolCallOutcome::ContinueWithSoftInterrupt { injected, point } => {
                         for event in Self::build_soft_interrupt_events(injected, point, None) {
@@ -1012,6 +1323,14 @@ impl Agent {
                 }
 
                 logging::info(&format!("Tool starting: {}", tc.name));
+                crate::session_metrics::record_activity(&self.session.id);
+                if inline_output_tap {
+                    // Surface the tool execution on the coordinator's inline
+                    // viewport immediately: workers spend most wall-clock time
+                    // here, where no assistant text streams.
+                    self.inline_tail.start_tool(&tc.name, &tc.input);
+                    self.publish_inline_tail();
+                }
                 let tool_start = Instant::now();
 
                 // Spawn tool in its own task so we can detach it to background on Alt+B
@@ -1069,6 +1388,7 @@ impl Agent {
 
                 self.unlock_tools_if_needed(&tc.name);
                 let tool_elapsed = tool_start.elapsed();
+                crate::session_metrics::record_activity(&self.session.id);
 
                 if let Some(result) = tool_result {
                     // Normal tool completion
@@ -1077,6 +1397,12 @@ impl Agent {
                         tc.name,
                         tool_elapsed.as_secs_f64()
                     ));
+                    if inline_output_tap {
+                        // Update the tool marker in place with duration/error.
+                        self.inline_tail
+                            .finish_tool(tool_elapsed.as_secs_f64(), result.is_err());
+                        self.publish_inline_tail();
+                    }
 
                     match result {
                         Ok(output) => {
@@ -1089,7 +1415,7 @@ impl Agent {
                             });
 
                             let side_pane_images =
-                                tool_output_side_pane_images(&tc.name, &tc.input, &output);
+                                tool_output_side_pane_images(&tc.id, &tc.name, &tc.input, &output);
                             if !side_pane_images.is_empty() {
                                 logging::info(&format!(
                                     "SidePaneImages: emitting {} image(s) from tool '{}' (session={})",
@@ -1265,6 +1591,7 @@ mod tests {
             name: name.to_string(),
             input,
             intent: None,
+            thought_signature: None,
         }
     }
 
@@ -1290,5 +1617,78 @@ mod tests {
 
         assert!(is_error);
         assert!(message.contains("interrupted by server reload"));
+    }
+
+    /// Reference O(n) full scan, preserving the original precedence: the
+    /// `to=functions.` marker is checked before `+#+#`.
+    fn find_wrap_marker_full(text: &str) -> Option<usize> {
+        text.find("to=functions.").or_else(|| text.find("+#+#"))
+    }
+
+    /// Simulate streaming `full` in arbitrary deltas and assert the incremental
+    /// scan finds the first marker position, matching a full rescan each step.
+    fn assert_incremental_matches(full: &str, chunk: usize) {
+        let mut acc = String::new();
+        let mut incremental_hit: Option<usize> = None;
+        let bytes = full.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let mut end = (i + chunk).min(bytes.len());
+            while end < bytes.len() && !full.is_char_boundary(end) {
+                end += 1;
+            }
+            let delta = &full[i..end];
+            acc.push_str(delta);
+            if incremental_hit.is_none() {
+                incremental_hit = find_wrap_marker_incremental(&acc, delta.len());
+            }
+            i = end;
+        }
+        // The earliest of either marker in the full text.
+        let fn_pos = full.find("to=functions.");
+        let plus_pos = full.find("+#+#");
+        let expected = match (fn_pos, plus_pos) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        assert_eq!(
+            incremental_hit, expected,
+            "incremental scan mismatch for {full:?} chunk={chunk}"
+        );
+    }
+
+    #[test]
+    fn wrap_marker_incremental_detects_markers_across_chunk_sizes() {
+        let cases = [
+            "plain answer with no marker at all",
+            "answer then to=functions.foo({})",
+            "answer then +#+# wrapped",
+            "prefix +#+# and later to=functions.bar",
+            "unicode 🔄 résumé then to=functions.baz",
+            "",
+            "to=functions.first",
+            "+#+#",
+        ];
+        for case in cases {
+            for chunk in [1usize, 2, 3, 5, 7, 100] {
+                assert_incremental_matches(case, chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_marker_incremental_finds_marker_straddling_delta_boundary() {
+        // Feed "to=functions." split right in the middle so the marker only
+        // exists once both halves are appended; the overlap window must catch it.
+        let mut acc = String::new();
+        acc.push_str("answer to=fun");
+        assert_eq!(
+            find_wrap_marker_incremental(&acc, "answer to=fun".len()),
+            None
+        );
+        acc.push_str("ctions.tool");
+        let hit = find_wrap_marker_incremental(&acc, "ctions.tool".len());
+        assert_eq!(hit, find_wrap_marker_full(&acc));
+        assert_eq!(hit, Some("answer ".len()));
     }
 }

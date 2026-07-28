@@ -2,6 +2,16 @@ use super::*;
 use ratatui::widgets::Wrap;
 
 impl SessionPicker {
+    fn running_spinner_frame() -> usize {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .saturating_div(u128::from(
+                jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAME_MS,
+            )) as usize
+    }
+
     pub(super) fn crash_reason_line(session: &SessionInfo) -> Option<Line<'static>> {
         let reason = match &session.status {
             SessionStatus::Crashed { message } => message
@@ -69,6 +79,80 @@ impl SessionPicker {
         }
     }
 
+    /// Normalized search tokens used for highlighting, or an empty vec when there
+    /// is no active search. Mirrors the matcher's tokenization so highlighting and
+    /// filtering agree on what counts as a match.
+    pub(super) fn active_highlight_tokens(&self) -> Vec<String> {
+        super::loading::search_query_tokens(&self.search_query)
+    }
+
+    /// Split `text` into spans, applying `base` to non-matching segments and a
+    /// distinct highlight style to case-insensitive occurrences of any of the
+    /// `tokens`. Tokens are matched independently (logical OR for highlighting),
+    /// matching the AND-token filter's notion of "this word matched". Overlapping
+    /// or adjacent matches are merged via a per-character highlight mask.
+    pub(super) fn highlight_spans(
+        text: &str,
+        tokens: &[String],
+        base: Style,
+    ) -> Vec<Span<'static>> {
+        if tokens.is_empty() || text.is_empty() {
+            return vec![Span::styled(text.to_string(), base)];
+        }
+
+        let chars: Vec<char> = text.chars().collect();
+        let lower: String = text.to_lowercase();
+        // Map lowercased byte offsets back to char indices so multi-byte and
+        // case-folding-width changes can't desync the mask.
+        let lower_chars: Vec<char> = lower.chars().collect();
+
+        let mut mask = vec![false; lower_chars.len()];
+        let mut any = false;
+        for token in tokens {
+            if token.is_empty() || token.chars().count() > lower_chars.len() {
+                continue;
+            }
+            let needle: Vec<char> = token.chars().collect();
+            let mut i = 0;
+            while i + needle.len() <= lower_chars.len() {
+                if lower_chars[i..i + needle.len()] == needle[..] {
+                    for slot in mask.iter_mut().skip(i).take(needle.len()) {
+                        *slot = true;
+                    }
+                    any = true;
+                    i += needle.len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        if !any {
+            return vec![Span::styled(text.to_string(), base)];
+        }
+
+        // The lowercase char count can differ from the original char count when
+        // case folding changes length (rare); fall back to no highlight rather
+        // than risk a slice mismatch.
+        if mask.len() != chars.len() {
+            return vec![Span::styled(text.to_string(), base)];
+        }
+
+        let highlight = base.fg(rgb(255, 214, 90)).add_modifier(Modifier::BOLD);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut idx = 0;
+        while idx < chars.len() {
+            let hot = mask[idx];
+            let start = idx;
+            while idx < chars.len() && mask[idx] == hot {
+                idx += 1;
+            }
+            let segment: String = chars[start..idx].iter().collect();
+            spans.push(Span::styled(segment, if hot { highlight } else { base }));
+        }
+        spans
+    }
+
     fn primary_title_display(session: &SessionInfo) -> String {
         let title = session.title.trim();
         let short_name = session.short_name.trim();
@@ -80,10 +164,20 @@ impl SessionPicker {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn render_session_item_lines(
         &self,
         session: &SessionInfo,
         is_selected: bool,
+    ) -> Vec<Line<'static>> {
+        self.render_session_item_lines_at_frame(session, is_selected, Self::running_spinner_frame())
+    }
+
+    pub(super) fn render_session_item_lines_at_frame(
+        &self,
+        session: &SessionInfo,
+        is_selected: bool,
+        spinner_frame: usize,
     ) -> Vec<Line<'static>> {
         let dim: Color = rgb(100, 100, 100);
         let dimmer: Color = rgb(70, 70, 70);
@@ -94,6 +188,9 @@ impl SessionPicker {
         let created_ago = format_time_ago(session.created_at);
         let in_batch_restore = self.crashed_session_ids.contains(&session.id);
         let is_marked = self.selected_session_ids.contains(&session.id);
+        let same_dir = self.session_in_current_dir(session);
+        let same_dir_clr: Color = rgb(120, 200, 140);
+        let highlight_tokens = self.active_highlight_tokens();
 
         let name_style = if is_selected {
             Style::default()
@@ -106,7 +203,7 @@ impl SessionPicker {
         let canary_marker = if session.is_canary { " 🔬" } else { "" };
         let debug_marker = if session.is_debug { " 🧪" } else { "" };
         let saved_marker = if session.saved { " 📌" } else { "" };
-        let selection_marker = if is_marked { "[x] " } else { "[ ] " };
+        let selection_marker = if is_marked { "● " } else { "○ " };
         let selection_style = if is_marked {
             Style::default()
                 .fg(rgb(140, 220, 160))
@@ -116,18 +213,48 @@ impl SessionPicker {
         };
 
         let time_ago = format_time_ago(session.last_message_time);
-        let (status_icon, status_color, time_label) = match &session.status {
-            SessionStatus::Active => ("▶", rgb(100, 200, 100), "active".to_string()),
-            SessionStatus::Closed => ("✓", dim, format!("closed {}", time_ago)),
-            SessionStatus::Crashed { .. } => {
-                ("💥", rgb(220, 100, 100), format!("crashed {}", time_ago))
+        // Live presence (a running process owns this session) takes precedence
+        // over the persisted snapshot status: it distinguishes sessions still
+        // working on a response from ones ready for input, which the stored
+        // `SessionStatus::Active` alone cannot.
+        let is_current = self.session_is_current(session);
+        let live_badge = if self.session_is_live(session) {
+            if session.source == SessionSource::ClaudeCode {
+                Some(("●", rgb(120, 210, 255), "live Claude".to_string()))
+            } else if self.session_is_streaming(session) {
+                let label = match self.session_streaming_duration(session) {
+                    Some(elapsed) => format!("working {}", format_short_duration(elapsed)),
+                    None => "working".to_string(),
+                };
+                Some((
+                    jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES[spinner_frame
+                        % jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES.len()],
+                    rgb(255, 193, 7),
+                    label,
+                ))
+            } else {
+                Some(("●", rgb(100, 220, 130), "ready".to_string()))
             }
-            SessionStatus::Reloaded => ("🔄", user_clr, format!("reloaded {}", time_ago)),
-            SessionStatus::Compacted => ("📦", rgb(255, 193, 7), format!("compacted {}", time_ago)),
-            SessionStatus::RateLimited => ("⏳", accent, format!("rate-limited {}", time_ago)),
-            SessionStatus::Error { .. } => {
-                ("❌", rgb(220, 100, 100), format!("errored {}", time_ago))
-            }
+        } else {
+            None
+        };
+        let (status_icon, status_color, time_label) = match live_badge {
+            Some(badge) => badge,
+            None => match &session.status {
+                SessionStatus::Active => ("▶", rgb(100, 200, 100), "active".to_string()),
+                SessionStatus::Closed => ("✓", dim, format!("closed {}", time_ago)),
+                SessionStatus::Crashed { .. } => {
+                    ("💥", rgb(220, 100, 100), format!("crashed {}", time_ago))
+                }
+                SessionStatus::Reloaded => ("🔄", user_clr, format!("reloaded {}", time_ago)),
+                SessionStatus::Compacted => {
+                    ("📦", rgb(255, 193, 7), format!("compacted {}", time_ago))
+                }
+                SessionStatus::RateLimited => ("⏳", accent, format!("rate-limited {}", time_ago)),
+                SessionStatus::Error { .. } => {
+                    ("❌", rgb(220, 100, 100), format!("errored {}", time_ago))
+                }
+            },
         };
 
         let primary_title = Self::primary_title_display(session);
@@ -137,8 +264,12 @@ impl SessionPicker {
                 format!("{} ", session.icon),
                 Style::default().fg(rgb(110, 210, 255)),
             ),
-            Span::styled(primary_title, name_style),
         ];
+        line1_spans.extend(Self::highlight_spans(
+            &primary_title,
+            &highlight_tokens,
+            name_style,
+        ));
         line1_spans.extend([
             Span::styled(canary_marker, Style::default().fg(rgb(255, 193, 7))),
             Span::styled(debug_marker, Style::default().fg(rgb(180, 180, 180))),
@@ -150,10 +281,10 @@ impl SessionPicker {
             Span::styled(format!("  {}", time_label), Style::default().fg(dim)),
         ]);
         if let Some(ref label) = session.save_label {
-            line1_spans.push(Span::styled(
-                format!("  \"{}\"", label),
-                Style::default().fg(rgb(255, 200, 140)),
-            ));
+            let label_style = Style::default().fg(rgb(255, 200, 140));
+            line1_spans.push(Span::styled("  \"".to_string(), label_style));
+            line1_spans.extend(Self::highlight_spans(label, &highlight_tokens, label_style));
+            line1_spans.push(Span::styled("\"".to_string(), label_style));
         }
         if let Some(source_badge) = session.source.badge() {
             line1_spans.push(Span::styled(
@@ -168,6 +299,22 @@ impl SessionPicker {
                 "  [BATCH]",
                 Style::default()
                     .fg(batch_restore)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if is_current {
+            line1_spans.push(Span::styled(
+                "  ◀ current",
+                Style::default()
+                    .fg(rgb(110, 210, 255))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if same_dir {
+            line1_spans.push(Span::styled(
+                "  ▸ here",
+                Style::default()
+                    .fg(same_dir_clr)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -226,14 +373,22 @@ impl SessionPicker {
         } else {
             String::new()
         };
-        let line3 = Line::from(vec![
+        let dir_style = Style::default().fg(if same_dir { same_dir_clr } else { dimmer });
+        let mut line3_spans = vec![
             Span::styled("     ", Style::default()),
             Span::styled(
                 format!("created: {}", created_ago),
                 Style::default().fg(dimmer),
             ),
-            Span::styled(dir_part, Style::default().fg(dimmer)),
-        ]);
+        ];
+        if !dir_part.is_empty() {
+            line3_spans.extend(Self::highlight_spans(
+                &dir_part,
+                &highlight_tokens,
+                dir_style,
+            ));
+        }
+        let line3 = Line::from(line3_spans);
 
         let mut rows = vec![line1, line2];
         if let Some(prompt) = session.first_user_prompt.as_deref().map(str::trim)
@@ -245,11 +400,16 @@ impl SessionPicker {
             } else {
                 prompt
             };
-            rows.push(Line::from(vec![
+            let mut prompt_spans = vec![
                 Span::styled("     ", Style::default()),
                 Span::styled("prompt: ", Style::default().fg(dimmer)),
-                Span::styled(prompt_display, Style::default().fg(rgb(180, 180, 220))),
-            ]));
+            ];
+            prompt_spans.extend(Self::highlight_spans(
+                &prompt_display,
+                &highlight_tokens,
+                Style::default().fg(rgb(180, 180, 220)),
+            ));
+            rows.push(Line::from(prompt_spans));
         }
         rows.push(line3);
         if let Some(reason_line) = Self::crash_reason_line(session) {
@@ -260,10 +420,15 @@ impl SessionPicker {
         rows
     }
 
-    fn render_session_item(&self, session: &SessionInfo, is_selected: bool) -> ListItem<'static> {
+    fn render_session_item(
+        &self,
+        session: &SessionInfo,
+        is_selected: bool,
+        spinner_frame: usize,
+    ) -> ListItem<'static> {
         let batch_row_bg: Color = rgb(36, 18, 18);
         let in_batch_restore = self.crashed_session_ids.contains(&session.id);
-        let rows = self.render_session_item_lines(session, is_selected);
+        let rows = self.render_session_item_lines_at_frame(session, is_selected, spinner_frame);
         let mut item = ListItem::new(rows);
         if in_batch_restore && !is_selected {
             item = item.style(Style::default().bg(batch_row_bg));
@@ -274,6 +439,9 @@ impl SessionPicker {
     pub(super) fn render_session_list(&mut self, frame: &mut Frame, area: Rect) {
         let server_color: Color = rgb(255, 200, 100);
         let dim: Color = rgb(100, 100, 100);
+        let spinner_frame = Self::running_spinner_frame();
+        let spinner = jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES
+            [spinner_frame % jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES.len()];
 
         let items: Vec<ListItem> = if let Some(message) = self.loading_message.as_deref() {
             vec![
@@ -288,6 +456,21 @@ impl SessionPicker {
                 ])),
                 ListItem::new(Line::from(vec![Span::styled(
                     "     Scanning local, imported, and running sessions…",
+                    Style::default().fg(dim),
+                )])),
+            ]
+        } else if self.items.is_empty()
+            && self.filter_mode == jcode_tui_session_picker::SessionFilterMode::Active
+        {
+            vec![
+                ListItem::new(Line::from(vec![Span::styled(
+                    "  No other active sessions",
+                    Style::default()
+                        .fg(rgb(220, 220, 220))
+                        .add_modifier(Modifier::BOLD),
+                )])),
+                ListItem::new(Line::from(vec![Span::styled(
+                    "     s cycles to all sessions · Esc closes",
                     Style::default().fg(dim),
                 )])),
             ]
@@ -362,7 +545,9 @@ impl SessionPicker {
                                     .and_then(|i| self.visible_sessions.get(i).copied())
                                     .and_then(|session_ref| self.session_by_ref(session_ref))
                             })
-                            .map(|session| self.render_session_item(session, is_selected))
+                            .map(|session| {
+                                self.render_session_item(session, is_selected, spinner_frame)
+                            })
                             .unwrap_or_else(|| ListItem::new(Line::from(""))),
                     }
                 })
@@ -376,6 +561,34 @@ impl SessionPicker {
                 Style::default()
                     .fg(rgb(255, 200, 100))
                     .add_modifier(Modifier::BOLD),
+            ));
+        } else if self.filter_mode == jcode_tui_session_picker::SessionFilterMode::Active {
+            // The Active view breaks the count down into "still working" vs
+            // "ready for input" so the user can triage at a glance. Counts are
+            // derived from the visible rows so search/debug filters stay honest.
+            let (working, ready) =
+                self.visible_session_iter()
+                    .fold((0usize, 0usize), |(working, ready), session| {
+                        if self.session_is_streaming(session) {
+                            (working + 1, ready)
+                        } else {
+                            (working, ready + 1)
+                        }
+                    });
+            title_parts.push(Span::styled(
+                format!(" {} active ", working + ready),
+                Style::default()
+                    .fg(rgb(200, 200, 200))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            title_parts.push(Span::styled(
+                format!("{}{} working", spinner, working),
+                Style::default().fg(rgb(255, 193, 7)),
+            ));
+            title_parts.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 80))));
+            title_parts.push(Span::styled(
+                format!("●{} ready", ready),
+                Style::default().fg(rgb(100, 220, 130)),
             ));
         } else {
             title_parts.push(Span::styled(
@@ -423,20 +636,23 @@ impl SessionPicker {
 
         title_parts.push(Span::styled(" ", Style::default()));
 
-        let help = if self.loading_message.is_some() {
-            " Esc cancel "
+        let mut help = if self.loading_message.is_some() {
+            " Esc cancel ".to_string()
         } else if self.search_active {
-            " type to filter, Esc cancel "
+            " type to filter · Ctrl+J/K or ↑↓ nav · Ctrl+W word-del · Esc cancel ".to_string()
         } else {
             match crate::config::config().keybindings.session_picker_enter {
                 crate::config::SessionPickerResumeAction::CurrentTerminal => {
-                    " Space select · Enter in place · Ctrl+Enter new terminal · d debug · / search · h/l focus · ↑↓ · q "
+                    " Space select · Enter in place · Ctrl+Enter new terminal · d debug · / search · h/l focus · ↑↓ · q ".to_string()
                 }
                 crate::config::SessionPickerResumeAction::NewTerminal => {
-                    " Space select · Enter new terminal · Ctrl+Enter in place · d debug · / search · h/l focus · ↑↓ · q "
+                    " Space select · Enter new terminal · Ctrl+Enter in place · d debug · / search · h/l focus · ↑↓ · q ".to_string()
                 }
             }
         };
+        if self.selected_live_claude_target().is_some() && !self.search_active {
+            help = format!(" T take over live Claude ·{}", help);
+        }
 
         let border_dim: Color = rgb(70, 70, 70);
         let border_focus: Color = rgb(130, 130, 160);
@@ -445,6 +661,17 @@ impl SessionPicker {
         } else {
             border_dim
         };
+
+        // Measure total rendered rows and per-item heights so we can show a
+        // native scrollbar when the list overflows. `List` renders each item at
+        // its own line count (no wrapping), so summing item heights gives the
+        // exact content height, and a prefix sum maps the scroll offset (first
+        // visible item index) to a rendered-row offset for the scrollbar thumb.
+        let item_heights: Vec<usize> = items.iter().map(|item| item.height().max(1)).collect();
+        let total_item_rows: usize = item_heights.iter().sum();
+        let inner_height = area.height.saturating_sub(2) as usize;
+        let show_scrollbar =
+            super::super::ui::native_scrollbar_visible(true, total_item_rows, inner_height);
 
         let list = List::new(items)
             .block(
@@ -469,6 +696,28 @@ impl SessionPicker {
             });
 
         frame.render_stateful_widget(list, area, &mut self.list_state);
+
+        // Draw the scrollbar inside the right border, after the list has updated
+        // its scroll offset for this frame. Translate the first-visible item index
+        // to a rendered-row offset so the thumb tracks long, multi-line items.
+        if show_scrollbar && area.width > 2 {
+            let offset_item = self.list_state.offset().min(item_heights.len());
+            let row_offset: usize = item_heights[..offset_item].iter().sum();
+            let scrollbar_area = Rect {
+                x: area.x + area.width.saturating_sub(1),
+                y: area.y + 1,
+                width: 1,
+                height: area.height.saturating_sub(2),
+            };
+            super::super::ui::render_native_scrollbar(
+                frame,
+                scrollbar_area,
+                row_offset,
+                total_item_rows,
+                inner_height,
+                self.focus == PaneFocus::Sessions,
+            );
+        }
     }
 
     pub(super) fn render_crash_banner(&self, frame: &mut Frame, area: Rect) {

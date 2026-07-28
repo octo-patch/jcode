@@ -35,6 +35,8 @@ struct BrowserInput {
     #[serde(default)]
     tab_id: Option<i64>,
     #[serde(default)]
+    window_id: Option<i64>,
+    #[serde(default)]
     frame_id: Option<i64>,
     #[serde(default)]
     all_frames: Option<bool>,
@@ -210,6 +212,10 @@ impl Tool for BrowserTool {
         for (name, schema) in [
             ("url", json!({"type": "string"})),
             ("tab_id", json!({"type": "integer"})),
+            (
+                "window_id",
+                json!({"type": "integer", "description": "Scope the action to a specific browser window. Useful when multiple agents drive the browser in parallel."}),
+            ),
             ("frame_id", json!({"type": "integer"})),
             ("all_frames", json!({"type": "boolean"})),
             ("selector", json!({"type": "string"})),
@@ -423,10 +429,9 @@ async fn firefox_setup(provider: &FirefoxBridgeProvider) -> Result<ToolOutput> {
 }
 
 async fn ensure_firefox_ready() -> Result<Option<String>> {
-    if crate::browser::is_setup_complete() {
-        return Ok(None);
-    }
-
+    // A setup marker only proves that installation once completed. Always
+    // verify the live bridge before launching an action because Firefox or the
+    // extension may have stopped or become incompatible since then.
     let status = crate::browser::ensure_browser_ready_noninteractive().await?;
     if status.ready {
         return Ok(None);
@@ -449,8 +454,9 @@ async fn ensure_firefox_ready() -> Result<Option<String>> {
     } else {
         message.push_str("Browser bridge binaries are installed, but the live Firefox bridge is not responding.\n");
     }
-    message
-        .push_str("Normal browser tool calls will not reopen the installer automatically anymore.");
+    message.push_str(
+        "Normal browser tool calls will not reopen the installer automatically anymore. Do not retry browser actions until status reports ready. Continue with another available capability; if the goal requires an external capability unavailable in this session, use capability discovery.",
+    );
     anyhow::bail!(message)
 }
 
@@ -664,7 +670,17 @@ fn bridge_request(action: &str, input: &BrowserInput) -> Result<(String, Value, 
                 .path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("path is required for upload"))?;
-            params.insert("path".into(), json!(path));
+            // The native messaging host reads the file from `filePath`, base64-encodes
+            // it, and forwards it to the content script. It also accepts an optional
+            // `fileName` override. (Previously this sent `path`, which the host ignored,
+            // producing a "Missing filePath" error.)
+            params.insert("filePath".into(), json!(path));
+            if let Some(file_name) = std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+            {
+                params.insert("fileName".into(), json!(file_name));
+            }
         }
         "press" => {
             let script = build_press_script(input.key.as_deref(), input.selector.as_deref())?;
@@ -689,6 +705,9 @@ fn bridge_request(action: &str, input: &BrowserInput) -> Result<(String, Value, 
 fn apply_common_targeting(params: &mut Map<String, Value>, input: &BrowserInput) {
     if let Some(tab_id) = input.tab_id {
         params.insert("tabId".into(), json!(tab_id));
+    }
+    if let Some(window_id) = input.window_id {
+        params.insert("windowId".into(), json!(window_id));
     }
     if let Some(frame_id) = input.frame_id {
         params.insert("frameId".into(), json!(frame_id));
@@ -732,7 +751,7 @@ fn build_press_script(key: Option<&str>, selector: Option<&str>) -> Result<Strin
 async fn firefox_run_bridge_command(
     action: &str,
     params: Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> Result<Value> {
     let bin = crate::browser::browser_binary_path();
     if !bin.exists() {
@@ -750,7 +769,7 @@ async fn firefox_run_bridge_command(
 
     #[cfg(not(windows))]
     if std::env::var("BROWSER_SESSION").is_err()
-        && let Some(session_name) = crate::browser::ensure_browser_session(&ctx.session_id)
+        && let Some(session_name) = crate::browser::ensure_browser_session(&_ctx.session_id)
     {
         command.env("BROWSER_SESSION", session_name);
     }

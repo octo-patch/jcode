@@ -272,30 +272,115 @@ async fn send_ntfy(
 }
 
 // ---------------------------------------------------------------------------
+// Desktop (cross-platform, fire-and-forget)
+// ---------------------------------------------------------------------------
+
+/// Send a local desktop notification without blocking.
+///
+/// Uses Notification Center via `osascript` on macOS and `notify-send` on
+/// Linux. The child process is spawned detached and never waited on; failures
+/// are ignored (a missing notifier is not an error).
+pub fn send_desktop_notification(title: &str, body: &str) {
+    send_desktop_notification_rich(title, None, body, None);
+}
+
+/// Send a local desktop notification with optional macOS subtitle and sound.
+///
+/// `subtitle` renders as a second bold line on macOS (ignored elsewhere).
+/// `sound` is a Notification Center sound name such as "Glass" or "Ping"
+/// (macOS only). Both are best-effort; a missing notifier is not an error.
+pub fn send_desktop_notification_rich(
+    title: &str,
+    subtitle: Option<&str>,
+    body: &str,
+    sound: Option<&str>,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        fn applescript_escape(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for ch in s.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => {}
+                    _ => out.push(ch),
+                }
+            }
+            out
+        }
+        let mut script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            applescript_escape(body),
+            applescript_escape(title)
+        );
+        if let Some(subtitle) = subtitle.filter(|s| !s.trim().is_empty()) {
+            script.push_str(&format!(" subtitle \"{}\"", applescript_escape(subtitle)));
+        }
+        if let Some(sound) = sound.filter(|s| !s.trim().is_empty()) {
+            script.push_str(&format!(" sound name \"{}\"", applescript_escape(sound)));
+        }
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (subtitle, sound);
+        let _ = std::process::Command::new("notify-send")
+            .arg("--app-name=jcode")
+            .arg(title)
+            .arg(body)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (title, subtitle, body, sound);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Desktop (notify-send)
 // ---------------------------------------------------------------------------
 
 fn send_desktop(title: &str, body: &str, urgency: &str) {
-    let result = std::process::Command::new("notify-send")
-        .arg("--app-name=jcode")
-        .arg(format!("--urgency={}", urgency))
-        .arg("--icon=dialog-information")
-        .arg(title)
-        .arg(body)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // On macOS notify-send does not exist; route through Notification Center.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = urgency;
+        send_desktop_notification(title, body);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let result = std::process::Command::new("notify-send")
+            .arg("--app-name=jcode")
+            .arg(format!("--urgency={}", urgency))
+            .arg("--icon=dialog-information")
+            .arg(title)
+            .arg(body)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
 
-    match result {
-        Ok(status) if status.success() => {
-            logging::info(&format!("Desktop notification sent: {}", title));
-        }
-        Ok(status) => {
-            logging::warn(&format!("notify-send exited with {}", status));
-        }
-        Err(e) => {
-            // notify-send not available - not an error, just skip
-            logging::info(&format!("notify-send unavailable: {}", e));
+        match result {
+            Ok(status) if status.success() => {
+                logging::info(&format!("Desktop notification sent: {}", title));
+            }
+            Ok(status) => {
+                logging::warn(&format!("notify-send exited with {}", status));
+            }
+            Err(e) => {
+                // notify-send not available - not an error, just skip
+                logging::info(&format!("notify-send unavailable: {}", e));
+            }
         }
     }
 }

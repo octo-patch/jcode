@@ -7,6 +7,31 @@ fn default_true() -> bool {
     true
 }
 
+/// Wire spec for a task-DAG node submitted by an agent (seed/expand/inject).
+/// Mirrors `jcode_plan::dag::NodeSpec` but kept as an explicit wire type so the
+/// protocol stays self-describing and serde-stable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskGraphNodeSpec {
+    pub id: String,
+    pub content: String,
+    /// "explore" | "implement" | "verify" | "fix" | "synthesize". Defaults to
+    /// "explore" when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub priority: u8,
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Client request to server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -35,6 +60,8 @@ pub enum Request {
     SoftInterrupt {
         id: u64,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<(String, String)>,
         /// If true, can skip remaining tools at injection point C
         #[serde(default)]
         urgent: bool,
@@ -97,6 +124,11 @@ pub enum Request {
         client_has_local_history: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_session_takeover: bool,
+        /// Terminal-identifying env vars (tmux/zellij/kitty/DISPLAY/...) captured
+        /// from the connecting client so the server can route spawn/focus hooks
+        /// to the client's terminal instead of its own stale startup env (#405).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_env: Vec<(String, String)>,
     },
 
     /// Get full conversation history (for TUI sync on connect)
@@ -141,6 +173,12 @@ pub enum Request {
         allow_session_takeover: bool,
     },
 
+    /// Resume/continue every live session that was interrupted and would
+    /// auto-continue on a reload (e.g. crashed/errored mid-turn). This is the
+    /// on-demand equivalent of the automatic post-reload recovery sweep.
+    #[serde(rename = "resume_all_sessions")]
+    ResumeAllSessions { id: u64 },
+
     /// Deliver a scheduled task to a currently live session.
     #[serde(rename = "notify_session")]
     NotifySession {
@@ -175,7 +213,16 @@ pub enum Request {
     #[serde(rename = "refresh_models")]
     RefreshModels { id: u64 },
 
-    /// Set the active model by name
+    /// Set the active model by name.
+    ///
+    /// A legacy/desktop compatibility shape (`{"type":"set_route","model":...}`)
+    /// is also accepted, but it is normalized into this variant inside
+    /// [`crate::decode_request`] rather than via a serde `alias`. A serde alias
+    /// would make this variant *also* answer to the `set_route` tag, and serde's
+    /// internally-tagged enums pick the first matching variant by tag (not by
+    /// fields), so it would shadow the structured [`Request::SetRoute`] variant
+    /// below and make every structured route switch fail with
+    /// `missing field \`model\``.
     #[serde(rename = "set_model")]
     SetModel { id: u64, model: String },
 
@@ -206,7 +253,7 @@ pub enum Request {
         session_id: Option<String>,
     },
 
-    /// Set reasoning effort for providers that expose it (OpenAI/Anthropic: none|low|medium|high|xhigh; DeepSeek: none|low|medium|high|max)
+    /// Set reasoning effort for providers that expose it (OpenAI: none|minimal|low|medium|high|xhigh|max; Anthropic: none|low|medium|high|xhigh|max; DeepSeek: none|low|medium|high|max)
     #[serde(rename = "set_reasoning_effort")]
     SetReasoningEffort {
         id: u64,
@@ -280,6 +327,11 @@ pub enum Request {
         /// profile deterministically.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<AuthChanged>,
+        /// First-run onboarding may ask the server to choose the strongest
+        /// available route across all authenticated providers. Normal re-auth,
+        /// account switching, and older clients leave this false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        prefer_strongest: bool,
     },
 
     /// Switch active Anthropic account label on the server session.
@@ -367,6 +419,10 @@ pub enum Request {
         delivery: Option<CommDeliveryMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wake: Option<bool>,
+        /// Sender-provided one-line summary. Receiving UIs render long
+        /// message bodies collapsed to this with an expand control.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tldr: Option<String>,
     },
 
     /// List agents and their activity
@@ -411,6 +467,49 @@ pub enum Request {
         reason: Option<String>,
     },
 
+    /// Seed the swarm task DAG in one call (the first agent's draft). Replaces or
+    /// initializes the shared plan with a validated graph of nodes + edges.
+    #[serde(rename = "comm_seed_graph")]
+    CommSeedGraph {
+        id: u64,
+        session_id: String,
+        /// "deep" (comprehensive, gated) or "light" (fan-out).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        nodes: Vec<TaskGraphNodeSpec>,
+    },
+
+    /// Decompose a node the caller owns into a child sub-DAG (composite path). In
+    /// deep mode a critique/verify gate is auto-inserted.
+    #[serde(rename = "comm_expand_node")]
+    CommExpandNode {
+        id: u64,
+        session_id: String,
+        node_id: String,
+        children: Vec<TaskGraphNodeSpec>,
+    },
+
+    /// Complete a node the caller owns with a typed handoff artifact. In deep mode
+    /// the artifact is validated for thinness.
+    #[serde(rename = "comm_complete_node")]
+    CommCompleteNode {
+        id: u64,
+        session_id: String,
+        node_id: String,
+        /// Handoff artifact as a JSON object string.
+        artifact_json: String,
+    },
+
+    /// Inject gap/fix nodes from a gate that found a problem, re-blocking the gate
+    /// (and its composite parent) until the new nodes drain.
+    #[serde(rename = "comm_inject_gap")]
+    CommInjectGap {
+        id: u64,
+        session_id: String,
+        gate_id: String,
+        nodes: Vec<TaskGraphNodeSpec>,
+    },
+
     /// Spawn a new agent session (coordinator only)
     #[serde(rename = "comm_spawn")]
     CommSpawn {
@@ -424,7 +523,26 @@ pub enum Request {
         request_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawn_mode: Option<String>,
+        /// Optional per-spawn model override. Takes precedence over
+        /// `agents.swarm_model` config. Supports explicit auth-route prefixes
+        /// (e.g. `openai-api:gpt-5.5`) and the `inherit`/`coordinator`
+        /// sentinels to force coordinator inheritance past a config pin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Optional reasoning effort for the spawned agent (e.g. `none`,
+        /// `low`, `medium`, `high`, `xhigh`, `max`). Unset = provider default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        /// Optional short human-readable label for the spawned agent shown in
+        /// swarm UI (gallery chips, member lists). Overrides the task label
+        /// otherwise derived from the first line of `initial_message`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
+
+    /// List models/routes available for spawning swarm agents
+    #[serde(rename = "comm_list_models")]
+    CommListModels { id: u64, session_id: String },
 
     /// Stop/destroy an agent session (coordinator only)
     #[serde(rename = "comm_stop")]
@@ -479,6 +597,10 @@ pub enum Request {
         /// Optional blockers/follow-up summary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         follow_up: Option<String>,
+        /// Reporter-provided one-line summary. Receiving UIs render long
+        /// report bodies collapsed to this with an expand control.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tldr: Option<String>,
     },
 
     /// Read another agent's full conversation context
@@ -525,6 +647,14 @@ pub enum Request {
         spawn_if_needed: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Optional model override for workers spawned by this assignment
+        /// (same semantics as CommSpawn::model).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Optional reasoning effort for workers spawned by this assignment
+        /// (same semantics as CommSpawn::effort).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
 
     /// Control an existing assigned task lifecycle (coordinator only)
@@ -572,6 +702,17 @@ pub enum Request {
         /// Timeout in seconds (default 3600 = 1 hour)
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Run the wait as a detached background watcher instead of blocking the
+        /// requesting turn. Defaults to true so the agent stays responsive.
+        #[serde(default = "default_true")]
+        background: bool,
+        /// When backgrounded, surface a notification card on completion.
+        #[serde(default = "default_true")]
+        notify: bool,
+        /// When backgrounded, wake an idle requesting agent with the result (or
+        /// soft-interrupt it if busy). Defaults to true.
+        #[serde(default = "default_true")]
+        wake: bool,
     },
 }
 
@@ -590,6 +731,27 @@ pub enum ServerEvent {
     /// Streaming text delta
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
+
+    /// Streaming reasoning/thinking delta (raw, unformatted model text).
+    ///
+    /// Unlike [`ServerEvent::TextDelta`], this carries the model's reasoning as
+    /// raw text deltas so the client can render the in-progress line live
+    /// (token-by-token) rather than waiting for a whole line to complete. The
+    /// client is responsible for the dim+italic styling. Clients that predate
+    /// this event simply ignore it (reasoning is still persisted as a
+    /// history-only trace and shown when the message commits).
+    #[serde(rename = "reasoning_delta")]
+    ReasoningDelta { text: String },
+
+    /// Reasoning/thinking finished for the current step. Lets the client close
+    /// its live reasoning region (flush the partial line, add separators) before
+    /// normal output or a tool call begins.
+    #[serde(rename = "reasoning_done")]
+    ReasoningDone {
+        /// Wall-clock reasoning duration in seconds, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_secs: Option<f64>,
+    },
 
     /// Replace the current turn's streamed text content
     /// Used when text-wrapped tool calls are recovered: the garbled text
@@ -619,10 +781,9 @@ pub enum ServerEvent {
         error: Option<String>,
     },
 
-    /// Rendered images produced by a tool result during the live turn (e.g. the
-    /// `read` tool reading an image file). Lets remote clients populate the
-    /// pinned-image side pane immediately, instead of waiting for the next full
-    /// History reload.
+    /// Rendered images produced during the live turn, including image-bearing
+    /// tool results and provider-native image generation. Lets remote clients
+    /// render them inline immediately instead of waiting for History reload.
     #[serde(rename = "side_pane_images")]
     SidePaneImages {
         session_id: String,
@@ -695,8 +856,25 @@ pub enum ServerEvent {
 
     /// Provider has finished the visible assistant message, but the turn may still be
     /// finalizing bookkeeping such as session IDs or completion trailers.
+    ///
+    /// `stop_reason` carries the provider's own reason when it supplied one
+    /// (e.g. Anthropic `end_turn`, `tool_use`, `max_tokens`). It must be
+    /// forwarded rather than dropped: `max_tokens` is the only signal that a
+    /// turn was truncated by the output budget, and headless consumers
+    /// (`run --ndjson`) have no other way to detect it.
     #[serde(rename = "message_end")]
-    MessageEnd,
+    MessageEnd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+    },
+
+    /// A transient transport fault interrupted the provider stream mid-response
+    /// and the provider is retrying the request from the top. The client must
+    /// discard all partial output from the current attempt (streamed text,
+    /// reasoning, in-progress tool calls) so the replayed response renders
+    /// cleanly instead of duplicating.
+    #[serde(rename = "retry_rollback")]
+    RetryRollback { attempt: u32, max: u32 },
 
     /// Upstream provider info (e.g., which provider OpenRouter routed to)
     #[serde(rename = "upstream_provider")]
@@ -754,6 +932,20 @@ pub enum ServerEvent {
     /// so it does not blend into streaming model output.
     #[serde(rename = "interrupted")]
     Interrupted,
+
+    /// The provider ended the turn without any visible assistant output,
+    /// typically a model-side guardrail/refusal stop (e.g. Anthropic
+    /// `stop_reason: "refusal"`), or a reasoning-only response with no final
+    /// text. Rendered as a system notice so the user learns why no response
+    /// arrived instead of the turn ending silently.
+    #[serde(rename = "provider_guardrail")]
+    ProviderGuardrail {
+        /// Raw provider stop reason, when known (e.g. "refusal").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        /// Human-readable explanation for display.
+        message: String,
+    },
 
     /// Relevant memory was injected into the conversation
     #[serde(rename = "memory_injected")]
@@ -935,6 +1127,12 @@ pub enum ServerEvent {
         /// Upstream provider (e.g., which provider OpenRouter routed to, or calculated preference)
         #[serde(skip_serializing_if = "Option::is_none")]
         upstream_provider: Option<String>,
+        /// Server-resolved billing credential for this session: `Oauth`
+        /// (subscription) vs `ApiKey` (cost-based), or `None` when the active
+        /// provider has no OAuth-vs-API-key distinction. Lets remote clients
+        /// render usage/billing without re-deriving it from the provider name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_credential: Option<jcode_provider_core::ResolvedCredential>,
         /// Reasoning effort for providers that expose it
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
@@ -1169,6 +1367,23 @@ pub enum ServerEvent {
         new_session_id: String,
     },
 
+    /// Response to comm_list_models request
+    #[serde(rename = "comm_list_models_response")]
+    CommListModelsResponse {
+        id: u64,
+        /// The coordinator's currently active model (spawn default when no
+        /// override is configured or requested).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_model: Option<String>,
+        /// The configured `agents.swarm_model` pin, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_swarm_model: Option<String>,
+        /// All model routes known to the server (model + provider + auth
+        /// method + availability + rough cost estimate).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        model_routes: Vec<jcode_provider_core::ModelRoute>,
+    },
+
     /// Response to comm_await_members request
     #[serde(rename = "comm_await_members_response")]
     CommAwaitMembersResponse {
@@ -1179,6 +1394,11 @@ pub enum ServerEvent {
         members: Vec<AwaitedMemberStatus>,
         /// Human-readable summary
         summary: String,
+        /// True when the wait was handed off to a detached background watcher.
+        /// In that case `members`/`completed` describe the current snapshot, not
+        /// a final result; completion is delivered later via notify/wake.
+        #[serde(default)]
+        background_started: bool,
     },
 
     /// Response to split request — new session created with cloned conversation
@@ -1197,6 +1417,21 @@ pub enum ServerEvent {
         message: String,
         /// Whether compaction was started successfully
         success: bool,
+    },
+
+    /// Response to resume_all_sessions — summary of which sessions were continued.
+    #[serde(rename = "resume_all_result")]
+    ResumeAllResult {
+        id: u64,
+        /// Number of live sessions that were continued by this request.
+        resumed: usize,
+        /// Number of live sessions inspected but skipped (idle/complete/busy).
+        skipped: usize,
+        /// Friendly names (or short ids) of the sessions that were continued.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        resumed_sessions: Vec<String>,
+        /// Human-readable summary suitable for direct display.
+        message: String,
     },
 
     /// A running command is waiting for stdin input from the user

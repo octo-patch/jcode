@@ -31,18 +31,25 @@ fn prepare_server_exec(cmd: &mut std::process::Command, socket_path: &std::path:
 
 async fn receive_reload_signal(
     rx: &mut watch::Receiver<Option<crate::server::ReloadSignal>>,
+    last_request_id: &mut Option<String>,
 ) -> Option<crate::server::ReloadSignal> {
-    if let Some(signal) = rx.borrow_and_update().clone() {
-        return Some(signal);
-    }
-
+    // The reload watch channel keeps holding the last `Some(signal)` after it is
+    // sent (it is never reset to `None`), so `borrow_and_update` would keep
+    // handing back the same signal on every loop iteration. In production the
+    // caller exec()s/exits after the first one, but a test-session listener just
+    // `continue`s -- which previously turned into a hot busy-loop that starved
+    // the runtime (single-threaded #[tokio::test]) and hung the reload e2e tests.
+    // Dedupe by request_id so each distinct signal is delivered exactly once.
     loop {
-        if rx.changed().await.is_err() {
-            return None;
+        if let Some(signal) = rx.borrow_and_update().clone()
+            && last_request_id.as_deref() != Some(signal.request_id.as_str())
+        {
+            *last_request_id = Some(signal.request_id.clone());
+            return Some(signal);
         }
 
-        if let Some(signal) = rx.borrow_and_update().clone() {
-            return Some(signal);
+        if rx.changed().await.is_err() {
+            return None;
         }
     }
 }
@@ -56,9 +63,18 @@ pub(super) async fn await_reload_signal(
     use std::process::Command as ProcessCommand;
 
     let mut rx = super::reload_state::reload_signal().1.clone();
+    // Treat any signal already sitting in the (process-global) reload channel as
+    // already handled: a server should only react to reload signals issued after
+    // it started listening, never to a stale one left over from a previous run.
+    // Without this, in-process e2e servers (which share the global channel) would
+    // each immediately re-process the last test's reload signal on startup.
+    let mut last_request_id: Option<String> = rx
+        .borrow_and_update()
+        .as_ref()
+        .map(|signal| signal.request_id.clone());
 
     loop {
-        let signal = match receive_reload_signal(&mut rx).await {
+        let signal = match receive_reload_signal(&mut rx, &mut last_request_id).await {
             Some(signal) => signal,
             None => return,
         };
@@ -132,6 +148,28 @@ pub(super) async fn await_reload_signal(
                 "elapsed_ms": reload_started.elapsed().as_millis(),
                 "state": crate::server::reload_state_summary(std::time::Duration::from_secs(60)),
             }),
+        );
+
+        // Finalize in-process background tasks (selfdev builds/tests, bash
+        // tasks, run_plan drivers) before exec replaces this process image.
+        // exec runs no destructors, so without this the task futures vanish:
+        // kill_on_drop build children leak, and their status files read
+        // Running until the next process's orphan sweep. Aborting here kills
+        // the children and persists a deterministic Failed(interrupted by
+        // reload) status the agent sees immediately after reload.
+        let aborted = crate::background::global()
+            .abort_live_tasks_for_reload()
+            .await;
+        if aborted > 0 {
+            crate::logging::info(&format!(
+                "Server: finalized {} in-process background task(s) before reload exec",
+                aborted
+            ));
+        }
+        super::reload_trace::record_value(
+            &signal.request_id,
+            "background_tasks_finalized",
+            serde_json::json!({ "count": aborted }),
         );
 
         let prefers_selfdev = signal.prefer_selfdev_binary;

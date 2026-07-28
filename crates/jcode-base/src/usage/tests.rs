@@ -379,6 +379,7 @@ fn test_usage_data_from_provider_report_maps_limits_and_extra_usage() {
         )],
         hard_limit_reached: false,
         error: None,
+        last_used_unix_secs: None,
     };
 
     let usage = usage_data_from_provider_report(&report);
@@ -430,7 +431,7 @@ fn test_openai_usage_data_from_provider_report_preserves_hard_limit_flag() {
 }
 
 #[test]
-fn test_openai_snapshot_does_not_treat_hard_limit_flag_as_exhausted() {
+fn test_openai_snapshot_treats_hard_limit_flag_as_exhausted() {
     let usage = OpenAIUsageData {
         hard_limit_reached: true,
         five_hour: Some(OpenAIUsageWindow {
@@ -447,7 +448,7 @@ fn test_openai_snapshot_does_not_treat_hard_limit_flag_as_exhausted() {
         &usage,
     );
 
-    assert!(!snapshot.exhausted);
+    assert!(snapshot.exhausted);
     assert_eq!(snapshot.five_hour_ratio, Some(1.0));
     assert_eq!(snapshot.seven_day_ratio, None);
 }
@@ -529,6 +530,35 @@ fn test_parse_openai_usage_payload_prefers_wham_windows_and_additional_limits() 
 }
 
 #[test]
+fn test_parse_openai_usage_payload_labels_monthly_primary_window() {
+    let json = serde_json::json!({
+        "plan_type": "team",
+        "rate_limit": {
+            "allowed": false,
+            "limit_reached": true,
+            "primary_window": {
+                "used_percent": 100.0,
+                "limit_window_seconds": 2_628_000,
+                "reset_at": 1_786_512_910
+            },
+            "secondary_window": null
+        }
+    });
+
+    let parsed = openai_helpers::parse_openai_usage_payload(&json);
+    assert_eq!(parsed.limits.len(), 1);
+    assert_eq!(parsed.limits[0].name, "Monthly window");
+
+    let usage = openai_usage_data_from_provider_report(&ProviderUsage {
+        provider_name: "OpenAI (ChatGPT)".to_string(),
+        limits: parsed.limits,
+        hard_limit_reached: parsed.hard_limit_reached,
+        ..Default::default()
+    });
+    assert!(usage.exhausted());
+}
+
+#[test]
 fn test_parse_openai_usage_payload_falls_back_to_nested_rate_limits() {
     let json = serde_json::json!({
         "plan": "team",
@@ -573,7 +603,9 @@ fn test_account_usage_probe_prefers_best_available_alternative() {
                 label: "work".to_string(),
                 email: Some("work@example.com".to_string()),
                 exhausted: true,
+                primary_label: None,
                 five_hour_ratio: Some(1.0),
+                secondary_label: None,
                 seven_day_ratio: Some(1.0),
                 resets_at: Some("2026-01-01T00:00:00Z".to_string()),
                 error: None,
@@ -582,7 +614,9 @@ fn test_account_usage_probe_prefers_best_available_alternative() {
                 label: "backup".to_string(),
                 email: Some("backup@example.com".to_string()),
                 exhausted: false,
+                primary_label: None,
                 five_hour_ratio: Some(0.45),
+                secondary_label: None,
                 seven_day_ratio: Some(0.10),
                 resets_at: Some("2026-01-01T01:00:00Z".to_string()),
                 error: None,
@@ -591,7 +625,9 @@ fn test_account_usage_probe_prefers_best_available_alternative() {
                 label: "secondary".to_string(),
                 email: Some("secondary@example.com".to_string()),
                 exhausted: false,
+                primary_label: None,
                 five_hour_ratio: Some(0.70),
+                secondary_label: None,
                 seven_day_ratio: Some(0.20),
                 resets_at: Some("2026-01-01T02:00:00Z".to_string()),
                 error: None,
@@ -619,7 +655,9 @@ fn test_account_usage_probe_detects_all_accounts_exhausted() {
                 label: "primary".to_string(),
                 email: None,
                 exhausted: true,
+                primary_label: None,
                 five_hour_ratio: Some(1.0),
+                secondary_label: None,
                 seven_day_ratio: Some(1.0),
                 resets_at: None,
                 error: None,
@@ -628,7 +666,9 @@ fn test_account_usage_probe_detects_all_accounts_exhausted() {
                 label: "backup".to_string(),
                 email: None,
                 exhausted: true,
+                primary_label: None,
                 five_hour_ratio: Some(1.0),
+                secondary_label: None,
                 seven_day_ratio: Some(1.0),
                 resets_at: None,
                 error: None,
@@ -640,4 +680,43 @@ fn test_account_usage_probe_detects_all_accounts_exhausted() {
     assert!(probe.all_accounts_exhausted());
     assert!(probe.best_available_alternative().is_none());
     assert!(probe.switch_guidance().is_none());
+}
+
+#[test]
+fn test_reports_sort_most_recently_used_first() {
+    let report = |name: &str, last_used: Option<u64>| ProviderUsage {
+        provider_name: name.to_string(),
+        last_used_unix_secs: last_used,
+        ..Default::default()
+    };
+
+    let mut results = vec![
+        report("Never Used B", None),
+        report("Old", Some(100)),
+        report("Never Used A", None),
+        report("Recent", Some(2_000_000)),
+    ];
+    sort_reports_most_recent_first(&mut results);
+
+    let names: Vec<&str> = results.iter().map(|r| r.provider_name.as_str()).collect();
+    assert_eq!(names, ["Recent", "Old", "Never Used A", "Never Used B"]);
+}
+
+#[test]
+fn test_activity_sweeper_skips_sources_with_dedicated_reports() {
+    // Dual-auth surfaces are always reported by their own fetchers.
+    assert!(activity_source_has_dedicated_report(
+        "claude:oauth:claude-1"
+    ));
+    assert!(activity_source_has_dedicated_report("claude:api-key"));
+    assert!(activity_source_has_dedicated_report(
+        "openai:oauth:openai-1"
+    ));
+    assert!(activity_source_has_dedicated_report("openai:api-key"));
+    // Unknown/uncovered sources fall through to the sweeper.
+    assert!(!activity_source_has_dedicated_report("bedrock"));
+    assert!(!activity_source_has_dedicated_report("jcode"));
+    assert!(!activity_source_has_dedicated_report(
+        "some-custom-endpoint"
+    ));
 }

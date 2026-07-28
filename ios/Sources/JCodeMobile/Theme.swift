@@ -1,209 +1,77 @@
 import SwiftUI
 
-enum JC {
-    // MARK: - Colors
+/// Design tokens. Dark, calm, terminal-native; mint accent for live state.
+enum Theme {
+    static let background = Color(hex: 0x0F0F14)
+    static let surface = Color(hex: 0x1A1A1F)
+    static let surfaceElevated = Color(hex: 0x242429)
+    static let border = Color.white.opacity(0.08)
+    static let mint = Color(hex: 0x4DD9A6)
+    static let mintTint = Color(hex: 0x4DD9A6).opacity(0.15)
+    static let textPrimary = Color.white.opacity(0.92)
+    static let textSecondary = Color.white.opacity(0.55)
+    static let textTertiary = Color.white.opacity(0.35)
+    static let warning = Color(hex: 0xF59E0B)
+    static let error = Color(hex: 0xD94D59)
 
-    enum Colors {
-        static let background = Color.black
-        static let surface = Color(red: 0.03, green: 0.03, blue: 0.06)
-        static let surfaceElevated = Color(red: 0.07, green: 0.07, blue: 0.10)
-        static let surfaceHover = Color(red: 0.11, green: 0.11, blue: 0.14)
-
-        static let border = Color.white.opacity(0.04)
-        static let borderSubtle = Color.white.opacity(0.03)
-        static let borderFocused = Color(red: 0.71, green: 0.49, blue: 1.0).opacity(0.4)
-
-        static let accent = Color(red: 0.71, green: 0.49, blue: 1.0)
-        static let accentDim = Color(red: 0.71, green: 0.49, blue: 1.0).opacity(0.12)
-        static let accentGlow = Color(red: 0.71, green: 0.49, blue: 1.0).opacity(0.3)
-
-        static let blue = Color(red: 0.30, green: 0.62, blue: 1.0)
-        static let green = Color(red: 0.0, green: 0.90, blue: 0.46)
-        static let pink = Color(red: 1.0, green: 0.36, blue: 0.67)
-        static let cyan = Color(red: 0.0, green: 0.90, blue: 1.0)
-        static let amber = Color(red: 1.0, green: 0.67, blue: 0.0)
-        static let red = Color(red: 1.0, green: 0.24, blue: 0.35)
-
-        static let textPrimary = Color.white.opacity(0.92)
-        static let textSecondary = Color.white.opacity(0.45)
-        static let textTertiary = Color.white.opacity(0.22)
-        static let textOnAccent = Color.black
-
-        static let userText = blue
-        static let aiText = Color.white.opacity(0.86)
-        static let systemText = pink.opacity(0.7)
-        static let toolText = Color.white.opacity(0.22)
-
-        static let userBubble = Color(red: 0.30, green: 0.62, blue: 1.0).opacity(0.10)
-        static let assistantBubble = Color(red: 0.07, green: 0.07, blue: 0.10)
-        static let systemBubble = Color(red: 1.0, green: 0.36, blue: 0.67).opacity(0.08)
-
-        static let statusOnline = green
-        static let statusConnecting = amber
-        static let statusOffline = red
-
-        static let toolStreaming = amber
-        static let toolRunning = cyan
-        static let toolDone = green
-        static let toolFailed = red
-
-        static let codeBackground = Color(red: 0.04, green: 0.04, blue: 0.06)
-        static let codeBorder = Color.white.opacity(0.04)
-
-        static let destructive = red
+    static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight, design: .monospaced)
     }
 
-    // MARK: - Typography
-
-    enum Fonts {
-        static let largeTitle = Font.system(size: 28, weight: .bold, design: .rounded)
-        static let title = Font.system(size: 22, weight: .bold, design: .rounded)
-        static let title2 = Font.system(size: 20, weight: .semibold, design: .rounded)
-        static let headline = Font.system(size: 17, weight: .semibold)
-        static let body = Font.system(size: 15, weight: .regular)
-        static let callout = Font.system(size: 14, weight: .regular)
-        static let caption = Font.system(size: 12, weight: .medium)
-        static let caption2 = Font.system(size: 11, weight: .regular)
-
-        static let mono = Font.system(size: 13, weight: .regular, design: .monospaced)
-        static let monoSmall = Font.system(size: 11, weight: .regular, design: .monospaced)
-        static let monoCaption = Font.system(size: 10, weight: .regular, design: .monospaced)
-
-        static let prompt = Font.system(size: 16, weight: .medium, design: .monospaced)
-
-        static let stream = Font.system(size: 14, weight: .regular)
-        static let streamMono = Font.system(size: 12, weight: .regular, design: .monospaced)
-        static let streamSmall = Font.system(size: 11, weight: .regular, design: .monospaced)
-    }
-
-    // MARK: - Spacing
-
-    enum Spacing {
-        static let xs: CGFloat = 4
-        static let sm: CGFloat = 8
-        static let md: CGFloat = 12
-        static let lg: CGFloat = 16
-        static let xl: CGFloat = 24
-        static let xxl: CGFloat = 32
-        static let xxxl: CGFloat = 48
-    }
-
-    // MARK: - Radii
-
-    enum Radius {
-        static let sm: CGFloat = 8
-        static let md: CGFloat = 12
-        static let lg: CGFloat = 16
-        static let xl: CGFloat = 20
-        static let full: CGFloat = 100
-    }
-
-    // MARK: - Animations
-
-    enum Animation {
-        static let quick = SwiftUI.Animation.easeOut(duration: 0.15)
-        static let standard = SwiftUI.Animation.easeInOut(duration: 0.25)
-        static let smooth = SwiftUI.Animation.spring(response: 0.35, dampingFraction: 0.85)
-        static let bounce = SwiftUI.Animation.spring(response: 0.4, dampingFraction: 0.7)
-        static let slow = SwiftUI.Animation.easeInOut(duration: 0.5)
+    /// Decorative icon font (SF Symbols) at a fixed point size.
+    static func icon(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight)
     }
 }
 
-// MARK: - Reusable View Modifiers
+extension Color {
+    init(hex: UInt32) {
+        self.init(
+            red: Double((hex >> 16) & 0xFF) / 255.0,
+            green: Double((hex >> 8) & 0xFF) / 255.0,
+            blue: Double(hex & 0xFF) / 255.0
+        )
+    }
+}
 
-struct GlassCard: ViewModifier {
-    var padding: CGFloat = JC.Spacing.lg
+/// Extra edge padding for chrome pinned to an edge with no system inset.
+///
+/// Home-button devices (iPhone SE class) report a zero bottom safe-area inset,
+/// so edge-pinned chrome needs explicit breathing room there; Dynamic Island
+/// devices already get it from the system insets. Derived from the root
+/// GeometryReader in RootView and injected via the environment: reading
+/// UIKit window insets during a SwiftUI body evaluation creates an
+/// AttributeGraph cycle that corrupts view-hierarchy updates.
+struct CompactEdgePads: Equatable {
+    var top: CGFloat = 0
+    var bottom: CGFloat = 0
 
-    func body(content: Content) -> some View {
+    /// Derives the pads from the container's safe-area insets.
+    init(safeArea: EdgeInsets) {
+        top = safeArea.top < 24 ? 12 : 0
+        bottom = safeArea.bottom > 0 ? 0 : 12
+    }
+
+    init() {}
+}
+
+extension EnvironmentValues {
+    @Entry var compactEdgePads = CompactEdgePads()
+}
+
+/// Card container used across screens.
+struct Card<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
         content
-            .padding(padding)
-            .background(JC.Colors.surface)
-            .clipShape(RoundedRectangle(cornerRadius: JC.Radius.md, style: .continuous))
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
             .overlay(
-                RoundedRectangle(cornerRadius: JC.Radius.md, style: .continuous)
-                    .stroke(JC.Colors.border, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Theme.border, lineWidth: 1)
             )
-    }
-}
-
-struct AccentButton: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(JC.Fonts.headline)
-            .foregroundStyle(JC.Colors.textOnAccent)
-            .padding(.horizontal, JC.Spacing.xl)
-            .padding(.vertical, JC.Spacing.md)
-            .background(JC.Colors.accent)
-            .clipShape(RoundedRectangle(cornerRadius: JC.Radius.md, style: .continuous))
-            .shadow(color: JC.Colors.accentGlow, radius: 12, y: 4)
-            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
-            .animation(JC.Animation.quick, value: configuration.isPressed)
-    }
-}
-
-struct GhostButton: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(JC.Fonts.callout)
-            .foregroundStyle(JC.Colors.textSecondary)
-            .padding(.horizontal, JC.Spacing.lg)
-            .padding(.vertical, JC.Spacing.sm)
-            .background(JC.Colors.surfaceElevated)
-            .clipShape(RoundedRectangle(cornerRadius: JC.Radius.sm, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: JC.Radius.sm, style: .continuous)
-                    .stroke(JC.Colors.border, lineWidth: 1)
-            )
-            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
-            .animation(JC.Animation.quick, value: configuration.isPressed)
-    }
-}
-
-struct PillBadge: View {
-    let text: String
-    var color: Color = JC.Colors.accent
-
-    var body: some View {
-        Text(text)
-            .font(JC.Fonts.monoCaption)
-            .foregroundStyle(color)
-            .padding(.horizontal, JC.Spacing.sm)
-            .padding(.vertical, 3)
-            .background(color.opacity(0.12))
-            .clipShape(Capsule())
-    }
-}
-
-extension View {
-    func glassCard(padding: CGFloat = JC.Spacing.lg) -> some View {
-        modifier(GlassCard(padding: padding))
-    }
-}
-
-// MARK: - Status Dot
-
-struct StatusDot: View {
-    let color: Color
-    var animated: Bool = false
-
-    @State private var isPulsing = false
-
-    var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: 8, height: 8)
-            .shadow(color: color.opacity(0.6), radius: 6)
-            .overlay(
-                Circle()
-                    .stroke(color.opacity(0.4), lineWidth: 2)
-                    .scaleEffect(isPulsing ? 1.8 : 1.0)
-                    .opacity(isPulsing ? 0 : 1)
-            )
-            .onAppear {
-                guard animated else { return }
-                withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: false)) {
-                    isPulsing = true
-                }
-            }
     }
 }

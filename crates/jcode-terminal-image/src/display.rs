@@ -1,11 +1,11 @@
 //! Terminal image display support
 //!
-//! Supports Kitty graphics protocol (Kitty, Ghostty), iTerm2 inline images,
+//! Supports Kitty graphics protocol (Kitty, Ghostty, Handterm), iTerm2 inline images,
 //! and Sixel graphics (xterm, foot, mlterm, WezTerm).
 //! Falls back to a simple placeholder if no image protocol is available.
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
@@ -40,16 +40,16 @@ impl ImageProtocol {
             return Self::Kitty;
         }
 
-        // Check TERM for kitty or ghostty
+        // Check TERM for Kitty-compatible terminals.
         if let Ok(term) = std::env::var("TERM")
-            && (term.contains("kitty") || term.contains("ghostty"))
+            && is_kitty_terminal_name(&term)
         {
             return Self::Kitty;
         }
 
-        // Check TERM_PROGRAM for Ghostty
+        // Check TERM_PROGRAM for Kitty-compatible terminals.
         if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
-            if term_program == "ghostty" {
+            if is_kitty_terminal_name(&term_program) {
                 return Self::Kitty;
             }
             if term_program == "iTerm.app" {
@@ -113,6 +113,11 @@ impl ImageProtocol {
     }
 }
 
+fn is_kitty_terminal_name(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("kitty") || value.contains("ghostty") || value.contains("handterm")
+}
+
 /// Display parameters for terminal images
 #[derive(Debug, Clone)]
 pub struct ImageDisplayParams {
@@ -152,7 +157,11 @@ impl ImageDisplayParams {
 pub fn display_image(path: &Path, params: &ImageDisplayParams) -> io::Result<bool> {
     let protocol = ImageProtocol::detect();
 
-    if !protocol.is_supported() {
+    // Protocol environment variables such as TERM are often inherited by
+    // headless commands whose stdout is redirected to an NDJSON file. Trying
+    // to render in that case is both incorrect and can deadlock when the
+    // caller already holds stdout's lock for the duration of the command.
+    if !can_display_to_stdout(protocol, io::stdout().is_terminal()) {
         return Ok(false);
     }
 
@@ -168,6 +177,10 @@ pub fn display_image(path: &Path, params: &ImageDisplayParams) -> io::Result<boo
         ImageProtocol::Sixel => display_sixel(path, params, img_width, img_height),
         ImageProtocol::None => Ok(false),
     }
+}
+
+fn can_display_to_stdout(protocol: ImageProtocol, stdout_is_terminal: bool) -> bool {
+    stdout_is_terminal && protocol.is_supported()
 }
 
 /// Get image dimensions from raw data
@@ -422,6 +435,32 @@ mod tests {
         // This test just verifies the detection doesn't panic
         let protocol = ImageProtocol::detect();
         println!("Detected protocol: {:?}", protocol);
+    }
+
+    #[test]
+    fn redirected_stdout_disables_every_image_protocol() {
+        for protocol in [
+            ImageProtocol::Kitty,
+            ImageProtocol::ITerm2,
+            ImageProtocol::Sixel,
+            ImageProtocol::None,
+        ] {
+            assert!(!can_display_to_stdout(protocol, false));
+        }
+    }
+
+    #[test]
+    fn terminal_stdout_still_allows_supported_image_protocols() {
+        assert!(can_display_to_stdout(ImageProtocol::Kitty, true));
+        assert!(can_display_to_stdout(ImageProtocol::ITerm2, true));
+        assert!(can_display_to_stdout(ImageProtocol::Sixel, true));
+        assert!(!can_display_to_stdout(ImageProtocol::None, true));
+    }
+
+    #[test]
+    fn handterm_uses_kitty_graphics_protocol() {
+        assert!(is_kitty_terminal_name("handterm"));
+        assert!(is_kitty_terminal_name("HandTerm"));
     }
 
     #[test]

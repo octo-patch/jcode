@@ -4,7 +4,7 @@
 //! need the full Agent SDK infrastructure.
 //!
 //! Automatically selects the best available backend:
-//! - OpenAI (gpt-5.3-codex-spark) if Codex credentials are available
+//! - OpenAI (gpt-5.6-luna, reasoning=none) if Codex credentials are available
 //! - Claude (claude-haiku-4-5-20241022) if Claude credentials are available
 
 use crate::auth;
@@ -13,7 +13,8 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 /// Fast/cheap OpenAI model used when Codex credentials are available.
-pub const SIDECAR_OPENAI_MODEL: &str = "gpt-5.3-codex-spark";
+pub const SIDECAR_OPENAI_MODEL: &str = "gpt-5.6-luna";
+const SIDECAR_OPENAI_REASONING: &str = "none";
 const SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL: &str = "gpt-5.4";
 const SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING: &str = "low";
 
@@ -28,6 +29,9 @@ const OPENAI_ORIGINATOR: &str = "codex_cli_rs";
 
 /// Claude Messages API endpoint (with beta=true for OAuth)
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
+
+/// Claude Messages API endpoint for direct API-key access (no OAuth beta flag).
+const CLAUDE_API_KEY_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// User-Agent for OAuth requests (must match Claude CLI format)
 const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/1.0.0";
@@ -47,6 +51,12 @@ const DEFAULT_MAX_TOKENS: u32 = 1024;
 enum SidecarBackend {
     OpenAI,
     Claude,
+    /// Dispatch through the live agent provider (`crate::provider::active_provider_fork`).
+    /// Used when neither OpenAI nor Claude OAuth credentials are present but the
+    /// user is running on another provider (Copilot, Antigravity, Gemini,
+    /// Cursor, Bedrock, OpenRouter). This is what makes the memory sidecar work
+    /// on ALL providers instead of only the two with dedicated HTTP clients.
+    Provider,
 }
 
 /// Lightweight client for fast sidecar calls
@@ -56,11 +66,16 @@ pub struct Sidecar {
     model: String,
     max_tokens: u32,
     backend: SidecarBackend,
+    /// Optional explicit reasoning effort override (OpenAI Responses API).
+    /// When `Some`, this effort is always sent; when `None`, the default
+    /// per-model behavior applies. Used by the memory benchmark to pin
+    /// GPT-5.5 with no thinking.
+    reasoning_override: Option<String>,
 }
 
 impl Sidecar {
     /// Create a new sidecar client, auto-selecting the best available backend.
-    /// Prefers OpenAI (codex-spark) if creds exist, falls back to Claude.
+    /// Prefers OpenAI (GPT-5.6 Luna with no reasoning) if creds exist, falls back to Claude.
     pub fn new() -> Self {
         let configured_model = crate::config::config().agents.memory_model.clone();
         Self::with_configured_model(configured_model)
@@ -76,20 +91,11 @@ impl Sidecar {
                         "Ignoring unsupported memory sidecar model override '{}'; expected an OpenAI or Claude model",
                         model
                     ));
-                    if auth::codex::load_credentials().is_ok() {
-                        (SidecarBackend::OpenAI, SIDECAR_OPENAI_MODEL.to_string())
-                    } else {
-                        (SidecarBackend::Claude, SIDECAR_CLAUDE_MODEL.to_string())
-                    }
+                    Self::auto_select_backend()
                 }
             }
-        } else if auth::codex::load_credentials().is_ok() {
-            (SidecarBackend::OpenAI, SIDECAR_OPENAI_MODEL.to_string())
-        } else if auth::claude::load_credentials().is_ok() {
-            (SidecarBackend::Claude, SIDECAR_CLAUDE_MODEL.to_string())
         } else {
-            // Default to Claude - will fail on use with a clear error
-            (SidecarBackend::Claude, SIDECAR_CLAUDE_MODEL.to_string())
+            Self::auto_select_backend()
         };
 
         Self {
@@ -97,7 +103,53 @@ impl Sidecar {
             model,
             max_tokens: DEFAULT_MAX_TOKENS,
             backend,
+            reasoning_override: None,
         }
+    }
+
+    /// Pick the best available sidecar backend.
+    ///
+    /// Preference order:
+    /// 1. OpenAI GPT-5.6 Luna at reasoning=none if Codex creds exist.
+    /// 2. Claude haiku (dedicated fast/cheap OAuth path) if Claude creds exist.
+    /// 3. The live agent provider (works for EVERY provider jcode supports:
+    ///    Copilot, Antigravity, Gemini, Cursor, Bedrock, OpenRouter, and even
+    ///    OpenAI/Claude API-key setups), dispatched via `complete_simple`.
+    ///
+    /// Only when no provider is registered at all do we fall back to Claude,
+    /// which then fails on use with a clear credentials error.
+    fn auto_select_backend() -> (SidecarBackend, String) {
+        if auth::codex::load_credentials().is_ok() {
+            (SidecarBackend::OpenAI, SIDECAR_OPENAI_MODEL.to_string())
+        } else if auth::claude::load_credentials().is_ok() {
+            (SidecarBackend::Claude, SIDECAR_CLAUDE_MODEL.to_string())
+        } else if let Some(provider) = crate::provider::active_provider_fork() {
+            // Dispatch through whatever provider the user is running on. The
+            // model string is informational here; the provider already has the
+            // user's selected model and routes accordingly.
+            (SidecarBackend::Provider, provider.model())
+        } else {
+            // No credentials and no live provider: default to Claude so the
+            // eventual error message is actionable.
+            (SidecarBackend::Claude, SIDECAR_CLAUDE_MODEL.to_string())
+        }
+    }
+
+    /// Whether a usable LLM backend is actually reachable for the sidecar right
+    /// now. Unlike [`Sidecar::auto_select_backend`] this does NOT fall back to a
+    /// Claude placeholder when nothing is logged in: it returns `true` only when
+    /// real Codex/Claude credentials exist or a live agent provider is
+    /// registered.
+    ///
+    /// Re-evaluated live (reads credentials/provider state on each call) so that
+    /// adding or removing a login is reflected without a restart. This is the
+    /// signal the memory system uses to decide whether the LLM precision judge
+    /// can run; if it returns `false`, memory's sidecar mode is treated as
+    /// unavailable rather than silently degrading to the no-LLM path.
+    pub fn llm_backend_available() -> bool {
+        auth::codex::load_credentials().is_ok()
+            || auth::claude::load_credentials().is_ok()
+            || crate::provider::active_provider_fork().is_some()
     }
 
     /// Return the currently selected sidecar model name.
@@ -105,11 +157,38 @@ impl Sidecar {
         &self.model
     }
 
+    /// Construct a sidecar pinned to a specific Claude model (used by the
+    /// memory recall benchmark judge so the relevance labels come from a strong,
+    /// fixed model regardless of the user's configured memory model).
+    pub fn with_claude_model(model: impl Into<String>) -> Self {
+        Self {
+            client: crate::provider::shared_http_client(),
+            model: model.into(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            backend: SidecarBackend::Claude,
+            reasoning_override: None,
+        }
+    }
+
+    /// Construct a sidecar pinned to a specific OpenAI model via Codex/OpenAI
+    /// OAuth, with an optional explicit reasoning effort (e.g. "none"/"minimal"
+    /// for no-thinking). Used by the memory recall benchmark judge.
+    pub fn with_openai_model(model: impl Into<String>, reasoning_effort: Option<String>) -> Self {
+        Self {
+            client: crate::provider::shared_http_client(),
+            model: model.into(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            backend: SidecarBackend::OpenAI,
+            reasoning_override: reasoning_effort,
+        }
+    }
+
     /// Return the currently selected backend label.
     pub fn backend_name(&self) -> &'static str {
         match self.backend {
             SidecarBackend::OpenAI => "openai",
             SidecarBackend::Claude => "claude",
+            SidecarBackend::Provider => "provider",
         }
     }
 
@@ -119,7 +198,24 @@ impl Sidecar {
         match self.backend {
             SidecarBackend::OpenAI => self.complete_openai(system, user_message).await,
             SidecarBackend::Claude => self.complete_claude(system, user_message).await,
+            SidecarBackend::Provider => self.complete_via_provider(system, user_message).await,
         }
+    }
+
+    /// Complete via the live agent provider (`complete_simple`).
+    ///
+    /// This is the universal path: it works for every provider jcode supports,
+    /// because `complete_simple` is a default method on the `Provider` trait that
+    /// collects the streamed `TextDelta`s into a single string. The provider was
+    /// forked at construction time, so it carries the user's selected model.
+    async fn complete_via_provider(&self, system: &str, user_message: &str) -> Result<String> {
+        let provider = crate::provider::active_provider_fork().context(
+            "No active provider registered for sidecar; memory features require a logged-in provider",
+        )?;
+        provider
+            .complete_simple(user_message, system)
+            .await
+            .context("Sidecar completion via active provider failed")
     }
 
     /// Complete via OpenAI Responses API.
@@ -140,8 +236,12 @@ impl Sidecar {
         };
         let url = format!("{}/{}", base.trim_end_matches('/'), OPENAI_RESPONSES_PATH);
 
-        let (primary_model, primary_reasoning) =
+        let (primary_model, resolved_reasoning) =
             resolve_openai_request_model(&self.model, is_chatgpt_mode);
+        // An explicit reasoning override (e.g. benchmark judge pinning GPT-5.5
+        // to no-thinking) always wins over the per-model default.
+        let primary_reasoning: Option<&str> =
+            self.reasoning_override.as_deref().or(resolved_reasoning);
 
         match self
             .complete_openai_with_model(
@@ -195,6 +295,35 @@ impl Sidecar {
                             SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL,
                         );
                         Ok(text)
+                    }
+                    Err(OpenAiSidecarError::Api { status, body })
+                        if is_openai_model_unavailable(status, &body)
+                            && auth::claude::load_credentials().is_ok() =>
+                    {
+                        // Both GPT-5.6 Luna and the gpt-5.4 OAuth
+                        // fallback are denied for this ChatGPT account. Rather
+                        // than dead-end the sidecar, fall back to Claude haiku
+                        // when Claude credentials are available.
+                        let reason = classify_openai_model_unavailable(status, &body)
+                            .unwrap_or_else(|| {
+                                format!("model denied by OpenAI API (status {})", status)
+                            });
+                        crate::provider::record_model_unavailable_for_account(
+                            SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL,
+                            &reason,
+                        );
+                        crate::logging::info(&format!(
+                            "Sidecar fallback: {} also unavailable in ChatGPT OAuth mode; falling back to Claude {} ({})",
+                            SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL, SIDECAR_CLAUDE_MODEL, reason
+                        ));
+                        let claude = Self {
+                            client: self.client.clone(),
+                            model: SIDECAR_CLAUDE_MODEL.to_string(),
+                            max_tokens: self.max_tokens,
+                            backend: SidecarBackend::Claude,
+                            reasoning_override: None,
+                        };
+                        claude.complete_claude(system, user_message).await
                     }
                     Err(err) => Err(err.into_anyhow()),
                 }
@@ -268,6 +397,43 @@ impl Sidecar {
 
     /// Complete via Claude Messages API
     async fn complete_claude(&self, system: &str, user_message: &str) -> Result<String> {
+        // Respect the runtime's pinned Anthropic credential mode. The main agent
+        // may be running in API-key mode (`claude-api`), where the org forbids
+        // OAuth and Anthropic returns a 403 "OAuth authentication is currently
+        // not allowed for this organization." The sidecar previously hardcoded
+        // the OAuth path, so memory calls (consensus judge, extraction) failed
+        // even though the main agent worked fine on the API key. Mirror the main
+        // provider's resolution: use the direct API key when API-key mode is
+        // pinned (or when no OAuth credentials exist but a key does), and fall
+        // back to the API key if an OAuth request is rejected as forbidden.
+        if anthropic_sidecar_prefers_api_key()
+            && let Ok(key) = crate::provider::anthropic::load_anthropic_api_key()
+        {
+            return self
+                .complete_claude_api_key(system, user_message, &key)
+                .await;
+        }
+
+        match self.complete_claude_oauth(system, user_message).await {
+            Ok(text) => Ok(text),
+            Err(err) if is_anthropic_oauth_forbidden(&err) => {
+                match crate::provider::anthropic::load_anthropic_api_key() {
+                    Ok(key) => {
+                        crate::logging::info(
+                            "Sidecar Claude: OAuth forbidden for organization; falling back to API key",
+                        );
+                        self.complete_claude_api_key(system, user_message, &key)
+                            .await
+                    }
+                    Err(_) => Err(err),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// OAuth (Claude subscription) completion path.
+    async fn complete_claude_oauth(&self, system: &str, user_message: &str) -> Result<String> {
         let creds = auth::claude::load_credentials()
             .context("Failed to load Claude credentials for sidecar")?;
 
@@ -296,6 +462,47 @@ impl Sidecar {
         .await
         .context("Failed to send request to Claude API")?;
 
+        Self::parse_claude_response(response).await
+    }
+
+    /// Direct API-key completion path (`x-api-key`).
+    ///
+    /// Unlike the OAuth path this must NOT inject the "You are Claude Code"
+    /// identity spoof: that block is only valid for the OAuth/subscription
+    /// endpoint and a direct API key talks to the standard Messages API.
+    async fn complete_claude_api_key(
+        &self,
+        system: &str,
+        user_message: &str,
+        api_key: &str,
+    ) -> Result<String> {
+        let request = ClaudeMessagesRequest {
+            model: &self.model,
+            max_tokens: self.max_tokens,
+            system: build_claude_api_key_system_param(system),
+            messages: vec![ClaudeMessage {
+                role: "user",
+                content: user_message,
+            }],
+        };
+
+        let response = self
+            .client
+            .post(CLAUDE_API_KEY_URL)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to send request to Claude API")?;
+
+        Self::parse_claude_response(response).await
+    }
+
+    /// Shared response parsing for both Claude credential paths.
+    async fn parse_claude_response(response: reqwest::Response) -> Result<String> {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
@@ -475,16 +682,19 @@ fn resolve_openai_request_model(
     preferred_model: &str,
     is_chatgpt_mode: bool,
 ) -> (&str, Option<&'static str>) {
-    if !is_chatgpt_mode || preferred_model != SIDECAR_OPENAI_MODEL {
+    if preferred_model != SIDECAR_OPENAI_MODEL {
         return (preferred_model, None);
     }
 
-    match crate::provider::is_model_available_for_account(SIDECAR_OPENAI_MODEL) {
-        Some(false) => (
+    match (
+        is_chatgpt_mode,
+        crate::provider::is_model_available_for_account(SIDECAR_OPENAI_MODEL),
+    ) {
+        (true, Some(false)) => (
             SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL,
             Some(SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING),
         ),
-        _ => (SIDECAR_OPENAI_MODEL, None),
+        _ => (SIDECAR_OPENAI_MODEL, Some(SIDECAR_OPENAI_REASONING)),
     }
 }
 
@@ -725,6 +935,46 @@ fn build_claude_system_param(system: &str) -> Option<ClaudeApiSystem<'_>> {
     Some(ClaudeApiSystem::Blocks(blocks))
 }
 
+/// Build the system param for the direct API-key path.
+///
+/// The "You are Claude Code" identity spoof and jcode notice are only valid
+/// for the OAuth/subscription endpoint; a direct API key talks to the standard
+/// Messages API and must not impersonate the official CLI. So this only carries
+/// the caller's own system prompt (if any).
+fn build_claude_api_key_system_param(system: &str) -> Option<ClaudeApiSystem<'_>> {
+    if system.is_empty() {
+        return None;
+    }
+    Some(ClaudeApiSystem::Blocks(vec![ClaudeApiSystemBlock {
+        block_type: "text",
+        text: system,
+    }]))
+}
+
+/// Whether the sidecar's Claude backend should use the direct API key rather
+/// than OAuth. True when the runtime is pinned to Anthropic API-key mode
+/// (`claude-api`), or when no OAuth credentials are present at all. Mirrors the
+/// main provider's resolution so memory features authenticate the same way the
+/// agent does.
+fn anthropic_sidecar_prefers_api_key() -> bool {
+    match jcode_provider_core::runtime_env_pinned_mode(
+        jcode_provider_core::DualAuthProvider::Anthropic,
+    ) {
+        Some(jcode_provider_core::AuthMode::ApiKey) => true,
+        Some(jcode_provider_core::AuthMode::Oauth) => false,
+        None => auth::claude::load_credentials().is_err(),
+    }
+}
+
+/// Recognize the Anthropic "OAuth not allowed for this organization" 403 so the
+/// sidecar can transparently fall back to the API key.
+fn is_anthropic_oauth_forbidden(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("403")
+        && (msg.contains("OAuth authentication is currently not allowed")
+            || msg.contains("permission_error"))
+}
+
 #[derive(Deserialize)]
 struct ClaudeMessagesResponse {
     content: Vec<ClaudeContentBlock>,
@@ -786,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_sidecar_fast_model() {
-        assert_eq!(SIDECAR_FAST_MODEL, "gpt-5.3-codex-spark");
+        assert_eq!(SIDECAR_FAST_MODEL, "gpt-5.6-luna");
     }
 
     #[test]
@@ -818,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chatgpt_oauth_keeps_spark_when_available() {
+    fn test_chatgpt_oauth_uses_luna_with_no_reasoning_when_available() {
         let _guard = crate::storage::lock_test_env();
         let temp = tempfile::TempDir::new().expect("create temp jcode home");
         let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
@@ -831,13 +1081,13 @@ mod tests {
 
         let (model, reasoning) = resolve_openai_request_model(SIDECAR_OPENAI_MODEL, true);
         assert_eq!(model, SIDECAR_OPENAI_MODEL);
-        assert_eq!(reasoning, None);
+        assert_eq!(reasoning, Some(SIDECAR_OPENAI_REASONING));
 
         codex::set_active_account_override(None);
     }
 
     #[test]
-    fn test_chatgpt_oauth_falls_back_to_gpt_5_4_low_when_spark_unavailable() {
+    fn test_chatgpt_oauth_falls_back_to_gpt_5_4_low_when_luna_unavailable() {
         let _guard = crate::storage::lock_test_env();
         let temp = tempfile::TempDir::new().expect("create temp jcode home");
         let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
@@ -855,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_openai_request_adds_low_reasoning_only_for_fallback() {
+    fn test_build_openai_request_uses_configured_default_and_fallback_reasoning() {
         let request = build_openai_request(
             SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL,
             "system",
@@ -869,8 +1119,201 @@ mod tests {
             serde_json::json!({"effort": SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING})
         );
 
-        let spark_request =
-            build_openai_request(SIDECAR_OPENAI_MODEL, "system", "hello", true, None);
-        assert!(spark_request.get("reasoning").is_none());
+        let luna_request = build_openai_request(
+            SIDECAR_OPENAI_MODEL,
+            "system",
+            "hello",
+            true,
+            Some(SIDECAR_OPENAI_REASONING),
+        );
+        assert_eq!(luna_request["model"], SIDECAR_OPENAI_MODEL);
+        assert_eq!(
+            luna_request["reasoning"],
+            serde_json::json!({"effort": SIDECAR_OPENAI_REASONING})
+        );
+    }
+
+    #[test]
+    fn test_openai_api_key_mode_uses_luna_with_no_reasoning() {
+        let (model, reasoning) = resolve_openai_request_model(SIDECAR_OPENAI_MODEL, false);
+        assert_eq!(model, SIDECAR_OPENAI_MODEL);
+        assert_eq!(reasoning, Some(SIDECAR_OPENAI_REASONING));
+    }
+
+    // ---- Provider-backed sidecar (works on ALL providers) -------------------
+
+    /// Minimal provider stub that echoes a fixed reply for `complete`, so the
+    /// default `complete_simple` path the sidecar uses can be exercised without
+    /// network access. Stands in for any of the 8 real providers.
+    struct StubProvider {
+        name: &'static str,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for StubProvider {
+        async fn complete(
+            &self,
+            _messages: &[crate::message::Message],
+            _tools: &[crate::message::ToolDefinition],
+            _system: &str,
+            _resume_session_id: Option<&str>,
+        ) -> Result<crate::provider::EventStream> {
+            let reply = self.reply.clone();
+            let stream = futures::stream::once(async move {
+                Ok(jcode_message_types::StreamEvent::TextDelta(reply))
+            });
+            Ok(Box::pin(stream))
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn model(&self) -> String {
+            format!("{}-model", self.name)
+        }
+
+        fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+            std::sync::Arc::new(StubProvider {
+                name: self.name,
+                reply: self.reply.clone(),
+            })
+        }
+    }
+
+    /// With NO OpenAI/Claude credentials, the sidecar must select the live
+    /// agent provider (the universal path) instead of failing. This is the core
+    /// guarantee that memory features work on every provider, not just two.
+    #[test]
+    fn sidecar_uses_active_provider_when_no_oauth_creds() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("create temp jcode home");
+        let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+
+        // Simulate running on a non-OpenAI/Claude provider (e.g. Gemini).
+        crate::provider::set_active_provider(std::sync::Arc::new(StubProvider {
+            name: "gemini",
+            reply: "[2,1]".to_string(),
+        }));
+
+        let sidecar = Sidecar::with_configured_model(None);
+        assert_eq!(
+            sidecar.backend_name(),
+            "provider",
+            "with no OAuth creds, the sidecar must route through the active provider"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt
+            .block_on(sidecar.complete("rank these", "1. a\n2. b"))
+            .expect("provider-backed completion should succeed");
+        assert_eq!(out, "[2,1]", "sidecar must return the provider's text");
+    }
+
+    /// Every provider jcode supports should drive the sidecar end-to-end via the
+    /// universal `complete_simple` path. We iterate over each provider label to
+    /// make the "works for ALL providers" guarantee explicit and regression-proof.
+    #[test]
+    fn sidecar_provider_path_works_for_all_providers() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("create temp jcode home");
+        let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for provider in [
+            "claude",
+            "openai",
+            "copilot",
+            "antigravity",
+            "gemini",
+            "cursor",
+            "bedrock",
+            "openrouter",
+        ] {
+            crate::provider::set_active_provider(std::sync::Arc::new(StubProvider {
+                name: provider,
+                reply: "[1]".to_string(),
+            }));
+            let sidecar = Sidecar::with_configured_model(None);
+            assert_eq!(
+                sidecar.backend_name(),
+                "provider",
+                "{provider}: sidecar should use the provider path with no OAuth creds"
+            );
+            let out = rt
+                .block_on(sidecar.complete("sys", "user"))
+                .unwrap_or_else(|e| panic!("{provider}: provider-backed completion failed: {e}"));
+            assert_eq!(out, "[1]", "{provider}: sidecar must echo provider output");
+        }
+    }
+
+    #[test]
+    fn test_is_anthropic_oauth_forbidden() {
+        // The exact error string the sidecar surfaces from a forbidden OAuth org.
+        let forbidden = anyhow::anyhow!(
+            "Claude API error (403 Forbidden): {{\"type\":\"error\",\"error\":{{\"type\":\"permission_error\",\"message\":\"OAuth authentication is currently not allowed for this organization.\"}}}}"
+        );
+        assert!(is_anthropic_oauth_forbidden(&forbidden));
+
+        // Unrelated failures must NOT trigger the API-key fallback.
+        assert!(!is_anthropic_oauth_forbidden(&anyhow::anyhow!(
+            "Claude API error (401 Unauthorized): bad token"
+        )));
+        assert!(!is_anthropic_oauth_forbidden(&anyhow::anyhow!(
+            "Failed to send request to Claude API"
+        )));
+        // A 403 from a permission_error (the organization gate) still counts even
+        // if the human-readable message phrasing changes slightly.
+        assert!(is_anthropic_oauth_forbidden(&anyhow::anyhow!(
+            "Claude API error (403 Forbidden): {{\"error\":{{\"type\":\"permission_error\"}}}}"
+        )));
+    }
+
+    #[test]
+    fn test_build_claude_api_key_system_param_omits_identity_spoof() {
+        // API-key path must NOT impersonate the official Claude Code CLI.
+        let none = build_claude_api_key_system_param("");
+        assert!(none.is_none(), "empty system => no system param");
+
+        let ClaudeApiSystem::Blocks(blocks) =
+            build_claude_api_key_system_param("be terse").expect("system present");
+        assert_eq!(blocks.len(), 1, "only the caller's system prompt is sent");
+        assert_eq!(blocks[0].text, "be terse");
+
+        // The OAuth builder, by contrast, injects the Claude Code identity spoof.
+        let ClaudeApiSystem::Blocks(oauth_blocks) =
+            build_claude_system_param("be terse").expect("oauth system present");
+        assert!(
+            oauth_blocks.iter().any(|b| b.text == CLAUDE_CODE_IDENTITY),
+            "oauth path keeps the identity block"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_sidecar_prefers_api_key_respects_pinned_mode() {
+        // Pinning the runtime to API-key mode must make the sidecar prefer the key.
+        let _g =
+            EnvVarGuard::set_path("JCODE_RUNTIME_PROVIDER", std::path::Path::new("claude-api"));
+        assert!(
+            anthropic_sidecar_prefers_api_key(),
+            "claude-api runtime => prefer API key"
+        );
+
+        // Pinning to OAuth mode must NOT prefer the key.
+        let _g2 = EnvVarGuard::set_path("JCODE_RUNTIME_PROVIDER", std::path::Path::new("claude"));
+        assert!(
+            !anthropic_sidecar_prefers_api_key(),
+            "claude (oauth) runtime => do not force API key"
+        );
     }
 }

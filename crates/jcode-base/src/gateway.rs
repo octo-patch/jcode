@@ -24,10 +24,17 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::logging;
 mod auth;
+pub mod control;
 mod registry;
-use auth::{WsAuth, WsAuthSource, extract_ws_auth, ws_error_response};
+use auth::{
+    AuthorizedDevice, WsAuth, WsAuthSource, authorize_ws_device, extract_ws_auth, ws_error_response,
+};
 #[cfg(test)]
 pub(crate) use auth::{is_valid_hex_token, parse_bearer_token, parse_query_token};
+pub use control::{
+    PairingInvite, RemoteCommand, RemoteStatus, ToggleOutcome, create_pairing_invite,
+    parse_remote_command, revoke_device, set_gateway_enabled,
+};
 pub use jcode_gateway_types::{PairedDevice, PairingCode};
 pub use registry::DeviceRegistry;
 
@@ -144,7 +151,10 @@ async fn handle_ws_connection(
 ) -> Result<()> {
     // Perform WebSocket handshake with a callback to inspect headers.
     // Prefer Authorization headers, but continue accepting ?token= for browser clients.
-    let auth = Arc::new(std::sync::Mutex::new(None::<WsAuth>));
+    // Token validation happens HERE, before the handshake completes, so
+    // revoked/unknown tokens receive a proper 401 instead of a silent
+    // accept-then-drop (which clients cannot distinguish from network flakes).
+    let auth = Arc::new(std::sync::Mutex::new(None::<(WsAuth, AuthorizedDevice)>));
     let auth_cb = Arc::clone(&auth);
 
     let ws_stream = tokio_tungstenite::accept_hdr_async(
@@ -160,22 +170,24 @@ async fn handle_ws_connection(
             }
 
             let ws_auth = extract_ws_auth(request)?;
+            // Reload from disk to pick up newly paired or revoked devices.
+            let device = authorize_ws_device(&DeviceRegistry::load(), &ws_auth.token)?;
             let mut guard = auth_cb
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *guard = Some(ws_auth);
+            *guard = Some((ws_auth, device));
             Ok(response)
         },
     )
     .await?;
 
-    // Validate auth token
-    let auth = auth
+    let (auth, device) = auth
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take()
         .ok_or_else(|| anyhow::anyhow!("No auth token provided"))?;
     let token = auth.token;
+    let (device_name, device_id) = (device.name, device.id);
 
     if auth.source == WsAuthSource::Query {
         logging::info(&format!(
@@ -184,22 +196,12 @@ async fn handle_ws_connection(
         ));
     }
 
-    let (device_name, device_id) = {
+    {
         let mut reg = registry.write().await;
-        // Reload from disk to pick up newly paired devices
+        // Reload from disk so the shared registry matches what we validated.
         *reg = DeviceRegistry::load();
-        match reg.validate_token(&token) {
-            Some(device) => {
-                let name = device.name.clone();
-                let id = device.id.clone();
-                reg.touch_device(&token);
-                (name, id)
-            }
-            None => {
-                anyhow::bail!("Invalid auth token from {}", peer_addr);
-            }
-        }
-    };
+        reg.touch_device(&token);
+    }
 
     logging::info(&format!(
         "Gateway: {} connected (device: {}, addr: {})",
@@ -320,6 +322,12 @@ async fn handle_ws_connection(
     Ok(())
 }
 
+/// Finds the end of HTTP headers (`\r\n\r\n`), returning the offset of the
+/// terminator start.
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
 fn http_response(status: u16, status_text: &str, body: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n{}",
@@ -338,8 +346,55 @@ async fn handle_http(
     registry: Arc<tokio::sync::RwLock<DeviceRegistry>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 8192];
-    let n = tcp_stream.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+    let mut filled = 0usize;
+    // Read until end of headers. Clients like URLSession may deliver headers
+    // and body in separate TCP segments, so a single read is not enough.
+    let header_end = loop {
+        if filled == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+        let n = tcp_stream.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break None;
+        }
+        filled += n;
+        if let Some(pos) = find_header_end(&buf[..filled]) {
+            break Some(pos);
+        }
+        if filled > 64 * 1024 {
+            anyhow::bail!("HTTP request headers too large from {}", peer_addr);
+        }
+    };
+    let Some(header_end) = header_end else {
+        anyhow::bail!("HTTP connection closed before headers from {}", peer_addr);
+    };
+
+    // Read the remaining body bytes per Content-Length, if any.
+    let headers_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let content_length = headers_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    let expected_total = body_start.saturating_add(content_length.min(1024 * 1024));
+    while filled < expected_total {
+        if filled == buf.len() {
+            buf.resize(expected_total.max(buf.len() * 2), 0);
+        }
+        let n = tcp_stream.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    let request = String::from_utf8_lossy(&buf[..filled]);
 
     let first_line = request.lines().next().unwrap_or("");
     let (method, path) = {
@@ -363,7 +418,7 @@ async fn handle_http(
         ("GET", "/health") => {
             let body = serde_json::json!({
                 "status": "ok",
-                "version": jcode_build_meta::VERSION,
+                "version": jcode_build_meta::version(),
                 "gateway": true,
             });
             http_response(200, "OK", &body.to_string())
@@ -456,9 +511,107 @@ async fn handle_pair_request(
     let body = serde_json::json!({
         "token": token,
         "server_name": "jcode",
-        "server_version": jcode_build_meta::VERSION,
+        "server_version": jcode_build_meta::version(),
     });
     http_response(200, "OK", &body.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Reachable-host resolution
+// ---------------------------------------------------------------------------
+
+/// Placeholder returned when no reachable host name can be determined.
+pub const UNKNOWN_CONNECT_HOST: &str = "<this-machine>";
+
+/// Parse the machine's own MagicDNS name out of `tailscale status --json`.
+pub fn parse_tailscale_dns_name(status_json: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(status_json).ok()?;
+    let dns_name = value
+        .get("Self")?
+        .get("DNSName")?
+        .as_str()?
+        .trim()
+        .trim_end_matches('.')
+        .to_string();
+
+    if dns_name.is_empty() {
+        None
+    } else {
+        Some(dns_name)
+    }
+}
+
+/// Best-effort MagicDNS name for this machine, if Tailscale is installed.
+pub fn detect_tailscale_dns_name() -> Option<String> {
+    let output = std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_tailscale_dns_name(&output.stdout)
+}
+
+/// Resolve the address a remote client should actually dial.
+///
+/// A wildcard `bind_addr` says nothing about how to reach this machine, so fall
+/// back through the explicit override, Tailscale MagicDNS, and finally the
+/// system hostname.
+pub fn resolve_connect_host(bind_addr: &str) -> String {
+    if bind_addr != "0.0.0.0" && bind_addr != "::" {
+        return bind_addr.to_string();
+    }
+
+    if let Some(host) = std::env::var("JCODE_GATEWAY_HOST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return host;
+    }
+
+    if let Some(host) = detect_tailscale_dns_name() {
+        return host;
+    }
+
+    system_hostname().unwrap_or_else(|| UNKNOWN_CONNECT_HOST.to_string())
+}
+
+/// The system hostname, via `$HOSTNAME` and then the `hostname` command.
+///
+/// `$HOSTNAME` is a shell variable that is frequently not exported, so it
+/// cannot be the only source.
+fn system_hostname() -> Option<String> {
+    if let Some(host) = std::env::var("HOSTNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(host);
+    }
+
+    match std::process::Command::new("hostname").output() {
+        Ok(output) if output.status.success() => {
+            let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if host.is_empty() { None } else { Some(host) }
+        }
+        Ok(output) => {
+            logging::info(&format!(
+                "gateway: `hostname` exited with {}; cannot infer a reachable address",
+                output.status
+            ));
+            None
+        }
+        Err(error) => {
+            logging::info(&format!(
+                "gateway: could not run `hostname` ({error}); cannot infer a reachable address"
+            ));
+            None
+        }
+    }
 }
 
 #[cfg(test)]

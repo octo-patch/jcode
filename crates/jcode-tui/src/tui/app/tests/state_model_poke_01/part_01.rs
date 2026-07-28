@@ -12,6 +12,56 @@ fn test_context_limit_error_detection() {
 }
 
 #[test]
+fn test_request_payload_too_large_error_detection() {
+    assert!(is_request_payload_too_large_error(
+        "Anthropic API error (413 Payload Too Large): {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}"
+    ));
+    assert!(!is_request_payload_too_large_error(
+        "rate limit exceeded, retry after 20s"
+    ));
+    // A plain token-context overflow is not a payload-size error.
+    assert!(!is_request_payload_too_large_error(
+        "This model's maximum context length is 200000 tokens"
+    ));
+}
+
+#[test]
+fn test_strip_oversized_images_drops_oldest_first() {
+    use crate::message::ContentBlock;
+    let mut app = create_test_app();
+    app.session.replace_messages(Vec::new());
+
+    let big = "a".repeat(8 * 1024 * 1024); // 8 MiB base64 image each
+    for _ in 0..3 {
+        app.session.add_message(
+            Role::User,
+            vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: big.clone(),
+            }],
+        );
+    }
+
+    // 24 MiB of images, budget 12 MiB → drop the two oldest, keep the newest.
+    let stripped = app
+        .session
+        .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+    assert_eq!(stripped, 2);
+    assert!(matches!(
+        app.session.messages[0].content[0],
+        ContentBlock::Text { .. }
+    ));
+    assert!(matches!(
+        app.session.messages[1].content[0],
+        ContentBlock::Text { .. }
+    ));
+    assert!(matches!(
+        app.session.messages[2].content[0],
+        ContentBlock::Image { .. }
+    ));
+}
+
+#[test]
 fn test_rewind_truncates_provider_messages() {
     let mut app = create_test_app();
     app.session.replace_messages(Vec::new());
@@ -177,16 +227,16 @@ fn test_accumulate_streaming_output_tokens_uses_deltas() {
     let mut app = create_test_app();
     let mut seen = 0;
 
-    app.streaming_tps_collect_output = true;
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
+    app.streaming.streaming_tps_collect_output = true;
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
 
     app.accumulate_streaming_output_tokens(10, &mut seen);
     app.accumulate_streaming_output_tokens(30, &mut seen);
     app.accumulate_streaming_output_tokens(30, &mut seen);
 
-    assert_eq!(app.streaming_total_output_tokens, 30);
-    assert_eq!(app.streaming_tps_observed_output_tokens, 30);
-    assert!(app.streaming_tps_observed_elapsed >= Duration::from_secs(9));
+    assert_eq!(app.streaming.streaming_total_output_tokens, 30);
+    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 30);
+    assert!(app.streaming.streaming_tps_observed_elapsed >= Duration::from_secs(9));
     assert_eq!(seen, 30);
 }
 
@@ -196,25 +246,25 @@ fn test_accumulate_streaming_output_tokens_ignores_hidden_output_phase() {
     let mut seen = 0;
 
     app.accumulate_streaming_output_tokens(20, &mut seen);
-    assert_eq!(app.streaming_total_output_tokens, 0);
-    assert_eq!(app.streaming_tps_observed_output_tokens, 0);
+    assert_eq!(app.streaming.streaming_total_output_tokens, 0);
+    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 0);
     assert_eq!(seen, 20);
 
-    app.streaming_tps_collect_output = true;
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
+    app.streaming.streaming_tps_collect_output = true;
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
     app.accumulate_streaming_output_tokens(60, &mut seen);
 
-    assert_eq!(app.streaming_total_output_tokens, 40);
-    assert_eq!(app.streaming_tps_observed_output_tokens, 40);
+    assert_eq!(app.streaming.streaming_total_output_tokens, 40);
+    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 40);
     assert_eq!(seen, 60);
 }
 
 #[test]
 fn test_compute_streaming_tps_uses_latest_observed_snapshot_instead_of_current_repaint_time() {
     let mut app = create_test_app();
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(20));
-    app.streaming_tps_observed_output_tokens = 40;
-    app.streaming_tps_observed_elapsed = Duration::from_secs(10);
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(20));
+    app.streaming.streaming_tps_observed_output_tokens = 40;
+    app.streaming.streaming_tps_observed_elapsed = Duration::from_secs(10);
 
     let tps = app.compute_streaming_tps().expect("tps");
     assert!(tps > 3.9 && tps < 4.1, "unexpected tps: {tps}");
@@ -225,12 +275,12 @@ fn test_compute_streaming_tps_does_not_decay_on_redundant_usage_snapshots() {
     let mut app = create_test_app();
     let mut seen = 0;
 
-    app.streaming_tps_collect_output = true;
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
+    app.streaming.streaming_tps_collect_output = true;
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
     app.accumulate_streaming_output_tokens(40, &mut seen);
     let initial_tps = app.compute_streaming_tps().expect("initial tps");
 
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(30));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(30));
     app.accumulate_streaming_output_tokens(40, &mut seen);
 
     let tps = app.compute_streaming_tps().expect("tps");
@@ -249,21 +299,21 @@ fn test_compute_streaming_tps_bursty_stream_simulation_stays_constant_between_re
     let mut app = create_test_app();
     let mut seen = 0;
 
-    app.streaming_tps_collect_output = true;
+    app.streaming.streaming_tps_collect_output = true;
 
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(2));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(2));
     app.accumulate_streaming_output_tokens(10, &mut seen);
     let tps_after_first_burst = app.compute_streaming_tps().expect("tps after first burst");
 
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(5));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(5));
     app.accumulate_streaming_output_tokens(10, &mut seen);
     let tps_after_idle_gap = app.compute_streaming_tps().expect("tps after idle gap");
 
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(6));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(6));
     app.accumulate_streaming_output_tokens(30, &mut seen);
     let tps_after_second_burst = app.compute_streaming_tps().expect("tps after second burst");
 
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(9));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(9));
     app.accumulate_streaming_output_tokens(30, &mut seen);
     let tps_after_second_idle_gap = app
         .compute_streaming_tps()
@@ -292,48 +342,48 @@ fn test_streaming_tps_timer_resume_pause_reset_lifecycle() {
     let mut app = create_test_app();
 
     assert_eq!(app.current_streaming_tps_elapsed(), Duration::ZERO);
-    assert!(!app.streaming_tps_collect_output);
+    assert!(!app.streaming.streaming_tps_collect_output);
 
     app.resume_streaming_tps();
-    assert!(app.streaming_tps_collect_output);
-    assert!(app.streaming_tps_start.is_some());
+    assert!(app.streaming.streaming_tps_collect_output);
+    assert!(app.streaming.streaming_tps_start.is_some());
 
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(2));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(2));
     app.pause_streaming_tps(true);
-    assert!(app.streaming_tps_collect_output);
-    assert!(app.streaming_tps_start.is_none());
-    assert!(app.streaming_tps_elapsed >= Duration::from_secs(2));
+    assert!(app.streaming.streaming_tps_collect_output);
+    assert!(app.streaming.streaming_tps_start.is_none());
+    assert!(app.streaming.streaming_tps_elapsed >= Duration::from_secs(2));
 
-    let elapsed_after_pause = app.streaming_tps_elapsed;
+    let elapsed_after_pause = app.streaming.streaming_tps_elapsed;
     app.pause_streaming_tps(false);
-    assert!(!app.streaming_tps_collect_output);
-    assert_eq!(app.streaming_tps_elapsed, elapsed_after_pause);
+    assert!(!app.streaming.streaming_tps_collect_output);
+    assert_eq!(app.streaming.streaming_tps_elapsed, elapsed_after_pause);
 
-    app.streaming_total_output_tokens = 42;
-    app.streaming_tps_observed_output_tokens = 42;
-    app.streaming_tps_observed_elapsed = elapsed_after_pause;
+    app.streaming.streaming_total_output_tokens = 42;
+    app.streaming.streaming_tps_observed_output_tokens = 42;
+    app.streaming.streaming_tps_observed_elapsed = elapsed_after_pause;
     app.reset_streaming_tps();
 
-    assert_eq!(app.streaming_tps_elapsed, Duration::ZERO);
-    assert_eq!(app.streaming_total_output_tokens, 0);
-    assert_eq!(app.streaming_tps_observed_output_tokens, 0);
-    assert_eq!(app.streaming_tps_observed_elapsed, Duration::ZERO);
-    assert!(!app.streaming_tps_collect_output);
-    assert!(app.streaming_tps_start.is_none());
+    assert_eq!(app.streaming.streaming_tps_elapsed, Duration::ZERO);
+    assert_eq!(app.streaming.streaming_total_output_tokens, 0);
+    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 0);
+    assert_eq!(app.streaming.streaming_tps_observed_elapsed, Duration::ZERO);
+    assert!(!app.streaming.streaming_tps_collect_output);
+    assert!(app.streaming.streaming_tps_start.is_none());
 }
 
 #[test]
 fn test_compute_streaming_tps_requires_tokens_and_minimum_elapsed() {
     let mut app = create_test_app();
 
-    app.streaming_tps_observed_elapsed = Duration::from_secs(10);
+    app.streaming.streaming_tps_observed_elapsed = Duration::from_secs(10);
     assert!(app.compute_streaming_tps().is_none());
 
-    app.streaming_tps_observed_output_tokens = 10;
-    app.streaming_tps_observed_elapsed = Duration::from_millis(100);
+    app.streaming.streaming_tps_observed_output_tokens = 10;
+    app.streaming.streaming_tps_observed_elapsed = Duration::from_millis(100);
     assert!(app.compute_streaming_tps().is_none());
 
-    app.streaming_tps_observed_elapsed = Duration::from_millis(250);
+    app.streaming.streaming_tps_observed_elapsed = Duration::from_millis(250);
     let tps = app.compute_streaming_tps().expect("tps above threshold");
     assert!(tps > 35.0 && tps <= 40.0, "unexpected tps: {tps}");
 }
@@ -343,16 +393,16 @@ fn test_accumulate_streaming_output_tokens_counts_provider_usage_reset_once() {
     let mut app = create_test_app();
     let mut seen = 80;
 
-    app.streaming_tps_collect_output = true;
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
+    app.streaming.streaming_tps_collect_output = true;
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
 
     app.accumulate_streaming_output_tokens(20, &mut seen);
-    assert_eq!(app.streaming_total_output_tokens, 20);
+    assert_eq!(app.streaming.streaming_total_output_tokens, 20);
     assert_eq!(seen, 20);
 
     app.accumulate_streaming_output_tokens(25, &mut seen);
-    assert_eq!(app.streaming_total_output_tokens, 25);
-    assert_eq!(app.streaming_tps_observed_output_tokens, 25);
+    assert_eq!(app.streaming.streaming_total_output_tokens, 25);
+    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 25);
     assert_eq!(seen, 25);
 }
 
@@ -361,18 +411,18 @@ fn test_streaming_tps_late_final_usage_after_pause_uses_paused_elapsed() {
     let mut app = create_test_app();
     let mut seen = 0;
 
-    app.streaming_tps_collect_output = true;
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
+    app.streaming.streaming_tps_collect_output = true;
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(10));
     app.pause_streaming_tps(true);
 
-    assert!(app.streaming_tps_start.is_none());
-    assert!(app.streaming_tps_elapsed >= Duration::from_secs(10));
+    assert!(app.streaming.streaming_tps_start.is_none());
+    assert!(app.streaming.streaming_tps_elapsed >= Duration::from_secs(10));
 
     app.accumulate_streaming_output_tokens(40, &mut seen);
 
-    assert_eq!(app.streaming_total_output_tokens, 40);
-    assert_eq!(app.streaming_tps_observed_output_tokens, 40);
-    assert!(app.streaming_tps_observed_elapsed >= Duration::from_secs(10));
+    assert_eq!(app.streaming.streaming_total_output_tokens, 40);
+    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 40);
+    assert!(app.streaming.streaming_tps_observed_elapsed >= Duration::from_secs(10));
     let tps = app.compute_streaming_tps().expect("late tps");
     assert!(tps > 3.0 && tps <= 4.0, "unexpected late tps: {tps}");
 }
@@ -382,26 +432,26 @@ fn test_begin_kv_cache_request_stops_tps_collection_until_output_resumes() {
     let mut app = create_test_app();
     let mut seen = 0;
 
-    app.streaming_tps_collect_output = true;
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(3));
+    app.streaming.streaming_tps_collect_output = true;
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(3));
 
     app.begin_kv_cache_request(&[Message::user("next")], &[], "system", "dynamic");
 
-    assert!(!app.streaming_tps_collect_output);
-    assert!(app.streaming_tps_start.is_none());
-    assert!(app.streaming_tps_elapsed >= Duration::from_secs(3));
+    assert!(!app.streaming.streaming_tps_collect_output);
+    assert!(app.streaming.streaming_tps_start.is_none());
+    assert!(app.streaming.streaming_tps_elapsed >= Duration::from_secs(3));
 
     app.accumulate_streaming_output_tokens(20, &mut seen);
-    assert_eq!(app.streaming_total_output_tokens, 0);
+    assert_eq!(app.streaming.streaming_total_output_tokens, 0);
     assert_eq!(seen, 20);
 
     app.resume_streaming_tps();
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(2));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(2));
     app.accumulate_streaming_output_tokens(50, &mut seen);
 
-    assert_eq!(app.streaming_total_output_tokens, 30);
-    assert_eq!(app.streaming_tps_observed_output_tokens, 30);
-    assert!(app.streaming_tps_observed_elapsed >= Duration::from_secs(5));
+    assert_eq!(app.streaming.streaming_total_output_tokens, 30);
+    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 30);
+    assert!(app.streaming.streaming_tps_observed_elapsed >= Duration::from_secs(5));
 }
 
 #[test]
@@ -410,20 +460,20 @@ fn test_streaming_tps_accumulates_multiple_generation_segments_excluding_paused_
     let mut seen = 0;
 
     app.resume_streaming_tps();
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(2));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(2));
     app.accumulate_streaming_output_tokens(10, &mut seen);
 
     app.pause_streaming_tps(true);
-    let elapsed_after_first_segment = app.streaming_tps_elapsed;
+    let elapsed_after_first_segment = app.streaming.streaming_tps_elapsed;
     assert!(elapsed_after_first_segment >= Duration::from_secs(2));
 
     app.resume_streaming_tps();
-    app.streaming_tps_start = Some(Instant::now() - Duration::from_secs(3));
+    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(3));
     app.accumulate_streaming_output_tokens(30, &mut seen);
 
-    assert_eq!(app.streaming_total_output_tokens, 30);
-    assert_eq!(app.streaming_tps_observed_output_tokens, 30);
-    assert!(app.streaming_tps_observed_elapsed >= Duration::from_secs(5));
+    assert_eq!(app.streaming.streaming_total_output_tokens, 30);
+    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 30);
+    assert!(app.streaming.streaming_tps_observed_elapsed >= Duration::from_secs(5));
     let tps = app.compute_streaming_tps().expect("segmented tps");
     assert!(tps > 5.0 && tps <= 6.0, "unexpected segmented tps: {tps}");
 }
@@ -516,6 +566,29 @@ fn test_super_space_toggles_next_prompt_new_session_routing() {
     );
 
     app.handle_key(KeyCode::Char(' '), KeyModifiers::SUPER)
+        .unwrap();
+    assert!(!app.route_next_prompt_to_new_session);
+    assert_eq!(
+        app.status_notice(),
+        Some("Next-prompt new session canceled".to_string())
+    );
+}
+
+#[test]
+fn test_alt_space_toggles_next_prompt_new_session_routing() {
+    let mut app = create_test_app();
+
+    // Option/Alt+Space mirrors Cmd/Super+Space so the fork hotkey works in
+    // terminals where Cmd+Space is captured by the OS (e.g. Spotlight).
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::ALT)
+        .unwrap();
+    assert!(app.route_next_prompt_to_new_session);
+    assert_eq!(
+        app.status_notice(),
+        Some("Next prompt → new session".to_string())
+    );
+
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::ALT)
         .unwrap();
     assert!(!app.route_next_prompt_to_new_session);
     assert_eq!(
@@ -909,11 +982,63 @@ fn test_pinned_diagram_not_shown_when_terminal_too_narrow() {
 }
 
 #[test]
+fn test_pinned_tall_diagram_does_not_crush_transcript() {
+    // Regression: a very tall diagram (portrait aspect) must not make the
+    // pinned side pane balloon past the configured ratio and crush the
+    // transcript. The pane is capped at `diagram_pane_ratio`; the diagram
+    // scales down to fit instead of eating the chat column. The transcript
+    // still renders the diagram inline, so a wide chat area keeps it visible.
+    let _render_lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.diagram_mode = crate::config::DiagramDisplayMode::Pinned;
+    app.diagram_pane_enabled = true;
+    app.diagram_pane_position = crate::config::DiagramPanePosition::Side;
+    app.diagram_pane_ratio = 40;
+
+    crate::tui::mermaid::clear_active_diagrams();
+    // Tall portrait diagram like the flowchart that triggered the bug.
+    crate::tui::mermaid::register_active_diagram(0x444, 1320, 1800, Some("tall".to_string()));
+
+    crate::tui::visual_debug::enable();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).expect("failed to create terminal");
+    terminal
+        .draw(|f| crate::tui::ui::draw(f, &app))
+        .expect("draw failed");
+
+    let frame = crate::tui::visual_debug::latest_frame().expect("frame capture");
+    let diagram = frame.layout.diagram_area.expect("diagram area");
+    let messages = frame.layout.messages_area.expect("messages area");
+
+    // Pane must not exceed the configured ratio (40% of 120 = 48).
+    assert!(
+        diagram.width <= 48,
+        "pinned pane exceeded configured ratio: width={} (ratio cap=48)",
+        diagram.width
+    );
+    // The transcript keeps the majority of the width so the inline diagram
+    // and text stay readable.
+    assert!(
+        messages.width >= 72,
+        "transcript crushed by pinned pane: messages width={}",
+        messages.width
+    );
+    assert_eq!(
+        diagram.width + messages.width,
+        120,
+        "chat + diagram widths should tile the full terminal"
+    );
+
+    crate::tui::visual_debug::disable();
+    crate::tui::mermaid::clear_active_diagrams();
+}
+
+#[test]
 fn test_workspace_info_widget_appears_in_visual_debug_frame_when_enabled() {
     let _render_lock = scroll_render_test_lock();
-    crate::tui::workspace_client::reset_for_tests();
 
     let mut app = create_test_app();
+    app.workspace_client.reset_for_tests();
     app.centered = true;
     app.display_messages = vec![
         DisplayMessage::system("Workspace widget render test".to_string()),
@@ -922,7 +1047,7 @@ fn test_workspace_info_widget_appears_in_visual_debug_frame_when_enabled() {
     app.bump_display_messages_version();
 
     let current_session = app.session.id.clone();
-    crate::tui::workspace_client::enable(
+    app.workspace_client.enable(
         Some(current_session.as_str()),
         &[current_session.clone(), "workspace_peer".to_string()],
     );
@@ -963,7 +1088,7 @@ fn test_workspace_info_widget_appears_in_visual_debug_frame_when_enabled() {
     );
 
     crate::tui::visual_debug::disable();
-    crate::tui::workspace_client::reset_for_tests();
+    app.workspace_client.reset_for_tests();
 }
 
 #[test]
@@ -1073,4 +1198,35 @@ fn test_mouse_scroll_over_tool_side_panel_scrolls_shared_right_pane_without_chan
     assert_eq!(app.diff_pane_scroll, 8);
     assert!(!app.diff_pane_focus);
     assert!(!app.diff_pane_auto_scroll);
+}
+
+#[test]
+fn test_side_pane_scroll_by_clamps_to_rendered_extent() {
+    let _render_lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+
+    // Simulate a rendered frame: 30 content lines in a 20-line viewport.
+    crate::tui::ui::set_pinned_pane_total_lines(30);
+    crate::tui::ui::set_last_diff_pane_max_scroll(10);
+    crate::tui::ui::set_last_diff_pane_effective_scroll(10);
+
+    // Follow-bottom sentinel resolves to the on-screen position before moving.
+    app.diff_pane_scroll = usize::MAX;
+    assert!(app.side_pane_scroll_by(-3));
+    assert_eq!(app.diff_pane_scroll, 7);
+    assert!(!app.diff_pane_auto_scroll);
+
+    // Downward motion clamps at the rendered max instead of accumulating
+    // phantom offset past the bottom.
+    app.diff_pane_scroll = 9;
+    assert!(app.side_pane_scroll_by(3));
+    assert_eq!(app.diff_pane_scroll, 10);
+    assert!(!app.side_pane_scroll_by(3), "already at the bottom");
+    assert_eq!(app.diff_pane_scroll, 10);
+
+    // A stale stored offset beyond the rendered extent snaps back so the very
+    // next upward scroll moves the visible view immediately.
+    app.diff_pane_scroll = 25;
+    assert!(app.side_pane_scroll_by(-3));
+    assert_eq!(app.diff_pane_scroll, 7);
 }

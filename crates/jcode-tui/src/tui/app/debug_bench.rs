@@ -153,6 +153,7 @@ impl App {
         self.clear_streaming_render_state();
         self.queued_messages.clear();
         self.interleave_message = None;
+        self.interleave_images.clear();
         self.pending_soft_interrupts.clear();
         self.status = ProcessingStatus::Idle;
         self.processing_started = None;
@@ -393,6 +394,7 @@ impl App {
         self.clear_streaming_render_state();
         self.queued_messages.clear();
         self.interleave_message = None;
+        self.interleave_images.clear();
         self.pending_soft_interrupts.clear();
         self.status = ProcessingStatus::Idle;
         self.processing_started = None;
@@ -756,9 +758,9 @@ impl App {
 
         let diagram_mode = cfg.diagram_mode.unwrap_or(self.diagram_mode);
         let expectations = ScrollTestExpectations {
-            expect_inline: cfg
-                .expect_inline
-                .unwrap_or(diagram_mode != crate::config::DiagramDisplayMode::Pinned),
+            // Diagrams flow inline (via the inline-image fit pipeline) in every
+            // mode; Pinned additionally mirrors them into the side pane.
+            expect_inline: cfg.expect_inline.unwrap_or(true),
             expect_pane: cfg
                 .expect_pane
                 .unwrap_or(diagram_mode == crate::config::DiagramDisplayMode::Pinned),
@@ -810,6 +812,7 @@ impl App {
         self.clear_streaming_render_state();
         self.queued_messages.clear();
         self.interleave_message = None;
+        self.interleave_images.clear();
         self.pending_soft_interrupts.clear();
         self.status = ProcessingStatus::Idle;
         self.processing_started = None;
@@ -1123,5 +1126,159 @@ impl App {
         });
 
         serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Measure how much the info widgets move/flicker while scrolling the *current*
+    /// transcript. Renders the live app over an offscreen backend, advances the
+    /// scroll position one content line at a time, captures the resulting widget
+    /// placements, and runs the shared stability analyzer.
+    pub(in crate::tui::app) fn run_widget_stability(&mut self, raw: Option<&str>) -> String {
+        use crate::tui::info_widget_stability::{PlacedRect, intern_kind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let cfg: WidgetStabilityConfig = match raw {
+            Some(raw) if !raw.trim().is_empty() => match serde_json::from_str(raw) {
+                Ok(cfg) => cfg,
+                Err(e) => return format!("widget-stability parse error: {}", e),
+            },
+            _ => WidgetStabilityConfig::default(),
+        };
+
+        let width = cfg.width.unwrap_or(120).max(40);
+        let height = cfg.height.unwrap_or(40).max(20);
+        let step = cfg.step.unwrap_or(1).max(1);
+        let max_frames = cfg.max_frames.unwrap_or(160).clamp(4, 2000);
+        let include_frames = cfg.include_frames.unwrap_or(false);
+
+        let saved_state = ScrollTestState::capture(self);
+        let was_visual_debug = crate::tui::visual_debug::is_enabled();
+        crate::tui::visual_debug::enable();
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = match Terminal::new(backend) {
+            Ok(t) => t,
+            Err(e) => {
+                saved_state.restore(self);
+                if !was_visual_debug {
+                    crate::tui::visual_debug::disable();
+                }
+                return format!("widget-stability terminal error: {}", e);
+            }
+        };
+
+        // Establish total content height from a baseline (bottom) render.
+        self.follow_chat_bottom();
+        let mut errors: Vec<String> = Vec::new();
+        if let Err(e) = terminal.draw(|f| crate::tui::ui::draw(f, self)) {
+            errors.push(format!("baseline draw error: {}", e));
+        }
+        let baseline = crate::tui::visual_debug::latest_frame();
+        let (visible_height, total_lines) = if let Some(frame) = baseline.as_ref() {
+            let vh = frame
+                .layout
+                .messages_area
+                .map(|r| r.height as usize)
+                .unwrap_or(height as usize);
+            (vh, frame.layout.estimated_content_height.max(1))
+        } else {
+            (height as usize, 1usize)
+        };
+        let max_scroll = total_lines.saturating_sub(visible_height);
+
+        // Walk from top to bottom one (or `step`) content lines at a time, recording
+        // the widget placements at each scroll position.
+        let mut frames: Vec<Vec<PlacedRect>> = Vec::new();
+        // Absolute transcript line shown on the first visible row of each frame, so
+        // the analyzer can subtract the scroll-ride and report content-relative
+        // travel (how much widgets move *relative to the text* they sit beside).
+        let mut scroll_tops_abs: Vec<i64> = Vec::new();
+        let mut frame_payloads: Vec<serde_json::Value> = Vec::new();
+        self.auto_scroll_paused = true;
+
+        let mut scroll_top = 0usize;
+        while scroll_top <= max_scroll && frames.len() < max_frames {
+            let offset = max_scroll.saturating_sub(scroll_top);
+            self.scroll_offset = offset;
+            if let Err(e) = terminal.draw(|f| crate::tui::ui::draw(f, self)) {
+                errors.push(format!("draw error at scroll_top {}: {}", scroll_top, e));
+                break;
+            }
+            scroll_tops_abs.push(crate::tui::ui::last_resolved_chat_scroll() as i64);
+            let placed: Vec<PlacedRect> = match crate::tui::visual_debug::latest_frame() {
+                Some(frame) => frame
+                    .info_widgets
+                    .as_ref()
+                    .map(|info| {
+                        info.placements
+                            .iter()
+                            .map(|p| PlacedRect {
+                                kind: intern_kind(&p.kind),
+                                x: p.rect.x,
+                                y: p.rect.y,
+                                width: p.rect.width,
+                                height: p.rect.height,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            if include_frames {
+                frame_payloads.push(serde_json::json!({
+                    "scroll_top": scroll_top,
+                    "widgets": placed.iter().map(|p| serde_json::json!({
+                        "kind": p.kind,
+                        "x": p.x,
+                        "y": p.y,
+                        "width": p.width,
+                        "height": p.height,
+                    })).collect::<Vec<_>>(),
+                }));
+            }
+            frames.push(placed);
+
+            if scroll_top == max_scroll {
+                break;
+            }
+            scroll_top = (scroll_top + step).min(max_scroll);
+        }
+
+        let report = crate::tui::info_widget_stability::analyze_frames_with_scroll(
+            &frames,
+            &scroll_tops_abs,
+        );
+
+        saved_state.restore(self);
+        if !was_visual_debug {
+            crate::tui::visual_debug::disable();
+        }
+
+        let out = serde_json::json!({
+            "ok": errors.is_empty(),
+            "config": {
+                "width": width,
+                "height": height,
+                "step": step,
+                "max_frames": max_frames,
+            },
+            "layout": {
+                "total_lines": total_lines,
+                "visible_height": visible_height,
+                "max_scroll": max_scroll,
+            },
+            "report": report,
+            "frames": if include_frames { serde_json::Value::Array(frame_payloads) } else { serde_json::Value::Null },
+            "errors": errors,
+            "notes": [
+                "Scrolls the current transcript one content line at a time over an offscreen backend.",
+                "travel_per_100_lines = total widget x+y movement per 100 scroll lines (lower is calmer).",
+                "content_travel_per_100_lines = movement RELATIVE TO THE TRANSCRIPT (scroll-ride subtracted); ~0 means widgets stick to one negative-space spot and just scroll along.",
+                "flicker_per_100_lines = widget appear/disappear transitions per 100 scroll lines.",
+                "distraction_per_100_lines = travel + weighted flicker; the single headline number."
+            ],
+        });
+
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
     }
 }

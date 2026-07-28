@@ -83,21 +83,19 @@ fn test_render_rounded_box_long_title_keeps_body_width_in_sync() {
 }
 
 #[test]
-fn test_render_swarm_message_uses_left_rail_not_box() {
+fn test_render_direct_message_as_compact_agent_row() {
     crate::tui::markdown::set_center_code_blocks(false);
     let msg = DisplayMessage::swarm("DM from fox", "Can you take parser tests?");
 
     let lines = render_swarm_message(&msg, 80, crate::config::DiffDisplayMode::Off);
     let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
 
-    assert_eq!(rendered.len(), 2, "expected compact header + body layout");
-    assert!(rendered[0].starts_with("│ ✉ DM from fox"));
-    assert_eq!(rendered[1], "│ Can you take parser tests?");
+    assert_eq!(rendered, vec!["🦊 Can you take parser tests?"]);
     assert!(
         rendered
             .iter()
-            .all(|line| !line.contains('╭') && !line.contains('╰')),
-        "swarm notifications should no longer render as rounded boxes: {:?}",
+            .all(|line| !line.contains('│') && !line.contains('✉')),
+        "direct messages should render without rails or type icons: {:?}",
         rendered
     );
 }
@@ -112,11 +110,36 @@ fn test_render_swarm_message_matches_exact_compact_snapshot() {
 
     assert_eq!(
         rendered,
-        vec![
-            "│ ⚑ Task · sheep".to_string(),
-            "│ Implement compaction asymptotic fixes".to_string(),
-        ]
+        vec!["🐑 Implement compaction asymptotic fixes".to_string()]
     );
+}
+
+#[test]
+fn test_render_swarm_await_as_compact_rail_free_summary() {
+    crate::tui::markdown::set_center_code_blocks(false);
+    let msg = DisplayMessage::swarm("🐝 Swarm await", "✓ 2/2");
+
+    let lines = render_swarm_message(&msg, 80, crate::config::DiffDisplayMode::Off);
+    let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
+
+    assert_eq!(rendered, vec!["🐝 ✓ 2/2"]);
+    assert!(rendered.iter().all(|line| !line.contains('│')));
+}
+
+#[test]
+fn test_render_swarm_await_wake_message_as_compact_rail_free_summary() {
+    crate::tui::markdown::set_center_code_blocks(false);
+    let msg = DisplayMessage::background_task(
+        "🐝 **Swarm await finished**\n\nAll members done. All 1 members are done: sabertooth\n\nMember statuses:\n  ✓ sabertooth (completed)\n\nCompletion reports:\n\n--- sabertooth (completed) ---\nAwait UI demo complete."
+            .to_string(),
+    );
+
+    let lines = render_background_task_message(&msg, 80, crate::config::DiffDisplayMode::Off);
+    let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
+
+    assert_eq!(rendered, vec!["🐝 ✓ 1/1"]);
+    assert!(rendered.iter().all(|line| !line.contains('│')));
+    assert!(!rendered.join("\n").contains("sabertooth"));
 }
 
 #[test]
@@ -127,25 +150,70 @@ fn test_render_swarm_message_trims_extra_newlines() {
     let lines = render_swarm_message(&msg, 80, crate::config::DiffDisplayMode::Off);
     let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
 
-    assert_eq!(rendered[0], "│ 📣 Broadcast · coordinator");
-    assert_eq!(rendered[1], "│ Plan updated");
-    assert_eq!(
-        rendered.len(),
-        2,
-        "trimmed message should not add blank lines"
-    );
+    assert_eq!(rendered, vec!["💫 📣 Plan updated"]);
+    assert!(rendered.iter().all(|line| !line.contains('│')));
 }
 
 #[test]
-fn test_render_swarm_message_uses_task_icon_for_assignments() {
+fn test_render_channel_and_shared_context_as_compact_agent_rows() {
+    crate::tui::markdown::set_center_code_blocks(false);
+
+    let channel = DisplayMessage::swarm("#dev · fox", "Can someone review this?");
+    let context = DisplayMessage::swarm("Shared context · fox", "branch = feature/auth");
+
+    let channel_lines = render_swarm_message(&channel, 80, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>();
+    let context_lines = render_swarm_message(&context, 80, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>();
+
+    assert_eq!(channel_lines, vec!["🦊 #dev · Can someone review this?"]);
+    assert_eq!(context_lines, vec!["🦊 🧠 branch · feature/auth"]);
+}
+
+#[test]
+fn test_render_file_activity_as_collapsible_compact_row() {
+    crate::tui::markdown::set_center_code_blocks(false);
+    let content = jcode_tui_messages::encode_collapsible_swarm_content(
+        "src/auth.rs · modified",
+        "```text\n-old\n+new\n```",
+    );
+    let msg = DisplayMessage::swarm("File activity · fox", content);
+
+    let rendered = render_swarm_message(&msg, 80, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rendered, vec!["🦊 ✎ src/auth.rs · modified  ▸ diff"]);
+    assert!(rendered.iter().all(|line| !line.contains('│')));
+}
+
+#[test]
+fn test_render_file_conflict_places_warning_before_agent() {
+    crate::tui::markdown::set_center_code_blocks(false);
+    let msg = DisplayMessage::swarm("File conflict · fox", "src/auth.rs · concurrent edits");
+
+    let rendered = render_swarm_message(&msg, 80, crate::config::DiffDisplayMode::Off)
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rendered, vec!["⚠ 🦊 src/auth.rs · concurrent edits"]);
+}
+
+#[test]
+fn test_render_swarm_message_uses_agent_emoji_for_assignments() {
     crate::tui::markdown::set_center_code_blocks(false);
     let msg = DisplayMessage::swarm("Task · sheep", "Implement compaction asymptotic fixes");
 
     let lines = render_swarm_message(&msg, 80, crate::config::DiffDisplayMode::Off);
     let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
 
-    assert_eq!(rendered[0], "│ ⚑ Task · sheep");
-    assert_eq!(rendered[1], "│ Implement compaction asymptotic fixes");
+    assert_eq!(rendered, vec!["🐑 Implement compaction asymptotic fixes"]);
 }
 
 #[test]
@@ -157,20 +225,15 @@ fn test_render_swarm_message_centered_mode_left_aligns_with_shared_padding() {
     let lines = render_swarm_message(&msg, 80, crate::config::DiffDisplayMode::Off);
     let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
 
-    assert_eq!(rendered.len(), 2, "expected compact header + body layout");
+    assert_eq!(rendered.len(), 1, "expected one compact plan row");
 
     let header_pad = rendered[0].chars().take_while(|c| *c == ' ').count();
-    let body_pad = rendered[1].chars().take_while(|c| *c == ' ').count();
     assert!(
         header_pad > 0,
         "centered swarm header should be padded: {rendered:?}"
     );
-    assert_eq!(
-        header_pad, body_pad,
-        "centered swarm block should share one left pad"
-    );
-    assert_eq!(rendered[0].trim_start(), "│ ☰ Plan · sheep");
-    assert_eq!(rendered[1].trim_start(), "│ 4 items · v1");
+    assert_eq!(rendered[0].trim_start(), "🐝 Plan · 4 items · v1");
+    assert!(!rendered[0].contains('│'));
     for line in &lines {
         assert_eq!(
             line.alignment,
@@ -195,10 +258,9 @@ fn test_render_swarm_message_centered_mode_keeps_task_icon_and_padding() {
         rendered[0].starts_with(' '),
         "centered task header should be padded: {rendered:?}"
     );
-    assert_eq!(rendered[0].trim_start(), "│ ⚑ Task · sheep");
     assert_eq!(
-        rendered[1].trim_start(),
-        "│ Implement compaction asymptotic fixes"
+        rendered[0].trim_start(),
+        "🐑 Implement compaction asymptotic fixes"
     );
 
     crate::tui::markdown::set_center_code_blocks(saved);
@@ -483,5 +545,84 @@ fn test_plan_memory_tile_truncates_long_category_title() {
         plan.lines.iter().all(|line| line.width() == 20),
         "expected long category titles to be truncated to tile width: {:?}",
         plan.lines.iter().map(extract_line_text).collect::<Vec<_>>()
+    );
+}
+
+/// Light-theme adaptation: rendering a full frame and adapting it for a light
+/// background must leave every non-Reset foreground readable against its
+/// (possibly Reset = white) background. This exercises the same buffer-level
+/// hook `ui::draw` applies, but with an explicit mode so it cannot race other
+/// tests through the process-global theme mode.
+#[test]
+fn test_light_theme_adapted_frame_has_readable_contrast() {
+    fn channel_lum(c: ratatui::style::Color) -> Option<f32> {
+        let (r, g, b) = match c {
+            ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+            ratatui::style::Color::Indexed(n) => crate::tui::color_support::indexed_to_rgb(n),
+            _ => return None,
+        };
+        // Perceived luminance approximation.
+        Some((0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0)
+    }
+
+    let messages = vec![
+        DisplayMessage {
+            role: "user".into(),
+            content: "hello there".into(),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        },
+        DisplayMessage {
+            role: "assistant".into(),
+            content: "hi! *bold* and `code`".into(),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        },
+    ];
+    let state = TestState {
+        display_messages: messages,
+        input: "next question".into(),
+        ..Default::default()
+    };
+
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            crate::tui::ui::draw(frame, &state);
+            jcode_tui_style::theme_mode::adapt_buffer(
+                frame.buffer_mut(),
+                jcode_tui_style::ThemeMode::Light,
+            );
+        })
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer();
+    let mut checked = 0usize;
+    for cell in buffer.content.iter() {
+        if cell.symbol().trim().is_empty() {
+            continue;
+        }
+        let Some(fg_lum) = channel_lum(cell.fg) else {
+            continue;
+        };
+        // Reset bg on a light terminal is near-white (lum ~1.0).
+        let bg_lum = channel_lum(cell.bg).unwrap_or(1.0);
+        assert!(
+            (fg_lum - bg_lum).abs() > 0.2,
+            "unreadable cell {:?} fg={:?} bg={:?} (fg_lum={fg_lum:.2} bg_lum={bg_lum:.2})",
+            cell.symbol(),
+            cell.fg,
+            cell.bg,
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 20,
+        "expected to verify a meaningful number of glyph cells, got {checked}"
     );
 }

@@ -3,12 +3,61 @@ use jcode_message_types::{ContentBlock, Message, Role, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// Identifies a session to resume, across the agent backends jcode can import
+/// from. This is pure data (only ids/paths) with no UI dependency; it lives in
+/// `jcode-session-types` so the foundation/import layer can match on it without
+/// depending on any `jcode-tui-*` crate. The session-picker UI re-exports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResumeTarget {
+    JcodeSession {
+        session_id: String,
+    },
+    ClaudeCodeSession {
+        session_id: String,
+        session_path: String,
+    },
+    CodexSession {
+        session_id: String,
+        session_path: String,
+    },
+    PiSession {
+        session_path: String,
+    },
+    OpenCodeSession {
+        session_id: String,
+        session_path: String,
+    },
+    CursorSession {
+        session_id: String,
+        session_path: String,
+    },
+}
+
+impl ResumeTarget {
+    pub fn stable_id(&self) -> &str {
+        match self {
+            Self::JcodeSession { session_id } => session_id,
+            Self::ClaudeCodeSession { session_id, .. } => session_id,
+            Self::CodexSession { session_id, .. } => session_id,
+            Self::PiSession { session_path } => session_path,
+            Self::OpenCodeSession { session_id, .. } => session_id,
+            Self::CursorSession { session_id, .. } => session_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedMessage {
     pub role: String,
     pub content: String,
     pub tool_calls: Vec<String>,
     pub tool_data: Option<ToolCall>,
+    /// Index of the stored session message this rendered message came from.
+    /// `None` for synthetic UI-only messages (e.g. the compacted-history
+    /// notice). Used to map user-facing rewind targets back to the stored
+    /// transcript (issue #432).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,12 +84,31 @@ pub enum RenderedImageSource {
     Other { role: String },
 }
 
+/// Where an image belongs in the transcript flow. Used by UIs to render the
+/// image inline at the message that produced it instead of appending it at the
+/// bottom of the transcript.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderedImageAnchor {
+    /// The image came from the tool result for this tool call id.
+    ToolCall { id: String },
+    /// The image was attached to the nth (0-based) user prompt in the rendered
+    /// transcript.
+    UserPrompt { ordinal: usize },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RenderedImage {
     pub media_type: String,
     pub data: String,
     pub label: Option<String>,
     pub source: RenderedImageSource,
+    /// Transcript anchor identifying the message this image belongs to, so the
+    /// UI can render it inline at that spot. `None` when the producer cannot
+    /// anchor it (e.g. older servers); unanchored images fall back to the
+    /// bottom of the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<RenderedImageAnchor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -440,27 +508,44 @@ pub fn minimum_session_search_term_matches(term_count: usize) -> usize {
 
 /// Fast case-insensitive byte search. Avoids allocating a lowercase copy of the
 /// entire file for the common ASCII-query case.
+///
+/// Uses memchr's SIMD-accelerated scan to find candidate positions for the
+/// first needle byte (both cases when it is an ASCII letter), then verifies the
+/// remainder case-insensitively. This is orders of magnitude faster than a
+/// naive byte-by-byte scan over multi-megabyte session files.
 pub fn contains_case_insensitive_bytes(haystack: &[u8], needle_lower: &[u8]) -> bool {
-    if needle_lower.is_empty() {
+    let Some((&first_lower, rest)) = needle_lower.split_first() else {
         return true;
-    }
+    };
     if haystack.len() < needle_lower.len() {
         return false;
     }
-    let end = haystack.len() - needle_lower.len();
-    'outer: for i in 0..=end {
-        for (j, &nb) in needle_lower.iter().enumerate() {
-            let hb = haystack[i + j];
-            let hb_lower = if hb.is_ascii_uppercase() {
-                hb | 0x20
-            } else {
-                hb
-            };
-            if hb_lower != nb {
-                continue 'outer;
-            }
+
+    let search_end = haystack.len() - needle_lower.len();
+    let first_upper = first_lower.to_ascii_uppercase();
+    let mut offset = 0;
+    while offset <= search_end {
+        let window = &haystack[offset..];
+        let found = if first_upper == first_lower {
+            memchr::memchr(first_lower, window)
+        } else {
+            memchr::memchr2(first_lower, first_upper, window)
+        };
+        let Some(pos) = found else {
+            return false;
+        };
+        let candidate = offset + pos;
+        if candidate > search_end {
+            return false;
         }
-        return true;
+        if haystack[candidate + 1..candidate + needle_lower.len()]
+            .iter()
+            .zip(rest)
+            .all(|(&hb, &nb)| hb.to_ascii_lowercase() == nb)
+        {
+            return true;
+        }
+        offset = candidate + 1;
     }
     false
 }
@@ -892,6 +977,49 @@ mod session_search_tests {
             "/TMP/PROJECT/NEEDLE.json",
             &query
         ));
+    }
+
+    #[test]
+    fn contains_case_insensitive_bytes_matches_naive_reference() {
+        fn naive(haystack: &[u8], needle_lower: &[u8]) -> bool {
+            if needle_lower.is_empty() {
+                return true;
+            }
+            haystack
+                .windows(needle_lower.len())
+                .any(|window| window.eq_ignore_ascii_case(needle_lower))
+        }
+
+        let haystacks: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"A",
+            b"needle",
+            b"NEEDLE",
+            b"NeEdLe",
+            b"xxneedle",
+            b"needlexx",
+            b"xxNEEDLExx",
+            b"nee",
+            b"neenee needle",
+            b"nnnnnnnnnn",
+            b"9needle9",
+            b"\xff\xfeNEEDLE\xff",
+            b"the ne edle is split",
+            b"ends with nee",
+            b"NEEDLNEEDLE",
+        ];
+        let needles: &[&[u8]] = &[b"", b"n", b"needle", b"9", b"\xff", b"ee", b"edle"];
+
+        for haystack in haystacks {
+            for needle in needles {
+                assert_eq!(
+                    contains_case_insensitive_bytes(haystack, needle),
+                    naive(haystack, needle),
+                    "mismatch for haystack={haystack:?} needle={needle:?}"
+                );
+            }
+        }
     }
 
     #[test]

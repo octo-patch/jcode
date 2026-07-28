@@ -5,18 +5,17 @@ mod bash;
 mod batch;
 mod bg;
 mod browser;
-mod codesearch;
 mod communicate;
+#[cfg(target_os = "macos")]
+mod computer;
 mod conversation_search;
 mod debug_socket;
+mod discover;
 mod edit;
-mod glob;
 mod gmail;
 mod goal;
-mod grep;
 mod invalid;
 mod ls;
-mod lsp;
 pub mod mcp;
 mod memory;
 mod multiedit;
@@ -26,9 +25,9 @@ mod read;
 pub mod selfdev;
 pub(crate) mod serde_coerce;
 mod session_search;
+pub(crate) mod session_search_index;
 mod side_panel;
 mod skill;
-mod task;
 mod todo;
 mod webfetch;
 mod websearch;
@@ -185,12 +184,17 @@ impl Registry {
                 "apply_patch",
                 apply_patch::ApplyPatchTool::new,
             );
-            Self::insert_tool_timed(&mut m, &mut timings, "glob", glob::GlobTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "grep", grep::GrepTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "ls", ls::LsTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bash", bash::BashTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "browser", browser::BrowserTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "open", open::OpenTool::new);
+            #[cfg(target_os = "macos")]
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "macos_computer_use",
+                computer::ComputerTool::new,
+            );
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
@@ -203,14 +207,7 @@ impl Registry {
                 "websearch",
                 websearch::WebSearchTool::new,
             );
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "codesearch",
-                codesearch::CodeSearchTool::new,
-            );
             Self::insert_tool_timed(&mut m, &mut timings, "invalid", invalid::InvalidTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "lsp", lsp::LspTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
             Self::insert_tool_timed(
@@ -258,7 +255,7 @@ impl Registry {
         tools
     }
 
-    pub async fn new(provider: Arc<dyn Provider>) -> Self {
+    pub async fn new(_provider: Arc<dyn Provider>) -> Self {
         let start = std::time::Instant::now();
         let skills_start = std::time::Instant::now();
         let skills = Self::shared_skills_registry();
@@ -282,11 +279,6 @@ impl Registry {
         let session_tools_start = std::time::Instant::now();
         Self::insert_tool(
             &mut tools_map,
-            "subagent",
-            task::SubagentTool::new(provider, registry.clone()),
-        );
-        Self::insert_tool(
-            &mut tools_map,
             "batch",
             batch::BatchTool::new(registry.clone()),
         );
@@ -295,6 +287,16 @@ impl Registry {
             "conversation_search",
             conversation_search::ConversationSearchTool::new(compaction),
         );
+        // Sponsored discovery is on by default (opt-out); when disabled the
+        // tool is never registered and no discovery endpoint is ever
+        // contacted.
+        if crate::config::config().sponsors.enabled {
+            Self::insert_tool(
+                &mut tools_map,
+                "discover_tools",
+                discover::DiscoverToolsTool::new(),
+            );
+        }
         let session_tools_ms = session_tools_start.elapsed().as_millis();
 
         let write_start = std::time::Instant::now();
@@ -502,6 +504,38 @@ impl Registry {
     /// Outputs that would push total context beyond this are truncated.
     const CONTEXT_GUARD_THRESHOLD: f32 = 0.90;
 
+    /// Fire the `post_tool` observer hook with tool outcome metadata.
+    /// No-op (without building the payload) when the hook is not configured.
+    fn fire_post_tool_hook(
+        resolved_name: &str,
+        ctx: &ToolContext,
+        result: &Result<ToolOutput>,
+        latency_ms: u64,
+    ) {
+        if !crate::hooks::hook_configured("post_tool") {
+            return;
+        }
+        let mut event = crate::hooks::HookEvent::new("post_tool")
+            .session_id(ctx.session_id.clone())
+            .field("TOOL_NAME", resolved_name)
+            .field("STATUS", if result.is_ok() { "ok" } else { "error" })
+            .field("DURATION_MS", latency_ms.to_string());
+        if let Some(dir) = &ctx.working_dir {
+            event = event.cwd(dir.display().to_string());
+        }
+        match result {
+            Ok(output) => {
+                event = event.field("OUTPUT_BYTES", output.output.len().to_string());
+            }
+            Err(error) => {
+                const ERROR_LIMIT: usize = 1000;
+                let message: String = error.to_string().chars().take(ERROR_LIMIT).collect();
+                event = event.field("ERROR", message);
+            }
+        }
+        crate::hooks::dispatch_observer(event);
+    }
+
     /// Maximum fraction of context budget a single tool output may occupy.
     /// Even if we have room, a single output shouldn't dominate the context.
     const SINGLE_OUTPUT_MAX_FRACTION: f32 = 0.30;
@@ -540,6 +574,32 @@ impl Registry {
         // Drop the lock before executing
         drop(tools);
 
+        // User-configured pre_tool gate: external policy hook that can block
+        // this call (exit 2). Skipped entirely when not configured.
+        if crate::hooks::hook_configured("pre_tool") {
+            let input_json = input.to_string();
+            let working_dir = ctx
+                .working_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string());
+            let decision = crate::hooks::run_pre_tool_gate(
+                &ctx.session_id,
+                working_dir.as_deref(),
+                resolved_name,
+                &input_json,
+            )
+            .await;
+            if let crate::hooks::GateDecision::Block { reason } = decision {
+                let mut fields =
+                    Self::tool_lifecycle_fields("blocked", name, resolved_name, &input, &ctx);
+                fields.push(("block_reason".to_string(), reason.clone()));
+                crate::logging::event_warn("TOOL_LIFECYCLE", fields);
+                return Err(anyhow::anyhow!(
+                    "Tool call blocked by pre_tool hook: {reason}"
+                ));
+            }
+        }
+
         crate::logging::event_info(
             "TOOL_LIFECYCLE",
             Self::tool_lifecycle_fields("start", name, resolved_name, &input, &ctx),
@@ -550,6 +610,7 @@ impl Registry {
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
         crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
+        Self::fire_post_tool_hook(resolved_name, &ctx, &result, latency_ms);
 
         let mut output = match result {
             Ok(output) => output,
@@ -684,13 +745,32 @@ impl Registry {
         shared_pool: Option<std::sync::Arc<crate::mcp::SharedMcpPool>>,
         session_id: Option<String>,
     ) {
+        self.register_mcp_tools_for_dir(event_tx, shared_pool, session_id, None)
+            .await
+    }
+
+    /// Like [`Self::register_mcp_tools`], but resolves project-local MCP config
+    /// (`.mcp.json`, `.jcode/mcp.json`, `.claude/mcp.json`) against
+    /// `working_dir` instead of the server process cwd. Remote/client sessions
+    /// must pass their session working directory here (issue #420).
+    pub async fn register_mcp_tools_for_dir(
+        &self,
+        event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerEvent>>,
+        shared_pool: Option<std::sync::Arc<crate::mcp::SharedMcpPool>>,
+        session_id: Option<String>,
+        working_dir: Option<std::path::PathBuf>,
+    ) {
         use crate::mcp::McpManager;
         use std::sync::Arc;
         use tokio::sync::RwLock;
 
         let mcp_manager = if let Some(pool) = shared_pool {
             let sid = session_id.unwrap_or_else(|| "unknown".to_string());
-            Arc::new(RwLock::new(McpManager::with_shared_pool(pool, sid)))
+            Arc::new(RwLock::new(McpManager::with_shared_pool_for_dir(
+                pool,
+                sid,
+                working_dir,
+            )))
         } else {
             Arc::new(RwLock::new(McpManager::new()))
         };
@@ -701,14 +781,29 @@ impl Registry {
         self.register("mcp".to_string(), Arc::new(mcp_tool) as Arc<dyn Tool>)
             .await;
 
-        // Check if we have servers to connect to
-        let server_count = {
+        // Check if we have enabled servers to connect to. Disabled servers stay
+        // configured (visible to the mcp management tool, connectable by name)
+        // but are not spawned, advertised, or shown as connecting (issue #436).
+        let (enabled_count, disabled_count) = {
             let manager = mcp_manager.read().await;
-            manager.config().servers.len()
+            let enabled = manager
+                .config()
+                .servers
+                .values()
+                .filter(|cfg| cfg.is_enabled())
+                .count();
+            (enabled, manager.config().servers.len() - enabled)
         };
 
-        if server_count > 0 {
-            crate::logging::info(&format!("MCP: Found {} server(s) in config", server_count));
+        if disabled_count > 0 {
+            crate::logging::info(&format!(
+                "MCP: {} disabled server(s) in config (kept, not spawned)",
+                disabled_count
+            ));
+        }
+
+        if enabled_count > 0 {
+            crate::logging::info(&format!("MCP: Found {} server(s) in config", enabled_count));
 
             // Send immediate "connecting" status so the TUI shows loading state
             // Server names with count 0 means "connecting..."
@@ -718,8 +813,9 @@ impl Registry {
                     manager
                         .config()
                         .servers
-                        .keys()
-                        .map(|name| format!("{}:0", name))
+                        .iter()
+                        .filter(|(_, cfg)| cfg.is_enabled())
+                        .map(|(name, _)| format!("{}:0", name))
                         .collect()
                 };
                 let _ = tx.send(crate::protocol::ServerEvent::McpStatus {
@@ -744,6 +840,7 @@ impl Registry {
                         .config()
                         .servers
                         .iter()
+                        .filter(|(_, cfg)| cfg.is_enabled())
                         .map(|(name, cfg)| (name.clone(), cfg.clone()))
                         .collect()
                 };
@@ -833,10 +930,12 @@ impl Registry {
                 // under the current config fingerprint; prune servers that are
                 // no longer configured. (#206 Phase 2)
                 {
-                    let (live_by_server, config_snapshot): (
-                        std::collections::BTreeMap<String, Vec<crate::mcp::McpToolDef>>,
-                        Vec<(String, crate::mcp::McpServerConfig)>,
-                    ) = {
+                    // Live tool defs grouped by server, plus a snapshot of the
+                    // configured servers, captured under one read lock.
+                    type LiveToolsByServer =
+                        std::collections::BTreeMap<String, Vec<crate::mcp::McpToolDef>>;
+                    type ConfigSnapshot = Vec<(String, crate::mcp::McpServerConfig)>;
+                    let (live_by_server, config_snapshot): (LiveToolsByServer, ConfigSnapshot) = {
                         let manager = mcp_manager.read().await;
                         let mut grouped: std::collections::BTreeMap<
                             String,

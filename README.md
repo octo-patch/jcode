@@ -9,10 +9,8 @@
 [![GitHub Stars](https://badgen.net/github/stars/1jehuang/jcode?icon=github)](https://github.com/1jehuang/jcode/stargazers)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/nBe9vGyK9a)
 
-The next generation coding agent harness to raise the skill ceiling. <br>
-Built for multi-session workflows, infinite customizability, and performance. 
-
-<br>
+The most RAM efficient harness <br>
+The most most intelligent harness
 
 <a href="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-memory-demo.mp4">
   <img src="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-memory-demo.webp" alt="jcode memory demonstration" width="800">
@@ -20,7 +18,7 @@ Built for multi-session workflows, infinite customizability, and performance.
 
 <br>
 
-[Features](#features) · [Install](#installation) · [Quick Start](#quick-start) · [Further Reading](#further-reading) · [Contributing](CONTRIBUTING.md)
+[Website](https://jcode.sh) · [Docs](https://jcode.sh/docs) · [Benchmarks](https://jcode.sh/bench) · [Features](#features) · [Install](#installation) · [Quick Start](#quick-start) · [Further Reading](#further-reading) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -34,10 +32,15 @@ Built for multi-session workflows, infinite customizability, and performance.
 
 ```bash
 # macOS & Linux
-curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.sh | bash
+curl -fsSL https://jcode.sh/install | bash
 ```
 
-Need Windows, Homebrew, source builds, provider setup, or tell your agent to set it up for you?
+```powershell
+# Windows 11 (PowerShell 5.1+)
+irm https://jcode.sh/install.ps1 | iex
+```
+
+Need Homebrew, source builds, provider setup, or want an agent to set it up for you?
 [Jump to detailed installation](#detailed-installation).
 
 ---
@@ -299,6 +302,8 @@ The custom scrollback implementation of jcode allows it to do much more than a n
 
 Jcode is left-aligned by default. You can switch to centered mode with the `Alt+C` hotkey, with the `/alignment` command, or in the config.
 
+To disable emoji globally in TUI and CLI output, set `emoji = false` under `[display]` in `~/.jcode/config.toml`, or launch with `JCODE_NO_EMOJI=1`. Jcode replaces emoji with compact ASCII markers while preserving other Unicode text.
+
 ---
 
 ## Swarm
@@ -366,8 +371,9 @@ There are two ways to set one up:
 
 Useful environment overrides for these endpoints:
 
-- `JCODE_STREAM_IDLE_TIMEOUT_SECS` — raise the streaming idle timeout (default 180s) for slow reasoning models that think silently before emitting tokens. Also settable as `[provider] stream_idle_timeout_secs` in `config.toml`.
+- `JCODE_STREAM_IDLE_TIMEOUT_SECS` — raise the base streaming idle timeout (default 180s) for slow reasoning models that think silently before emitting tokens. High reasoning efforts scale this automatically (high 2x, xhigh 3x, max 4x). Also settable as `[provider] stream_idle_timeout_secs` in `config.toml`.
 - Per-model `context_window` (alias `context_limit`) in a `[[providers.<name>.models]]` entry — set the context window when the endpoint has no usable `/v1/models` response, so jcode does not fall back to the generic 200k default.
+- `extra_body` — inject non-standard top-level fields into every chat/completions request body for backends that require them. See [Extra request-body fields](#extra-request-body-fields-extra_body) below.
 
 For details on self-hosting, local runtimes, and the exact config file shape, see below.
 
@@ -444,6 +450,32 @@ id = "my-model-id"
 context_window = 128000
 ```
 
+##### Extra request-body fields (`extra_body`)
+
+Some OpenAI-compatible backends require non-standard top-level request fields. For example, NVIDIA NIM DeepSeek-V4 reasoning models (`deepseek-ai/deepseek-v4-flash`, `deepseek-ai/deepseek-v4-pro`) only enable thinking when the request includes `chat_template_kwargs`; without it they reply without reasoning (or, for some deployments, hang). jcode lets you inject arbitrary top-level fields two ways.
+
+1. Per named profile, via `extra_body` in `config.toml` (a TOML table merged verbatim into the JSON body):
+
+   ```toml
+   [providers.my-nim]
+   type = "openai-compatible"
+   base_url = "https://integrate.api.nvidia.com/v1"
+   api_key_env = "NVIDIA_API_KEY"
+   default_model = "deepseek-ai/deepseek-v4-flash"
+
+   [providers.my-nim.extra_body.chat_template_kwargs]
+   thinking = true
+   reasoning_effort = "high"
+   ```
+
+2. For built-in profiles (e.g. `nvidia-nim`) or any endpoint, via the `JCODE_OPENAI_EXTRA_BODY` environment variable (a JSON object string). It can live in the provider's env file (`~/.config/jcode/nvidia-nim.env`) next to the API key:
+
+   ```bash
+   JCODE_OPENAI_EXTRA_BODY={"chat_template_kwargs":{"thinking":true,"reasoning_effort":"high"}}
+   ```
+
+Keys from `extra_body` are merged last and override any jcode-generated body field with the same name (`JCODE_OPENAI_EXTRA_BODY` wins over the config `extra_body` on key collisions). Invalid values are logged and ignored rather than failing the request.
+
 The custom OpenAI-compatible provider reads overrides from environment variables or from an env file in jcode's app config directory. On Linux this is usually `~/.config/jcode/`, so the default file is usually:
 
 ```text
@@ -474,15 +506,19 @@ Primary config files:
 - `~/.jcode/mcp.json` for global MCP servers
 - `.jcode/mcp.json` for project-local MCP servers
 
-Compatibility fallback:
+Claude Code compatibility:
 
-- `.claude/mcp.json`
+- `~/.claude.json` (Claude Code's user config): top-level `mcpServers`, plus per-project servers under `projects.<abs_path>.mcpServers` for the current directory
+- `.mcp.json` at the repo root (Claude Code's project config)
+- `.claude/mcp.json` (legacy fallback)
+
+Both the canonical `mcpServers` key and jcode's historical `servers` key are accepted. jcode currently supports stdio (command-based) servers only; HTTP/SSE entries (`"type": "http"`/`"sse"`) are recognized and skipped with a log line.
 
 Example MCP config:
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "filesystem": {
       "command": "/path/to/mcp-server",
       "args": ["--root", "/workspace"],
@@ -493,7 +529,7 @@ Example MCP config:
 }
 ```
 
-On first run, jcode also tries to import MCP servers from `~/.claude/mcp.json` and `~/.codex/config.toml` if `~/.jcode/mcp.json` does not exist yet.
+On first run, jcode also tries to import MCP servers from `~/.claude.json` (falling back to the legacy `~/.claude/mcp.json`) and `~/.codex/config.toml` if `~/.jcode/mcp.json` does not exist yet.
 
 For headless or SSH sessions, OAuth-style providers support `jcode login --provider <provider> --no-browser` (alias: `--headless`) so jcode prints the auth URL/QR and falls back to manual code or callback paste instead of trying to launch a local browser.
 
@@ -668,13 +704,16 @@ Notes:
 
 ## Further Reading
 
+- [jcode.sh/docs](https://jcode.sh/docs) — install, providers, configuration, keybindings
+- [jcode.sh/swarm](https://jcode.sh/swarm) — many coding agents in one repository
+- [jcode.sh/bench](https://jcode.sh/bench) — benchmark methodology and results
 - [Ambient Mode / OpenClaw](docs/AMBIENT_MODE.md)
 - [Browser Provider Protocol](docs/BROWSER_PROVIDER_PROTOCOL.md)
 - [Memory Architecture](docs/MEMORY_ARCHITECTURE.md)
 - [Swarm Architecture](docs/SWARM_ARCHITECTURE.md)
 - [Server Architecture](docs/SERVER_ARCHITECTURE.md)
-- [iOS Client Notes](docs/IOS_CLIENT.md)
 - [Safety System](docs/SAFETY_SYSTEM.md)
+- [Sponsored Discovery Sponsor Onboarding](docs/SPONSORED_DISCOVERY_SPONSOR_ONBOARDING.md)
 - [Windows Notes](docs/WINDOWS.md)
 - [Wrappers and Shell Integration](docs/WRAPPERS.md)
 - [Refactoring Notes](docs/REFACTORING.md)
@@ -697,10 +736,10 @@ Set up jcode on this machine for me.
      brew install jcode
 
    - macOS or Linux via install script:
-     curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.sh | bash
+     curl -fsSL https://jcode.sh/install | bash
 
    - Windows PowerShell:
-     irm https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.ps1 | iex
+     irm https://jcode.sh/install.ps1 | iex
 
    - From source if the above paths are not appropriate:
      git clone https://github.com/1jehuang/jcode.git
@@ -750,7 +789,7 @@ This is intended to be a copy-paste bootstrap prompt for jcode itself or any oth
 
 ```bash
 # macOS & Linux
-curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.sh | bash
+curl -fsSL https://jcode.sh/install | bash
 ```
 
 On Termux, install the glibc runtime and `patchelf` first so the installer can
@@ -759,13 +798,23 @@ launcher that avoids Termux's `LD_PRELOAD` shim:
 
 ```bash
 pkg install glibc patchelf
-curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.sh | bash
+curl -fsSL https://jcode.sh/install | bash
 ```
 
 ```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.ps1 | iex
+# Windows 11 x64 or ARM64 (PowerShell 5.1+)
+irm https://jcode.sh/install.ps1 | iex
 ```
+
+The Windows installer selects the correct architecture and verifies the download
+against the release's `SHA256SUMS`. Alacritty and the optional global launch
+hotkey require explicit consent and are not installed by default. See
+[Windows support, security, Defender, and SmartScreen notes](docs/WINDOWS.md).
+
+If a release does not contain a matching Windows asset, the installer stops
+instead of unexpectedly starting a long compilation. An explicit source build
+is available with `-BuildFromSource` and requires Git, Rust, and Visual Studio
+2022 Build Tools with the **Desktop development with C++** workload.
 
 ### macOS via Homebrew
 
@@ -799,6 +848,24 @@ Then symlink to your PATH:
 ```bash
 scripts/install_release.sh
 ```
+
+### Uninstall
+
+Removes installed binaries and the launcher but keeps your config, auth, and
+sessions so a clean reinstall picks up where you left off:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/uninstall.sh | bash -s -- --yes
+```
+
+For a full wipe of everything including config, auth, sessions, logs, and
+memory (useful for recovering from a broken install):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/uninstall.sh | bash -s -- --purge --yes
+```
+
+Add `--dry-run` to preview what would be removed without deleting anything.
 
 ### Platform Support
 

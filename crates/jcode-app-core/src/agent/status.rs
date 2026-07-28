@@ -11,6 +11,24 @@ impl Agent {
         self.session.messages.len()
     }
 
+    /// Number of model-visible conversation messages (excludes the immutable
+    /// session-context header and internal system reminders).
+    pub fn visible_conversation_message_count(&self) -> usize {
+        self.session.visible_conversation_message_count()
+    }
+
+    /// Role of the most recent model-visible conversation message, if any.
+    ///
+    /// When this is `User` and the agent is idle, the model still owes a
+    /// response for that turn (e.g. the turn errored or was interrupted before
+    /// the assistant replied).
+    pub fn last_visible_conversation_role(&self) -> Option<Role> {
+        self.session
+            .visible_conversation_messages()
+            .last()
+            .map(|message| message.role.clone())
+    }
+
     pub fn last_message_role(&self) -> Option<Role> {
         self.session.messages.last().map(|m| m.role.clone())
     }
@@ -56,6 +74,7 @@ impl Agent {
                         transcript.push_str(&format!("[Result: {}]\n", preview));
                     }
                     ContentBlock::Reasoning { .. }
+                    | ContentBlock::ReasoningTrace { .. }
                     | ContentBlock::AnthropicThinking { .. }
                     | ContentBlock::OpenAIReasoning { .. } => {}
                     ContentBlock::Image { .. } => {
@@ -133,7 +152,9 @@ impl Agent {
     }
 
     pub fn provider_name(&self) -> String {
-        crate::provider_catalog::runtime_provider_display_name(self.provider.name())
+        // `display_name()` resolves the active runtime profile (e.g. NVIDIA NIM)
+        // for the OpenRouter slot; for all other providers it equals `name()`.
+        self.provider.display_name()
     }
 
     pub fn provider_model(&self) -> String {

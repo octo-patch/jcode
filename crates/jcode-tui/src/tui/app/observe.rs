@@ -1,4 +1,4 @@
-use super::App;
+use super::{App, DisplayMessage};
 use crate::message::ToolCall;
 use crate::side_panel::{
     SidePanelPage, SidePanelPageFormat, SidePanelPageSource, SidePanelSnapshot,
@@ -60,6 +60,85 @@ impl App {
         self.refresh_observe_page();
     }
 
+    /// React to a completed tool by forcing the info-widget caches it may have
+    /// dirtied to refetch on the next frame, instead of waiting out their TTLs.
+    ///
+    /// The info widget's git-status and todos panels are stale-while-revalidate
+    /// caches (5s / 1s TTL). The agent's own tools are exactly what mutate those
+    /// underlying sources, so without an explicit nudge the widget would show the
+    /// repo/todo state from *before* the tool ran for a full TTL. This keeps the
+    /// SWR perf benefit (no synchronous git/disk work on the render path) while
+    /// making self-inflicted staleness self-correct immediately: the next read
+    /// returns the last value and kicks a background refresh.
+    ///
+    /// Called unconditionally on every tool completion (local and remote paths),
+    /// independent of observe mode. Tool names are matched leniently because the
+    /// same logical tool surfaces under several aliases (e.g. `bash`/`shell`,
+    /// `write`/`write_file`).
+    pub(super) fn note_tool_completed(&mut self, tool_call: &ToolCall, is_error: bool) {
+        if is_error {
+            // A failed tool did not change the working tree or todos.
+            return;
+        }
+
+        let name = tool_call.name.to_ascii_lowercase();
+
+        // Any filesystem- or repo-mutating tool can change git status (branch,
+        // staged/modified/untracked counts). `batch` can wrap any of these, so
+        // treat it as potentially mutating too.
+        let mutates_repo = matches!(
+            name.as_str(),
+            "bash"
+                | "shell"
+                | "shell_exec"
+                | "write"
+                | "write_file"
+                | "edit"
+                | "edit_file"
+                | "multiedit"
+                | "patch"
+                | "apply_patch"
+                | "batch"
+                | "run_shell"
+        );
+        if mutates_repo {
+            super::helpers::invalidate_git_info_cache();
+        }
+
+        // The todo tool rewrites the per-session todo list.
+        if (name == "todo" || name == "todowrite" || name == "todo_write")
+            && let Some(session_id) = self.active_client_session_id().map(str::to_string)
+        {
+            super::helpers::invalidate_todos_cache(&session_id);
+            // Local sessions also receive TodoUpdated, while remote sessions only
+            // observe the completed tool call. Refresh here as well so both paths
+            // adopt the same todo-derived title that /resume displays.
+            self.update_terminal_title();
+            // Long-task subscribe nudge: arms while incomplete todos exist,
+            // fires once when a 1h+ batch completes with quality gates passed.
+            self.note_todo_update_for_subscribe_nudge(&session_id);
+        }
+
+        // The schedule tool queues/cancels ambient tasks, which the ambient panel
+        // surfaces (queue count, next wake).
+        if name == "schedule" {
+            super::helpers::invalidate_ambient_info_cache();
+        }
+    }
+
+    /// Surface private todo quality-gate decisions to the user without exposing
+    /// their numeric thresholds to the model or the transcript.
+    pub(super) fn note_todo_gate_result(
+        &mut self,
+        tool_call: &ToolCall,
+        output: &str,
+        is_error: bool,
+    ) {
+        if let Some(notice) = todo_gate_notice(&tool_call.name, output, is_error) {
+            self.push_display_message(DisplayMessage::system(notice));
+        }
+    }
+
     pub(super) fn decorate_side_panel_with_observe(
         &self,
         mut snapshot: SidePanelSnapshot,
@@ -112,6 +191,26 @@ impl App {
             },
             updated_at_ms: self.observe_page_updated_at_ms.max(1),
         }
+    }
+}
+
+fn todo_gate_notice(name: &str, output: &str, is_error: bool) -> Option<&'static str> {
+    let name = name.to_ascii_lowercase();
+    if !matches!(name.as_str(), "todo" | "todowrite" | "todo_write") {
+        return None;
+    }
+
+    if output.contains(crate::todo::TODO_OWNERSHIP_CONTINUATION_MESSAGE) {
+        Some(
+            "🛑 The agent tried to finish without owning the full outcome. We asked it to follow through.",
+        )
+    } else if !is_error && output.contains(crate::todo::TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE)
+    {
+        Some(
+            "👉 The agent's plan has no clear way to measure progress. We asked it for a stronger feedback loop.",
+        )
+    } else {
+        None
     }
 }
 
@@ -194,4 +293,31 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|dur| dur.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn todo_gate_notices_are_user_visible_without_private_thresholds() {
+        let ownership = todo_gate_notice(
+            "todo",
+            crate::todo::TODO_OWNERSHIP_CONTINUATION_MESSAGE,
+            false,
+        )
+        .expect("ownership gate should produce a notice");
+        let hill = todo_gate_notice(
+            "todo",
+            crate::todo::TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE,
+            false,
+        )
+        .expect("hill-climbability gate should produce a notice");
+
+        assert!(ownership.contains("follow through"));
+        assert!(hill.contains("feedback loop"));
+        assert!(!ownership.contains(&crate::todo::QUALITY_GATE_THRESHOLD.to_string()));
+        assert!(!hill.contains(&crate::todo::QUALITY_GATE_THRESHOLD.to_string()));
+        assert!(todo_gate_notice("bash", ownership, true).is_none());
+    }
 }

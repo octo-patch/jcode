@@ -175,7 +175,7 @@ impl Provider for OpenRouterSpecCaptureProvider {
     }
 }
 
-fn create_test_app() -> App {
+pub(crate) fn create_test_app() -> App {
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -272,6 +272,7 @@ fn debug_memory_profile_includes_app_owned_summary_for_large_client_state() {
             data: "x".repeat(32 * 1024),
             label: Some("preview.png".to_string()),
             source: crate::session::RenderedImageSource::UserInput,
+            anchor: None,
         });
     app.observe_page_markdown = "# observe\n".repeat(256);
     app.input_undo_stack.push(("draft ".repeat(256), 12));
@@ -374,6 +375,26 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
         crate::env::remove_var("JCODE_HOME");
     }
     result
+}
+
+/// Run `f` in a hermetic `JCODE_HOME` with reasoning display pinned to
+/// `current`.
+///
+/// The reasoning-region tests assert live-then-anchored ("current") behaviour, but
+/// the *default* display mode became `Off` when `show_thinking` was defaulted off
+/// for new users (166e4444f). A temp home alone therefore no longer produces the
+/// mode these tests describe: it produces the new default. Pin the mode
+/// explicitly so the tests exercise the behaviour they document instead of
+/// silently following a config default they do not control.
+fn with_reasoning_current_home<T>(f: impl FnOnce() -> T) -> T {
+    with_temp_jcode_home(|| {
+        crate::config::Config::set_reasoning_display(
+            crate::config::ReasoningDisplayMode::Current,
+        )
+        .expect("pin reasoning display to current for the test config");
+        crate::config::invalidate_config_cache();
+        f()
+    })
 }
 
 fn create_jcode_repo_fixture() -> tempfile::TempDir {

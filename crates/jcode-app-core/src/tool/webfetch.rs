@@ -7,6 +7,13 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 const MAX_SIZE: usize = 5 * 1024 * 1024; // 5MB
+/// Cap on the text handed back to the model. Full pages routinely exceed 150 KB
+/// (~40k tokens) which is rarely worth the context budget.
+const MAX_OUTPUT_CHARS: usize = 40_000;
+/// Links whose target exceeds this length are rendered as their anchor text
+/// only. Long URLs are typically encoded payloads (pre-filled editors, tracking
+/// parameters, data URIs) whose cost far exceeds their navigational value.
+const MAX_URL_CHARS: usize = 300;
 const DEFAULT_TIMEOUT: u64 = 30;
 const MAX_TIMEOUT: u64 = 120;
 
@@ -151,13 +158,41 @@ impl Tool for WebFetchTool {
             }
         };
 
+        let full_len = output.len();
+        let (output, output_truncated) = truncate_output(output);
+
+        let note = if output_truncated {
+            format!(
+                "\n\n(output truncated to {MAX_OUTPUT_CHARS} of {full_len} chars; \
+                 fetch a more specific URL or anchor for the rest)"
+            )
+        } else {
+            String::new()
+        };
+
         Ok(ToolOutput::new(format!(
-            "Fetched {} ({} bytes)\n\n{}",
-            params.url,
-            output.len(),
-            output
+            "Fetched {} ({} bytes)\n\n{}{}",
+            params.url, full_len, output, note
         )))
     }
+}
+
+/// Truncate at a char boundary, preferring to cut at the last newline so the tail
+/// is not a half-formed line.
+fn truncate_output(output: String) -> (String, bool) {
+    if output.len() <= MAX_OUTPUT_CHARS {
+        return (output, false);
+    }
+    let mut cut = MAX_OUTPUT_CHARS;
+    while cut > 0 && !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let slice = &output[..cut];
+    let cut = match slice.rfind('\n') {
+        Some(nl) if nl > MAX_OUTPUT_CHARS / 2 => nl,
+        _ => cut,
+    };
+    (output[..cut].to_string(), true)
 }
 
 mod html_regex {
@@ -189,14 +224,52 @@ mod html_regex {
 
     static_regex!(script, r"(?is)<script[^>]*>.*?</script>");
     static_regex!(style, r"(?is)<style[^>]*>.*?</style>");
-    static_regex!(tag, r"<[^>]+>");
+    // Match attribute values (which may themselves contain `>`) before falling
+    // back to bare `>`-terminated content, so tags carrying JSON payloads such as
+    // Parsoid's `data-mw` do not leak their contents into the output.
+    static_regex!(
+        tag,
+        r#"(?s)</?[A-Za-z!/][^\s/>]*(?:\s+[^\s=/>]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*))?)*\s*/?>"#
+    );
     static_regex!(whitespace, r"\n\s*\n\s*\n");
+    // Runs of empty markdown list items left behind after tag stripping.
+    static_regex!(empty_bullets, r"(?m)^[ \t]*-[ \t]*$\n?");
+
+    /// HTML elements whose content is non-prose by specification: navigation,
+    /// complementary/tangential content, interactive controls, and embedded
+    /// non-text resources. This is deliberately limited to elements whose *spec
+    /// definition* excludes primary content, so it generalizes across sites
+    /// rather than encoding any single site's markup.
+    ///
+    /// Notably excludes `<header>`, which commonly wraps the article `<h1>`,
+    /// byline, and publication date, and `<footer>`, which can carry
+    /// article-level attribution when nested inside `<article>`.
+    const CHROME_TAGS: [&str; 10] = [
+        "nav", "aside", "form", "noscript", "svg", "iframe", "template", "select", "dialog",
+        "canvas",
+    ];
+
+    static CHROME: OnceLock<Vec<Regex>> = OnceLock::new();
+
+    pub fn chrome() -> &'static [Regex] {
+        CHROME.get_or_init(|| {
+            CHROME_TAGS
+                .iter()
+                .filter_map(|tag| {
+                    compile_regex(&format!(r"(?is)<{tag}\b[^>]*>.*?</{tag}\s*>"), "chrome")
+                })
+                .collect()
+        })
+    }
     static_regex!(link, r#"(?i)<a[^>]*href=["']([^"']+)["'][^>]*>([^<]*)</a>"#);
     static_regex!(strong, r"(?i)<(?:strong|b)>([^<]*)</(?:strong|b)>");
     static_regex!(em, r"(?i)<(?:em|i)>([^<]*)</(?:em|i)>");
     static_regex!(code, r"(?i)<code>([^<]*)</code>");
     static_regex!(pre_code, r"(?is)<pre[^>]*><code[^>]*>(.+?)</code></pre>");
     static_regex!(li, r"(?i)<li[^>]*>");
+    // HTML comments frequently contain build metadata, conditional markup, and
+    // commented-out blocks, none of which are rendered content.
+    static_regex!(comment, r"(?s)<!--.*?-->");
 
     static H_OPEN: OnceLock<Option<[Regex; 6]>> = OnceLock::new();
     static H_CLOSE: OnceLock<Option<[Regex; 6]>> = OnceLock::new();
@@ -242,6 +315,12 @@ fn html_to_text(html: &str) -> String {
 
     text = script.replace_all(&text, "").to_string();
     text = style.replace_all(&text, "").to_string();
+    if let Some(comment) = html_regex::comment() {
+        text = comment.replace_all(&text, "").to_string();
+    }
+    for re in html_regex::chrome() {
+        text = re.replace_all(&text, "").to_string();
+    }
 
     text = text.replace("<br>", "\n");
     text = text.replace("<br/>", "\n");
@@ -263,6 +342,28 @@ fn html_to_text(html: &str) -> String {
     text = whitespace.replace_all(&text, "\n\n").to_string();
 
     text.trim().to_string()
+}
+
+/// Render one anchor as markdown, dropping targets that cost more context than
+/// they convey.
+///
+/// Three general cases, none specific to any site:
+/// - Empty anchor text means the link is a bare icon or control. Emitting
+///   `[](url)` conveys nothing, so the whole link is dropped.
+/// - Overlong targets are encoded payloads rather than addresses; the anchor
+///   text is kept and the target dropped.
+/// - Pure in-page fragments (`#foo`) are navigation aids with no destination
+///   content, so the text is kept and the target dropped.
+fn render_link(href: &str, text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') || href.chars().count() > MAX_URL_CHARS {
+        return text.to_string();
+    }
+    format!("[{text}]({href})")
 }
 
 fn html_to_markdown(html: &str) -> String {
@@ -297,6 +398,12 @@ fn html_to_markdown(html: &str) -> String {
 
     md = script.replace_all(&md, "").to_string();
     md = style.replace_all(&md, "").to_string();
+    if let Some(comment) = html_regex::comment() {
+        md = comment.replace_all(&md, "").to_string();
+    }
+    for re in html_regex::chrome() {
+        md = re.replace_all(&md, "").to_string();
+    }
 
     if let (Some(h_open), Some(h_close)) = (html_regex::h_open(), html_regex::h_close()) {
         for i in 0..6 {
@@ -308,7 +415,14 @@ fn html_to_markdown(html: &str) -> String {
         }
     }
 
-    md = link.replace_all(&md, "[$2]($1)").to_string();
+    md = link
+        .replace_all(&md, |caps: &regex::Captures<'_>| {
+            render_link(
+                caps.get(1).map_or("", |m| m.as_str()),
+                caps.get(2).map_or("", |m| m.as_str()),
+            )
+        })
+        .to_string();
     md = strong.replace_all(&md, "**$1**").to_string();
     md = em.replace_all(&md, "*$1*").to_string();
     md = code.replace_all(&md, "`$1`").to_string();
@@ -329,7 +443,97 @@ fn html_to_markdown(html: &str) -> String {
     md = md.replace("&quot;", "\"");
     md = md.replace("&#39;", "'");
 
+    if let Some(empty_bullets) = html_regex::empty_bullets() {
+        md = empty_bullets.replace_all(&md, "").to_string();
+    }
     md = whitespace.replace_all(&md, "\n\n").to_string();
 
     md.trim().to_string()
+}
+
+#[cfg(test)]
+#[path = "webfetch_corpus_tests.rs"]
+mod corpus_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_non_prose_elements() {
+        let html = "<nav><a href='/x'>Menu</a></nav><p>Body text</p>\
+                    <aside>Related</aside><form><select><option>Pick</option></select></form>";
+        let md = html_to_markdown(html);
+        assert!(md.contains("Body text"));
+        assert!(!md.contains("Menu"), "nav should be dropped: {md}");
+        assert!(!md.contains("Related"), "aside should be dropped: {md}");
+        assert!(
+            !md.contains("Pick"),
+            "form controls should be dropped: {md}"
+        );
+    }
+
+    #[test]
+    fn keeps_article_header_and_footer_content() {
+        // <header> usually holds the title/byline and <footer> can hold
+        // article attribution, so neither is treated as chrome.
+        let html = "<article><header><h1>Real Title</h1><p>By Author</p></header>\
+                    <p>Body</p><footer>Published 2026</footer></article>";
+        let md = html_to_markdown(html);
+        for needle in ["Real Title", "By Author", "Body", "Published 2026"] {
+            assert!(md.contains(needle), "{needle} missing from {md}");
+        }
+    }
+
+    #[test]
+    fn drops_empty_links_and_overlong_targets() {
+        assert_eq!(render_link("https://example.com", ""), "");
+        assert_eq!(render_link("#section", "Jump"), "Jump");
+        let long = format!("https://example.com/?code={}", "a".repeat(MAX_URL_CHARS));
+        assert_eq!(render_link(&long, "Run"), "Run");
+        assert_eq!(
+            render_link("https://example.com", "Home"),
+            "[Home](https://example.com)"
+        );
+    }
+
+    #[test]
+    fn strips_html_comments() {
+        let md = html_to_markdown("<p>Keep</p><!-- build:12345 drop me -->");
+        assert!(md.contains("Keep"));
+        assert!(!md.contains("drop me"), "comment retained: {md}");
+    }
+
+    #[test]
+    fn does_not_leak_attributes_containing_angle_brackets() {
+        // Parsoid-style tags embed JSON in attributes; a naive `<[^>]+>` regex
+        // stops at the first `>` inside the value and dumps the rest as text.
+        let html = r#"<span data-mw='{"wt":"[[a]] > [[b]]"}'>Visible</span>"#;
+        let text = html_to_text(html);
+        assert_eq!(text, "Visible");
+    }
+
+    #[test]
+    fn caps_output_length() {
+        let long = "line of text\n".repeat(MAX_OUTPUT_CHARS);
+        let (out, truncated) = truncate_output(long);
+        assert!(truncated);
+        assert!(out.len() <= MAX_OUTPUT_CHARS);
+    }
+
+    #[test]
+    fn keeps_short_output_intact() {
+        let (out, truncated) = truncate_output("hello".to_string());
+        assert!(!truncated);
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // Multi-byte chars straddling the cut must not panic or corrupt output.
+        let long = "é".repeat(MAX_OUTPUT_CHARS);
+        let (out, truncated) = truncate_output(long);
+        assert!(truncated);
+        assert!(out.chars().all(|c| c == 'é'));
+    }
 }

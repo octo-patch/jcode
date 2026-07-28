@@ -232,7 +232,10 @@ pub fn export_timeline(session: &Session) -> Vec<TimelineEvent> {
                     .content
                     .iter()
                     .filter_map(|b| {
-                        if let ContentBlock::ToolUse { id, name, input } = b {
+                        if let ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } = b
+                        {
                             Some((id.clone(), name.clone(), input.clone()))
                         } else {
                             None

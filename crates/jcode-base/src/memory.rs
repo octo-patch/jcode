@@ -42,17 +42,20 @@ pub use activity::{
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
 use cache::{cache_graph, cached_graph};
-#[cfg(test)]
-use pending::insert_pending_memory_for_test;
 pub use pending::{
     PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
     clear_pending_memory, has_any_pending_memory, has_pending_memory, is_memory_injected,
-    is_memory_injected_any, mark_memories_injected, set_pending_memory,
+    is_memory_injected_any, mark_memories_injected, mark_memories_known, set_pending_memory,
     set_pending_memory_with_ids, set_pending_memory_with_ids_and_display, sync_injected_memories,
     take_pending_memory,
 };
+#[cfg(test)]
+use pending::{backdate_injected_memory_for_test, insert_pending_memory_for_test};
 use pending::{begin_memory_check, finish_memory_check};
-pub(crate) use prompt_support::{format_context_for_extraction, format_context_for_relevance};
+pub(crate) use prompt_support::format_context_for_extraction;
+pub use prompt_support::{
+    focus_query_text, format_context_for_relevance, format_focused_query_for_relevance,
+};
 
 const LEGACY_NOTE_CATEGORY: &str = "note";
 const MEMORY_RELEVANCE_MAX_CANDIDATES: usize = 30;
@@ -109,8 +112,41 @@ struct LegacyNoteEntry {
 
 pub type MemoryEventSink = Arc<dyn Fn(crate::protocol::ServerEvent) + Send + Sync>;
 
+/// Whether the user opted into the memory sidecar (LLM precision judge) mode.
+///
+/// This is the *configured* intent, not whether an LLM is actually reachable.
+/// It defaults to `true`: the LLM precision-judge path is the only mode that is
+/// reliably productive, so memory uses it unless the user explicitly opts into
+/// the no-LLM hybrid path (`agents.memory_sidecar_enabled = false`).
 pub fn memory_sidecar_enabled() -> bool {
     crate::config::config().agents.memory_sidecar_enabled
+}
+
+/// Whether the LLM precision-judge (sidecar) path can actually run right now:
+/// the user opted into sidecar mode AND a real LLM backend is reachable.
+///
+/// Re-evaluated live so login add/remove is reflected without a restart.
+pub fn memory_llm_judge_available() -> bool {
+    memory_sidecar_enabled() && crate::sidecar::Sidecar::llm_backend_available()
+}
+
+/// Whether memory should do anything at all this moment.
+///
+/// Memory is only worthwhile with the LLM precision judge. So memory is active
+/// when EITHER:
+/// - the LLM judge is available (configured + a backend is reachable), OR
+/// - the user explicitly opted OUT of the sidecar (they deliberately want the
+///   no-LLM hybrid path).
+///
+/// The one case we suppress is "sidecar mode requested but no LLM backend is
+/// reachable" (e.g. logged out / lost access): rather than silently degrading
+/// to the low-precision no-LLM path, memory goes dormant until a login returns.
+pub fn memory_runtime_active() -> bool {
+    if !memory_sidecar_enabled() {
+        // Explicit opt-out: user chose the no-LLM hybrid path on purpose.
+        return true;
+    }
+    crate::sidecar::Sidecar::llm_backend_available()
 }
 
 fn emit_memory_activity(event_tx: Option<&MemoryEventSink>) {
@@ -132,9 +168,13 @@ impl MemoryEntryEmbeddingExt for MemoryEntry {
             return false;
         }
 
-        match crate::embedding::embed(&self.content) {
-            Ok(embedding) => {
-                self.embedding = Some(embedding);
+        match crate::embedding_backend::embed_passage_active(&self.content) {
+            Ok((embedding, model_id)) => {
+                // Tag with the ACTIVE backend's model id so dense search only
+                // compares vectors from the same model/vector space. Untagged
+                // legacy memories are treated as local MiniLM via
+                // effective_embedding_model().
+                self.set_embedding(Some(embedding), Some(model_id));
                 true
             }
             Err(err) => {
@@ -206,9 +246,7 @@ impl MemoryManager {
     }
 
     fn get_project_dir(&self) -> Option<PathBuf> {
-        self.project_dir
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
+        self.project_dir.clone()
     }
 
     fn project_memory_path(&self) -> Result<Option<PathBuf>> {
@@ -535,8 +573,8 @@ impl MemoryManager {
         limit: usize,
     ) -> Result<Vec<(MemoryEntry, f32)>> {
         // Generate embedding for query text
-        let query_embedding = match crate::embedding::embed(text) {
-            Ok(emb) => emb,
+        let query_embedding = match crate::embedding_backend::embed_query_active(text) {
+            Ok((emb, _model)) => emb,
             Err(e) => {
                 crate::logging::info(&format!(
                     "Embedding failed, falling back to keyword search: {}",
@@ -556,8 +594,8 @@ impl MemoryManager {
         limit: usize,
         scope: MemoryScope,
     ) -> Result<Vec<(MemoryEntry, f32)>> {
-        let query_embedding = match crate::embedding::embed(text) {
-            Ok(emb) => emb,
+        let query_embedding = match crate::embedding_backend::embed_query_active(text) {
+            Ok((emb, _model)) => emb,
             Err(e) => {
                 crate::logging::info(&format!(
                     "Embedding failed, falling back to keyword search: {}",
@@ -590,6 +628,103 @@ impl MemoryManager {
     ) -> Result<Vec<(MemoryEntry, f32)>> {
         let entries_with_emb = self.collect_memories_with_embeddings_scoped(scope)?;
         Self::score_and_filter(entries_with_emb, query_embedding, "", threshold, limit)
+    }
+
+    /// Hybrid retrieval: fuse dense (embedding cosine) and sparse (BM25 over
+    /// memory search text) rankings with Reciprocal Rank Fusion.
+    ///
+    /// This is the recall-oriented live retrieval path. Unlike
+    /// `find_similar_with_embedding`, it does NOT apply a hard cosine floor
+    /// (which benchmarking showed zeroes out recall): instead it pulls a
+    /// generous candidate pool from each retriever and lets RRF + the
+    /// downstream sidecar/rerank decide. Lexical signal is essential for the
+    /// identifier/path/term-heavy memories agents store.
+    pub fn find_similar_hybrid(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(MemoryEntry, f32)>> {
+        self.find_similar_hybrid_scoped(query_text, query_embedding, limit, MemoryScope::All)
+    }
+
+    pub fn find_similar_hybrid_scoped(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        scope: MemoryScope,
+    ) -> Result<Vec<(MemoryEntry, f32)>> {
+        let entries = self.collect_memories_with_embeddings_scoped(scope)?;
+        Ok(Self::hybrid_fuse(
+            entries,
+            query_text,
+            query_embedding,
+            limit,
+        ))
+    }
+
+    /// Pull pool, rank by dense and BM25 separately, fuse with RRF.
+    fn hybrid_fuse(
+        entries: Vec<MemoryEntry>,
+        query_text: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Vec<(MemoryEntry, f32)> {
+        let entries: Vec<MemoryEntry> = entries
+            .into_iter()
+            .filter(|e| e.embedding.is_some())
+            .collect();
+        if entries.is_empty() {
+            return Vec::new();
+        }
+
+        // Generous per-retriever pool so fusion has signal to work with.
+        let pool = (limit * 5).max(HYBRID_POOL_MIN);
+
+        // Dense ranking (no hard threshold; just take the top by cosine).
+        // Vector-space gate: only entries embedded by the ACTIVE backend share a
+        // comparable space, so dense scores are computed over those only. Other
+        // entries (different model, e.g. not-yet-re-embedded local memories when
+        // OpenAI is active) still participate via the BM25 lexical half below, so
+        // they remain reachable rather than disappearing on a backend switch.
+        let active_model = crate::embedding_backend::active_model_id();
+        let dense_eligible: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.effective_embedding_model() == active_model)
+            .map(|(i, _)| i)
+            .collect();
+        let emb_refs: Vec<&[f32]> = dense_eligible
+            .iter()
+            .filter_map(|&i| entries[i].embedding.as_deref())
+            .collect();
+        let dense_scores = crate::embedding::batch_cosine_similarity(query_embedding, &emb_refs);
+        let mut dense: Vec<(usize, f32)> =
+            dense_eligible.iter().copied().zip(dense_scores).collect();
+        dense.sort_by(|a, b| b.1.total_cmp(&a.1));
+        dense.truncate(pool);
+
+        // Sparse (BM25) ranking over memory search text.
+        let sparse = bm25_rank(&entries, query_text, pool);
+
+        // RRF fusion.
+        const RRF_K: f32 = 60.0;
+        let mut fused: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        for (rank, (idx, _)) in dense.iter().enumerate() {
+            *fused.entry(*idx).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+        }
+        for (rank, (idx, _)) in sparse.iter().enumerate() {
+            *fused.entry(*idx).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+        }
+
+        let mut entries: Vec<Option<MemoryEntry>> = entries.into_iter().map(Some).collect();
+        top_k_by_score(
+            fused
+                .into_iter()
+                .filter_map(|(idx, score)| entries[idx].take().map(|e| (e, score))),
+            limit,
+        )
     }
 
     fn collect_all_memories_with_embeddings(&self) -> Result<Vec<MemoryEntry>> {
@@ -677,8 +812,8 @@ impl MemoryManager {
         limit: usize,
         scope: MemoryScope,
     ) -> Result<Vec<(MemoryEntry, f32)>> {
-        let query_embedding = match crate::embedding::embed(text) {
-            Ok(emb) => emb,
+        let query_embedding = match crate::embedding_backend::embed_query_active(text) {
+            Ok((emb, _model)) => emb,
             Err(e) => {
                 crate::logging::info(&format!(
                     "Embedding failed for retrieval candidates, falling back to keyword search: {}",
@@ -705,17 +840,33 @@ impl MemoryManager {
 
         let mut filtered_entries = Vec::with_capacity(entries.len());
         let mut skipped_missing_embeddings = 0usize;
+        // Vector-space gate: only compare embeddings produced by the ACTIVE
+        // backend (same model id). When the active backend differs from an
+        // entry's stored model (e.g. user switched to OpenAI but this memory was
+        // embedded with local MiniLM, not yet re-embedded), the cosine would be
+        // meaningless, so we exclude it from dense scoring. Such memories remain
+        // reachable via the lexical/BM25 path in hybrid retrieval.
+        let active_model = crate::embedding_backend::active_model_id();
+        let mut skipped_model_mismatch = 0usize;
         for entry in entries {
-            if entry.embedding.is_some() {
-                filtered_entries.push(entry);
-            } else {
+            if entry.embedding.is_none() {
                 skipped_missing_embeddings += 1;
+            } else if entry.effective_embedding_model() != active_model {
+                skipped_model_mismatch += 1;
+            } else {
+                filtered_entries.push(entry);
             }
         }
         if skipped_missing_embeddings > 0 {
             crate::logging::warn(&format!(
                 "Skipped {} retrieval candidate(s) without embeddings during similarity scoring",
                 skipped_missing_embeddings
+            ));
+        }
+        if skipped_model_mismatch > 0 {
+            crate::logging::info(&format!(
+                "Skipped {} retrieval candidate(s) embedded with a different model than the active backend ({})",
+                skipped_model_mismatch, active_model
             ));
         }
         if filtered_entries.is_empty() {
@@ -966,8 +1117,8 @@ impl MemoryManager {
         transcript: &str,
         session_id: &str,
     ) -> Result<Vec<String>> {
-        if !memory_sidecar_enabled() {
-            crate::logging::info("Memory transcript extraction skipped: memory sidecar disabled");
+        if !memory_llm_judge_available() {
+            crate::logging::info("Memory transcript extraction skipped: LLM judge unavailable");
             return Ok(Vec::new());
         }
 
@@ -1136,15 +1287,6 @@ impl MemoryManager {
         let manager = self.clone();
 
         tokio::spawn(async move {
-            let manager = if manager.project_dir.is_none() {
-                MemoryManager {
-                    project_dir: std::env::current_dir().ok(),
-                    ..manager
-                }
-            } else {
-                manager
-            };
-
             match manager
                 .get_relevant_parallel(&sid, &messages, event_tx.clone())
                 .await
@@ -1838,6 +1980,79 @@ pub const EMBEDDING_SIMILARITY_THRESHOLD: f32 = 0.5;
 
 /// Maximum embedding hits to verify with sidecar
 pub const EMBEDDING_MAX_HITS: usize = 10;
+
+/// Minimum per-retriever candidate pool size for hybrid fusion.
+const HYBRID_POOL_MIN: usize = 50;
+
+/// Rank memories by BM25 over their normalized search text.
+///
+/// Returns `(entry_index, score)` pairs sorted by score desc, truncated to
+/// `limit`. Memories with zero query-term overlap are dropped.
+fn bm25_rank(entries: &[MemoryEntry], query_text: &str, limit: usize) -> Vec<(usize, f32)> {
+    const K1: f32 = 1.2;
+    const B: f32 = 0.75;
+
+    let q_terms: Vec<String> = normalize_search_text(query_text)
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    if q_terms.is_empty() {
+        return Vec::new();
+    }
+    let q_set: std::collections::HashSet<&String> = q_terms.iter().collect();
+
+    // Tokenize each doc once; compute df and doc lengths.
+    let docs: Vec<Vec<String>> = entries
+        .iter()
+        .map(|e| {
+            e.searchable_text()
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .collect();
+
+    let n = docs.len().max(1) as f32;
+    let avgdl = docs.iter().map(|d| d.len()).sum::<usize>() as f32 / n;
+    let mut df: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+    for doc in &docs {
+        let unique: std::collections::HashSet<&str> = doc.iter().map(|s| s.as_str()).collect();
+        for t in unique {
+            *df.entry(t).or_insert(0.0) += 1.0;
+        }
+    }
+
+    let mut scored: Vec<(usize, f32)> = Vec::new();
+    for (idx, doc) in docs.iter().enumerate() {
+        if doc.is_empty() {
+            continue;
+        }
+        let dl = doc.len() as f32;
+        let mut tf: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+        for t in doc {
+            *tf.entry(t.as_str()).or_insert(0.0) += 1.0;
+        }
+        let mut score = 0.0f32;
+        for term in &q_set {
+            let Some(&f) = tf.get(term.as_str()) else {
+                continue;
+            };
+            let n_q = *df.get(term.as_str()).unwrap_or(&0.0);
+            if n_q == 0.0 {
+                continue;
+            }
+            let idf = (((n - n_q + 0.5) / (n_q + 0.5)) + 1.0).ln();
+            let denom = f + K1 * (1.0 - B + B * dl / avgdl);
+            score += idf * (f * (K1 + 1.0)) / denom;
+        }
+        if score > 0.0 {
+            scored.push((idx, score));
+        }
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.truncate(limit);
+    scored
+}
 
 impl Default for MemoryManager {
     fn default() -> Self {

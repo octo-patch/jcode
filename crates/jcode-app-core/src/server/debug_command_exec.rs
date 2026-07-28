@@ -158,7 +158,12 @@ pub(super) async fn execute_debug_command(
             return Err(anyhow::anyhow!("queue_interrupt: requires content"));
         }
         let agent = agent.lock().await;
-        agent.queue_soft_interrupt(content.to_string(), false, SoftInterruptSource::User);
+        agent.queue_soft_interrupt(
+            content.to_string(),
+            Vec::new(),
+            false,
+            SoftInterruptSource::User,
+        );
         return Ok("queued".to_string());
     }
 
@@ -171,7 +176,12 @@ pub(super) async fn execute_debug_command(
             return Err(anyhow::anyhow!("queue_interrupt_urgent: requires content"));
         }
         let agent = agent.lock().await;
-        agent.queue_soft_interrupt(content.to_string(), true, SoftInterruptSource::User);
+        agent.queue_soft_interrupt(
+            content.to_string(),
+            Vec::new(),
+            true,
+            SoftInterruptSource::User,
+        );
         return Ok("queued (urgent)".to_string());
     }
 
@@ -330,15 +340,19 @@ pub(super) async fn execute_debug_command(
             Some(ctx) => ctx.control_handle().await,
             None => None,
         } {
-            let _queued =
-                control.queue_soft_interrupt(content.clone(), true, SoftInterruptSource::User);
+            let _queued = control.queue_soft_interrupt(
+                content.clone(),
+                Vec::new(),
+                true,
+                SoftInterruptSource::User,
+            );
             control.request_cancel();
             delivered_without_agent_lock = true;
         }
 
         if !delivered_without_agent_lock {
             let agent = agent.lock().await;
-            agent.queue_soft_interrupt(content, true, SoftInterruptSource::User);
+            agent.queue_soft_interrupt(content, Vec::new(), true, SoftInterruptSource::User);
             agent.request_graceful_shutdown();
         }
         return Ok(serde_json::json!({
@@ -534,7 +548,7 @@ pub(super) async fn execute_debug_command(
                 if claude_usage_exhausted {
                     "claude-sonnet-4-6"
                 } else {
-                    "claude-opus-4-8"
+                    "claude-fable-5"
                 }
             }
             "openai" | "codex" => "gpt-5.5",
@@ -631,13 +645,17 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
+    /// Serialize env mutation on the *shared* process-wide test lock.
+    ///
+    /// Env vars are per-process, so a private mutex here would only exclude
+    /// other tests in this module while racing every other test that mutates
+    /// the environment (notably the `IsolatedHome` users in `reload_recovery`,
+    /// which set `JCODE_HOME` under `storage::lock_test_env`). Two mutexes
+    /// guarding one global serialize nothing, which showed up as a rotating set
+    /// of failures under `cargo test` that all passed with `--test-threads=1`
+    /// (issue #593). Everything touching the environment must share one lock.
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::storage::lock_test_env()
     }
 
     struct EnvGuard {
@@ -731,7 +749,14 @@ mod tests {
         .await
         .expect("debug selfdev reload should not hang")
         .expect("debug selfdev reload should succeed");
-        ack_task.await.expect("reload ack task should complete");
+        // Bound the ack wait: the reload must have emitted a signal for the
+        // acker to observe. If a regression makes `do_reload` short-circuit
+        // before `send_reload_signal` (e.g. the old "No binary found" path),
+        // this would otherwise hang forever instead of failing the test.
+        tokio::time::timeout(Duration::from_secs(2), ack_task)
+            .await
+            .expect("reload signal was never emitted (ack task hung)")
+            .expect("reload ack task should complete");
 
         assert!(
             started.elapsed() < Duration::from_secs(2),

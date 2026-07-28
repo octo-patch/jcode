@@ -75,6 +75,61 @@ pub fn binary_name() -> &'static str {
 
 pub const SELFDEV_CARGO_PROFILE: &str = "selfdev";
 
+/// Resolve a channel/launcher binary path to the file that actually runs.
+///
+/// Release archives install a tiny `jcode` wrapper script alongside the real
+/// `jcode-<platform>.bin` payload (the wrapper sets `LD_LIBRARY_PATH` and execs
+/// the payload). Channel symlinks point at the wrapper and reload/exec must
+/// keep using the wrapper, but the *running process* (`current_exe()`) is the
+/// payload. Any "is the candidate the same/newer binary than the running one?"
+/// comparison must therefore compare payloads. Comparing the wrapper against
+/// the payload compares two different files with unrelated mtimes, which made
+/// `server_has_newer_binary()` report a phantom update forever and locked
+/// post-`/update` sessions into an infinite reload loop.
+///
+/// Returns the canonicalized payload path when `path` resolves to a wrapper
+/// script with a unique sibling `<stem>-*.bin` payload; otherwise returns the
+/// canonicalized input path.
+pub fn resolve_binary_payload(path: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    wrapper_payload_sibling(&canonical).unwrap_or(canonical)
+}
+
+fn wrapper_payload_sibling(path: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(path).ok()?;
+    // Wrapper scripts are a few hundred bytes; real binaries are tens of MB.
+    // The size gate keeps us from reading a large binary just to check "#!".
+    if !meta.is_file() || meta.len() > 4096 {
+        return None;
+    }
+    let mut prefix = [0u8; 2];
+    {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        file.read_exact(&mut prefix).ok()?;
+    }
+    if &prefix != b"#!" {
+        return None;
+    }
+    let dir = path.parent()?;
+    let stem = path.file_stem()?.to_str()?;
+    let payload_prefix = format!("{stem}-");
+    let mut payload: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        if name.starts_with(&payload_prefix) && name.ends_with(".bin") {
+            if payload.is_some() {
+                // Ambiguous: more than one payload candidate. Refuse to guess.
+                return None;
+            }
+            payload = Some(entry.path());
+        }
+    }
+    payload.filter(|p| p.is_file())
+}
+
 fn profile_binary_path(repo_dir: &Path, profile: &str) -> PathBuf {
     repo_dir.join("target").join(profile).join(binary_name())
 }
@@ -123,8 +178,13 @@ pub fn selfdev_build_command_for_target(
     let specs = match target {
         SelfDevBuildTarget::Tui => vec![("jcode", "jcode")],
         SelfDevBuildTarget::Desktop => vec![("jcode-desktop", "jcode-desktop")],
+        SelfDevBuildTarget::Desktop2 => vec![("jcode-desktop2", "jcode-desktop2")],
         SelfDevBuildTarget::All | SelfDevBuildTarget::Auto => {
-            vec![("jcode", "jcode"), ("jcode-desktop", "jcode-desktop")]
+            vec![
+                ("jcode", "jcode"),
+                ("jcode-desktop", "jcode-desktop"),
+                ("jcode-desktop2", "jcode-desktop2"),
+            ]
         }
     };
     let wrapper = repo_dir.join("scripts").join("dev_cargo.sh");
@@ -183,30 +243,50 @@ fn infer_selfdev_build_target(repo_dir: &Path) -> SelfDevBuildTarget {
         return SelfDevBuildTarget::Tui;
     }
     let text = String::from_utf8_lossy(&output.stdout);
+    let paths: Vec<String> = text.lines().map(porcelain_path).collect();
+    build_target_for_paths(paths.iter().map(String::as_str))
+}
+
+/// The path a `git status --porcelain=v1` line refers to, following renames.
+fn porcelain_path(line: &str) -> String {
+    let raw = line.get(3..).unwrap_or(line).trim();
+    raw.rsplit_once(" -> ")
+        .map(|(_, new_path)| new_path)
+        .unwrap_or(raw)
+        .to_string()
+}
+
+/// Which binaries the given changed paths require rebuilding. Pure, so the
+/// routing is testable: getting this wrong means `selfdev build` silently
+/// builds the wrong binary and a reload appears to do nothing.
+fn build_target_for_paths<'a>(paths: impl Iterator<Item = &'a str>) -> SelfDevBuildTarget {
     let mut desktop = false;
+    let mut desktop2 = false;
     let mut other = false;
-    for line in text.lines() {
-        let path = line
-            .get(3..)
-            .unwrap_or(line)
-            .trim()
-            .rsplit_once(" -> ")
-            .map(|(_, new_path)| new_path)
-            .unwrap_or_else(|| line.get(3..).unwrap_or(line).trim());
+    for path in paths {
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
         if path == "Cargo.toml" || path == "Cargo.lock" || path.starts_with(".cargo/") {
+            // Workspace-wide changes can affect every binary.
             desktop = true;
+            desktop2 = true;
             other = true;
+        } else if path.starts_with("crates/jcode-desktop2/") {
+            // Checked before jcode-desktop/ so desktop2 is not misattributed.
+            desktop2 = true;
         } else if path.starts_with("crates/jcode-desktop/") {
             desktop = true;
-        } else if !path.is_empty() {
+        } else {
             other = true;
         }
     }
-    match (desktop, other) {
-        (true, false) => SelfDevBuildTarget::Desktop,
-        (false, true) => SelfDevBuildTarget::Tui,
-        (true, true) => SelfDevBuildTarget::All,
-        (false, false) => SelfDevBuildTarget::Tui,
+    match (desktop, desktop2, other) {
+        (true, false, false) => SelfDevBuildTarget::Desktop,
+        (false, true, false) => SelfDevBuildTarget::Desktop2,
+        (false, false, _) => SelfDevBuildTarget::Tui,
+        _ => SelfDevBuildTarget::All,
     }
 }
 
@@ -483,12 +563,18 @@ pub fn preferred_reload_candidate(is_selfdev_session: bool) -> Option<(PathBuf, 
         }
     });
 
-    let repo_is_newer =
-        |repo: &Path, current: &Path| match (binary_mtime(repo), binary_mtime(current)) {
+    let repo_is_newer = |repo: &Path, current: &Path| {
+        // `current` may be a channel symlink to a release wrapper script;
+        // compare the payload that actually runs, not the wrapper.
+        match (
+            binary_mtime(repo),
+            binary_mtime(&resolve_binary_payload(current)),
+        ) {
             (Some(repo), Some(current)) => repo > current,
             (Some(_), None) => true,
             _ => false,
-        };
+        }
+    };
 
     match (repo_binary, candidate) {
         (Some((repo, label)), Some((current, _))) if repo_is_newer(&repo, &current) => {
@@ -555,9 +641,196 @@ mod tests {
         );
     }
 
+    /// Every build target must map to the package it claims to build, or
+    /// `selfdev build target=X` silently builds something else.
+    #[test]
+    fn every_build_target_builds_its_own_package() {
+        let repo = repo_fixture(false);
+        let cases = [
+            (SelfDevBuildTarget::Tui, vec!["-p jcode "]),
+            (SelfDevBuildTarget::Desktop, vec!["-p jcode-desktop "]),
+            (SelfDevBuildTarget::Desktop2, vec!["-p jcode-desktop2 "]),
+            (
+                SelfDevBuildTarget::All,
+                vec!["-p jcode ", "-p jcode-desktop ", "-p jcode-desktop2 "],
+            ),
+        ];
+        for (target, expected) in cases {
+            let command = selfdev_build_command_for_target(repo.path(), target);
+            let text = format!("{} ", command.display);
+            for needle in &expected {
+                assert!(
+                    text.contains(needle),
+                    "{target:?} did not build `{needle}`: {}",
+                    command.display
+                );
+            }
+        }
+    }
+
+    /// A single-target build must not drag in the other binaries: building the
+    /// desktop app when only the TUI changed wastes minutes.
+    #[test]
+    fn single_targets_do_not_build_other_binaries() {
+        let repo = repo_fixture(false);
+        let tui = selfdev_build_command_for_target(repo.path(), SelfDevBuildTarget::Tui);
+        assert!(!tui.display.contains("jcode-desktop"));
+        let desktop2 = selfdev_build_command_for_target(repo.path(), SelfDevBuildTarget::Desktop2);
+        assert!(!desktop2.display.contains("-p jcode "));
+        assert!(!desktop2.display.contains("-p jcode-desktop "));
+    }
+
+    /// `auto` must route a change to the binary that contains it. Before
+    /// desktop2 was added here, editing it built the TUI instead.
+    #[test]
+    fn auto_routes_changed_paths_to_the_right_binary() {
+        let cases: Vec<(Vec<&str>, SelfDevBuildTarget)> = vec![
+            (vec![], SelfDevBuildTarget::Tui),
+            (vec!["src/main.rs"], SelfDevBuildTarget::Tui),
+            (vec!["crates/jcode-tui/src/lib.rs"], SelfDevBuildTarget::Tui),
+            (
+                vec!["crates/jcode-desktop/src/main.rs"],
+                SelfDevBuildTarget::Desktop,
+            ),
+            (
+                vec!["crates/jcode-desktop2/src/main.rs"],
+                SelfDevBuildTarget::Desktop2,
+            ),
+            (
+                vec!["crates/jcode-desktop2/src/editor.rs", "src/main.rs"],
+                SelfDevBuildTarget::All,
+            ),
+            (
+                vec![
+                    "crates/jcode-desktop/src/main.rs",
+                    "crates/jcode-desktop2/src/main.rs",
+                ],
+                SelfDevBuildTarget::All,
+            ),
+            // Workspace manifests can affect everything.
+            (vec!["Cargo.toml"], SelfDevBuildTarget::All),
+            (vec!["Cargo.lock"], SelfDevBuildTarget::All),
+        ];
+        for (paths, expected) in cases {
+            assert_eq!(
+                build_target_for_paths(paths.iter().copied()),
+                expected,
+                "paths {paths:?} routed to the wrong target"
+            );
+        }
+    }
+
+    #[test]
+    fn porcelain_lines_are_parsed_including_renames() {
+        assert_eq!(porcelain_path(" M src/main.rs"), "src/main.rs");
+        assert_eq!(
+            porcelain_path("?? crates/jcode-desktop2/src/new.rs"),
+            "crates/jcode-desktop2/src/new.rs"
+        );
+        assert_eq!(
+            porcelain_path("R  old/path.rs -> crates/jcode-desktop2/src/moved.rs"),
+            "crates/jcode-desktop2/src/moved.rs"
+        );
+    }
+
+    #[test]
+    fn build_targets_parse_from_their_names() {
+        for (name, expected) in [
+            ("tui", SelfDevBuildTarget::Tui),
+            ("desktop", SelfDevBuildTarget::Desktop),
+            ("jcode-desktop", SelfDevBuildTarget::Desktop),
+            ("desktop2", SelfDevBuildTarget::Desktop2),
+            ("jcode-desktop2", SelfDevBuildTarget::Desktop2),
+            ("all", SelfDevBuildTarget::All),
+            ("auto", SelfDevBuildTarget::Auto),
+        ] {
+            assert_eq!(
+                SelfDevBuildTarget::parse(Some(name)).expect("parse"),
+                expected,
+                "target name `{name}` parsed wrong"
+            );
+        }
+        assert!(SelfDevBuildTarget::parse(Some("nonsense")).is_err());
+    }
+
     #[test]
     fn is_jcode_repo_accepts_git_file_for_worktree() {
         let repo = repo_fixture(true);
         assert!(is_jcode_repo(repo.path()));
+    }
+
+    /// Build a release-style install dir: `jcode` wrapper script + payload.
+    fn release_install_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::TempDir::new().expect("temp install");
+        let wrapper = temp.path().join("jcode");
+        let payload = temp.path().join("jcode-linux-x86_64.bin");
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env sh\nexec ./jcode-linux-x86_64.bin \"$@\"\n",
+        )
+        .expect("wrapper");
+        std::fs::write(&payload, vec![0x7fu8; 64]).expect("payload");
+        (temp, wrapper, payload)
+    }
+
+    #[test]
+    fn resolve_binary_payload_maps_wrapper_to_payload() {
+        let (_temp, wrapper, payload) = release_install_fixture();
+        assert_eq!(
+            resolve_binary_payload(&wrapper),
+            std::fs::canonicalize(&payload).expect("canonical payload")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_payload_follows_channel_symlink_to_wrapper() {
+        // The real layout: builds/<channel>/jcode -> versions/<v>/jcode (wrapper).
+        let (temp, wrapper, payload) = release_install_fixture();
+        let channel_dir = temp.path().join("channel");
+        std::fs::create_dir_all(&channel_dir).expect("channel dir");
+        let link = channel_dir.join("jcode");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&wrapper, &link).expect("symlink");
+        #[cfg(not(unix))]
+        std::fs::copy(&wrapper, &link).map(|_| ()).expect("copy");
+        assert_eq!(
+            resolve_binary_payload(&link),
+            std::fs::canonicalize(&payload).expect("canonical payload")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_payload_keeps_real_binary() {
+        // A normal (non-wrapper) binary resolves to itself even with a sibling
+        // `.bin` file present: it is too large / not a script.
+        let temp = tempfile::TempDir::new().expect("temp install");
+        let binary = temp.path().join("jcode");
+        std::fs::write(&binary, vec![0x7fu8; 8192]).expect("binary");
+        std::fs::write(temp.path().join("jcode-linux-x86_64.bin"), [0u8; 8]).expect("bin");
+        assert_eq!(
+            resolve_binary_payload(&binary),
+            std::fs::canonicalize(&binary).expect("canonical binary")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_payload_keeps_small_script_without_payload() {
+        let temp = tempfile::TempDir::new().expect("temp install");
+        let script = temp.path().join("jcode");
+        std::fs::write(&script, "#!/usr/bin/env sh\nexec true\n").expect("script");
+        assert_eq!(
+            resolve_binary_payload(&script),
+            std::fs::canonicalize(&script).expect("canonical script")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_payload_refuses_ambiguous_payloads() {
+        let (temp, wrapper, _payload) = release_install_fixture();
+        std::fs::write(temp.path().join("jcode-macos-aarch64.bin"), [0u8; 8]).expect("second bin");
+        assert_eq!(
+            resolve_binary_payload(&wrapper),
+            std::fs::canonicalize(&wrapper).expect("canonical wrapper")
+        );
     }
 }

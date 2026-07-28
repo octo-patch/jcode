@@ -15,13 +15,16 @@ impl SessionPicker {
     }
 
     pub fn next(&mut self) {
-        // Onboarding: from the "Start a new session" row, Down moves into the
-        // session list (the first selectable session).
+        // Onboarding actions form a short list above the resumable sessions.
+        if self.onboarding_review_recent_project_highlighted() {
+            self.onboarding_action = Some(OnboardingAction::StartNewSession);
+            return;
+        }
         if self.onboarding_start_new_highlighted() {
-            self.onboarding_start_new_highlighted = false;
+            self.onboarding_action = None;
             if self.visible_sessions.is_empty() {
-                // Nothing to move to; stay on the start-new row.
-                self.onboarding_start_new_highlighted = true;
+                // Nothing below the actions, so stay on the last action.
+                self.onboarding_action = Some(OnboardingAction::StartNewSession);
             }
             return;
         }
@@ -37,15 +40,19 @@ impl SessionPicker {
     }
 
     pub fn previous(&mut self) {
-        // Onboarding: already on the start-new row -> nothing above it.
+        // Onboarding: already on the first action -> nothing above it.
+        if self.onboarding_review_recent_project_highlighted() {
+            return;
+        }
         if self.onboarding_start_new_highlighted() {
+            self.onboarding_action = Some(OnboardingAction::ReviewRecentProject);
             return;
         }
         if self.visible_sessions.is_empty() {
-            // Onboarding picker with no transcripts: Up lands on the start-new
-            // row (it's the only selectable thing).
+            // Onboarding picker with no transcripts: Up lands on the final
+            // onboarding action.
             if self.onboarding_banner.is_some() {
-                self.onboarding_start_new_highlighted = true;
+                self.onboarding_action = Some(OnboardingAction::StartNewSession);
             }
             return;
         }
@@ -56,17 +63,34 @@ impl SessionPicker {
             self.auto_scroll_preview = true;
         } else if self.onboarding_banner.is_some() {
             // At the top of the session list in onboarding mode -> move up to
-            // the "Start a new session" row.
-            self.onboarding_start_new_highlighted = true;
+            // the final onboarding action.
+            self.onboarding_action = Some(OnboardingAction::StartNewSession);
         }
     }
 
-    pub fn scroll_preview_down(&mut self, amount: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_add(amount);
+    /// Scroll the preview down by `amount` lines. The offset is clamped to the
+    /// real maximum by `render_preview` on the next frame; this returns whether
+    /// the offset changed relative to the last rendered maximum so the shared
+    /// mouse-scroll momentum can stop draining once the bottom is reached.
+    pub fn scroll_preview_down(&mut self, amount: u16) -> bool {
+        let before = self.scroll_offset;
+        let target = before.saturating_add(amount);
+        // Clamp to the last rendered maximum when we have one (mouse momentum and
+        // post-first-render scrolling); otherwise advance freely and let the next
+        // render clamp (keyboard paging before the first preview render).
+        self.scroll_offset = if self.preview_max_scroll > 0 {
+            target.min(self.preview_max_scroll)
+        } else {
+            target
+        };
+        self.scroll_offset != before
     }
 
-    pub fn scroll_preview_up(&mut self, amount: u16) {
+    /// Scroll the preview up by `amount` lines. Returns whether the offset moved.
+    pub fn scroll_preview_up(&mut self, amount: u16) -> bool {
+        let before = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
+        self.scroll_offset != before
     }
 
     fn point_in_rect(col: u16, row: u16, rect: Rect) -> bool {
@@ -76,23 +100,24 @@ impl SessionPicker {
             && row < rect.y.saturating_add(rect.height)
     }
 
+    /// Whether a screen coordinate falls inside the preview pane (used by the
+    /// host App to route wheel events into the shared scroll-momentum queue).
+    pub fn mouse_over_preview(&self, col: u16, row: u16) -> bool {
+        self.last_preview_area
+            .map(|r| Self::point_in_rect(col, row, r))
+            .unwrap_or(false)
+    }
+
     fn mouse_scroll_amount(&mut self) -> u16 {
-        let now = std::time::Instant::now();
-        let amount = if let Some(last) = self.last_mouse_scroll {
-            let gap = now.duration_since(last);
-            if gap.as_millis() < 50 { 1 } else { 3 }
-        } else {
-            3
-        };
-        self.last_mouse_scroll = Some(now);
-        amount
+        // One wheel notch advances the preview by the same number of lines as the
+        // main chat viewport's intent (`MOUSE_SCROLL_INTENT_LINES`), so the
+        // standalone picker feels consistent with the in-app overlay.
+        self.last_mouse_scroll = Some(std::time::Instant::now());
+        3
     }
 
     pub(super) fn handle_mouse_scroll(&mut self, col: u16, row: u16, kind: MouseEventKind) {
-        let over_preview = self
-            .last_preview_area
-            .map(|r| Self::point_in_rect(col, row, r))
-            .unwrap_or(false);
+        let over_preview = self.mouse_over_preview(col, row);
         let over_list = self
             .last_list_area
             .map(|r| Self::point_in_rect(col, row, r))
@@ -101,8 +126,12 @@ impl SessionPicker {
         if over_preview {
             let amt = self.mouse_scroll_amount();
             match kind {
-                MouseEventKind::ScrollUp => self.scroll_preview_up(amt),
-                MouseEventKind::ScrollDown => self.scroll_preview_down(amt),
+                MouseEventKind::ScrollUp => {
+                    self.scroll_preview_up(amt);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_preview_down(amt);
+                }
                 _ => {}
             }
             return;
@@ -120,14 +149,18 @@ impl SessionPicker {
     fn focus_previous_step(&mut self) {
         match self.focus {
             PaneFocus::Sessions => self.previous(),
-            PaneFocus::Preview => self.scroll_preview_up(PREVIEW_SCROLL_STEP),
+            PaneFocus::Preview => {
+                self.scroll_preview_up(PREVIEW_SCROLL_STEP);
+            }
         }
     }
 
     fn focus_next_step(&mut self) {
         match self.focus {
             PaneFocus::Sessions => self.next(),
-            PaneFocus::Preview => self.scroll_preview_down(PREVIEW_SCROLL_STEP),
+            PaneFocus::Preview => {
+                self.scroll_preview_down(PREVIEW_SCROLL_STEP);
+            }
         }
     }
 
@@ -138,7 +171,9 @@ impl SessionPicker {
                     self.previous();
                 }
             }
-            PaneFocus::Preview => self.scroll_preview_up(PREVIEW_PAGE_SCROLL),
+            PaneFocus::Preview => {
+                self.scroll_preview_up(PREVIEW_PAGE_SCROLL);
+            }
         }
     }
 
@@ -149,7 +184,9 @@ impl SessionPicker {
                     self.next();
                 }
             }
-            PaneFocus::Preview => self.scroll_preview_down(PREVIEW_PAGE_SCROLL),
+            PaneFocus::Preview => {
+                self.scroll_preview_down(PREVIEW_PAGE_SCROLL);
+            }
         }
     }
 
@@ -210,5 +247,44 @@ impl SessionPicker {
             }
             _ => {}
         }
+    }
+
+    /// Apply a single line of preview scroll in `direction` (-1 up, +1 down) and
+    /// report whether the offset actually moved. Used by the host App's shared
+    /// mouse-scroll momentum so the picker preview scrolls with the same smooth
+    /// easing as the main chat viewport.
+    pub fn apply_preview_scroll_step(&mut self, direction: i16) -> bool {
+        if direction < 0 {
+            self.scroll_preview_up(1)
+        } else if direction > 0 {
+            self.scroll_preview_down(1)
+        } else {
+            false
+        }
+    }
+
+    /// Whether the list pane (not the preview) is the wheel target for a screen
+    /// coordinate. The host App steps the selection directly for the list since
+    /// it is discrete, and routes preview wheels through scroll momentum.
+    pub fn mouse_over_list(&self, col: u16, row: u16) -> bool {
+        self.last_list_area
+            .map(|r| Self::point_in_rect(col, row, r))
+            .unwrap_or(false)
+    }
+
+    /// Step the session selection for a list-pane wheel event.
+    pub fn step_list_selection(&mut self, direction: i16) {
+        if direction < 0 {
+            self.previous();
+        } else if direction > 0 {
+            self.next();
+        }
+    }
+
+    /// Current preview scroll offset, exposed for tests that assert scroll
+    /// movement through the host App's shared momentum.
+    #[cfg(test)]
+    pub fn preview_scroll_offset_for_test(&self) -> u16 {
+        self.scroll_offset
     }
 }

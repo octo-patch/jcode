@@ -24,11 +24,15 @@ mod server_event_handlers;
 mod server_events;
 mod session_persistence;
 mod swarm_plan_core;
+mod swarm_status_core;
 mod workspace;
 
 #[cfg(test)]
 pub(super) use key_handling::reload_stale_remote_server_before_update;
-use queue_recovery::{recover_local_interleave_to_queue, recover_stranded_soft_interrupts};
+use queue_recovery::{
+    recover_local_interleave_to_queue, recover_stranded_soft_interrupts,
+    recover_undelivered_queued_continuation,
+};
 // Re-export for sibling modules and tests that access reconnect state and helpers
 // through `super::remote::*` without reaching into private submodules directly.
 #[allow(unused_imports)]
@@ -50,7 +54,8 @@ use workspace::{handle_workspace_command, handle_workspace_navigation_key};
 pub(super) use input_dispatch::{
     apply_remote_transcript_event, apply_transcript_event, begin_remote_send,
     begin_remote_split_launch, finish_remote_split_launch, history_matches_pending_startup_prompt,
-    route_prepared_input_to_new_remote_session, submit_prepared_remote_input,
+    route_prepared_input_to_new_remote_session, stage_turn_for_remote_tick_loop,
+    submit_prepared_remote_input, submit_remote_slash_input,
 };
 pub(super) use key_handling::{
     handle_remote_char_input, handle_remote_key, handle_remote_key_event, send_interleave_now,
@@ -75,20 +80,43 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             .is_some_and(|state| state.kind == crate::tui::PickerKind::Model),
     });
     let mut needs_redraw = crate::tui::periodic_redraw_required(app);
+    needs_redraw |= app.flush_pending_resize_redraw();
     app.maybe_capture_runtime_memory_heartbeat();
+    app.maybe_release_idle_heap();
+    // Surface the cold-cache transcript warning the moment the TTL expires
+    // while idle, not only when the next request starts.
+    needs_redraw |= app.maybe_push_idle_cold_cache_warning();
+    needs_redraw |= app.progress_copy_selection_edge_autoscroll();
     app.progress_mouse_scroll_animation();
     needs_redraw |= app.update_chat_overscroll();
     needs_redraw |= app.update_pinned_images_auto_hide();
+    // Dissolve stale (off-screen) reasoning traces with zero visible motion.
+    needs_redraw |= app.gc_offscreen_reasoning_traces();
     needs_redraw |= dispatch_compacted_history_load(app, remote).await;
-    if let Some(chunk) = app.stream_buffer.flush() {
-        app.append_streaming_text(&chunk);
+    // Adopt the resolved scroll position once a frame containing newly loaded
+    // older history has rendered, so manual scrolling resumes seamlessly.
+    needs_redraw |= app.reconcile_history_anchor();
+    // Reveal buffered streaming text at the smooth paced rate on each tick, the
+    // same as the local turn loop. When Done arrived with a backlog, leave one
+    // rendered live frame after the final reveal before committing the turn.
+    let stream_backlog_was_empty = app.stream_buffer.is_empty();
+    let ops = app.stream_buffer.flush_smooth_frame();
+    if app.apply_stream_ops(ops) {
         needs_redraw = true;
+    }
+    if stream_backlog_was_empty
+        && app.stream_buffer.is_empty()
+        && let Some(id) = app.deferred_stream_done_id.take()
+    {
+        needs_redraw |= app.handle_server_event(crate::protocol::ServerEvent::Done { id }, remote);
     }
 
     needs_redraw |= app.refresh_todos_view_if_needed();
+    needs_redraw |= app.refresh_todo_card_if_needed();
     needs_redraw |= app.refresh_side_panel_linked_content_if_due();
     needs_redraw |= app.poll_model_picker_load();
     needs_redraw |= app.poll_session_picker_load();
+    needs_redraw |= app.poll_session_picker_presence();
     needs_redraw |= app.onboarding_tick();
 
     let _ = check_debug_command(app, remote).await;
@@ -120,7 +148,7 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             }
         }
 
-        if let Some(target_session) = crate::tui::workspace_client::take_pending_resume_session() {
+        if let Some(target_session) = app.workspace_client.take_pending_resume_session() {
             match remote.resume_session(&target_session).await {
                 Ok(()) => {
                     let label = crate::id::extract_session_name(&target_session)
@@ -213,11 +241,32 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
         for msg in &messages {
             app.push_display_message(DisplayMessage::user(msg.clone()));
         }
-        if begin_remote_send(app, remote, combined, vec![], true, reminder, auto_retry, 0)
-            .await
-            .is_err()
+        if begin_remote_send(
+            app,
+            remote,
+            combined.clone(),
+            vec![],
+            true,
+            reminder.clone(),
+            auto_retry,
+            0,
+        )
+        .await
+        .is_err()
         {
-            crate::logging::error("Failed to send queued continuation message");
+            // The send never reached the server (e.g. the socket died under a
+            // reload handoff). Dropping the dequeued messages here would lose
+            // them permanently (issue #391); put them back so the queue
+            // re-dispatches after reconnect.
+            crate::logging::error(
+                "Failed to send queued continuation message; restoring it to the queue",
+            );
+            if let Some(reminder) = reminder {
+                app.hidden_queued_system_messages.insert(0, reminder);
+            }
+            if !combined.is_empty() {
+                app.queued_messages.insert(0, combined);
+            }
         }
         needs_redraw = true;
     }
@@ -235,23 +284,77 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             String::new(),
             vec![],
             true,
-            Some(combined),
+            Some(combined.clone()),
             true,
             0,
         )
         .await
         .is_err()
         {
-            crate::logging::error("Failed to send hidden continuation reminder");
+            crate::logging::error(
+                "Failed to send hidden continuation reminder; restoring it to the queue",
+            );
+            app.hidden_queued_system_messages.insert(0, combined);
         }
         needs_redraw = true;
     }
 
     detect_and_cancel_stall(app, remote).await;
+    needs_redraw |= recover_stuck_remote_history(app, remote).await;
+    needs_redraw |= detect_starved_queued_followup(app);
     needs_redraw
 }
 
+/// Forward the reasoning-effort variant staged by a model-picker selection
+/// (e.g. "gpt-5.5 (high)") to the server right after the model-switch request.
+/// In remote mode the picker cannot apply effort to `app.provider` (a local
+/// stand-in), so skipping this leaves the server on its configured default
+/// effort - typically low - silently downgrading the request (issue #427).
+async fn forward_pending_reasoning_effort(app: &mut App, remote: &mut RemoteConnection) {
+    let Some(effort) = app.pending_reasoning_effort.take() else {
+        return;
+    };
+    match remote.set_reasoning_effort(&effort).await {
+        Ok(()) => {
+            // Optimistically track the requested effort so the widget/header
+            // reflect the picker choice; ReasoningEffortChanged confirms it.
+            app.remote_reasoning_effort = Some(effort);
+        }
+        Err(error) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to request reasoning effort '{}': {}",
+                effort, error
+            )));
+            app.set_status_notice("Effort switch failed");
+        }
+    }
+}
+
 pub(super) async fn handle_terminal_event(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    remote: &mut RemoteConnection,
+    event: Option<std::result::Result<Event, std::io::Error>>,
+) -> Result<bool> {
+    let mut needs_redraw = apply_terminal_event(app, terminal, remote, event).await?;
+    // Coalesce bursts of already-buffered input (fast typing, key repeat,
+    // scroll wheels) into a single frame instead of paying one full render per
+    // event. Without this, typing faster than the frame rate queues events and
+    // each one costs handle + full draw serially, which reads as input-line
+    // lag. Mirrors the identical drain in `local::handle_terminal_event`.
+    const MAX_DRAINED_EVENTS_PER_WAKE: usize = 32;
+    for _ in 0..MAX_DRAINED_EVENTS_PER_WAKE {
+        if !crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            break;
+        }
+        if let Ok(event) = crossterm::event::read() {
+            needs_redraw |= apply_terminal_event(app, terminal, remote, Some(Ok(event))).await?;
+        }
+    }
+    Ok(needs_redraw)
+}
+
+async fn apply_terminal_event(
     app: &mut App,
     _terminal: &mut DefaultTerminal,
     remote: &mut RemoteConnection,
@@ -269,7 +372,12 @@ pub(super) async fn handle_terminal_event(
     match event {
         Some(Ok(Event::FocusGained)) => {
             input_attribution.event = Some("focus_gained".to_string());
+            needs_redraw |= app.set_client_focused(true);
             app.note_client_focus(true);
+        }
+        Some(Ok(Event::FocusLost)) => {
+            input_attribution.event = Some("focus_lost".to_string());
+            app.set_client_focused(false);
         }
         Some(Ok(Event::Key(key))) => {
             input_attribution.event = Some(format!("key:{:?}:{:?}", key.code, key.kind));
@@ -283,8 +391,13 @@ pub(super) async fn handle_terminal_event(
                     match remote.set_route_selection(selection).await {
                         Ok(_) => {
                             app.remote_model_switch_in_flight = true;
+                            forward_pending_reasoning_effort(app, remote).await;
                         }
                         Err(error) => {
+                            app.pending_reasoning_effort = None;
+                            // A fallback-offer resend must not fire without its
+                            // route switch; drop it with the failed request.
+                            app.pending_fallback_resend = None;
                             app.push_display_message(DisplayMessage::error(format!(
                                 "Failed to request model switch: {}",
                                 error
@@ -296,8 +409,10 @@ pub(super) async fn handle_terminal_event(
                     match remote.set_model(&spec).await {
                         Ok(_) => {
                             app.remote_model_switch_in_flight = true;
+                            forward_pending_reasoning_effort(app, remote).await;
                         }
                         Err(error) => {
+                            app.pending_reasoning_effort = None;
                             app.push_display_message(DisplayMessage::error(format!(
                                 "Failed to request model switch: {}",
                                 error
@@ -377,10 +492,12 @@ pub(super) async fn handle_terminal_event(
         Some(Ok(Event::Mouse(mouse))) => {
             input_attribution.event = Some(format!("mouse:{:?}", mouse.kind));
             input_attribution.scroll_delta = mouse_scroll_delta(&mouse);
-            app.note_client_interaction();
-            handle_mouse_event(app, mouse);
-            needs_redraw = true;
-            needs_redraw |= dispatch_compacted_history_load(app, remote).await;
+            if !matches!(mouse.kind, MouseEventKind::Moved) {
+                app.note_client_interaction();
+                handle_mouse_event(app, mouse);
+                needs_redraw = true;
+                needs_redraw |= dispatch_compacted_history_load(app, remote).await;
+            }
         }
         Some(Ok(Event::Resize(_, _))) => {
             input_attribution.event = Some("resize".to_string());
@@ -466,9 +583,18 @@ pub(super) async fn handle_bus_event(
             let success = login.success && login.provider != "copilot_code";
             let provider_hint = auth_provider_hint_for_login_provider(&login.provider);
             let auth = auth_changed_event_for_login_provider(&login.provider);
+            let prefer_strongest = success && app.onboarding_should_prefer_strongest_model();
             app.handle_login_completed(login);
-            if success {
-                remote.notify_auth_changed_detached_event(provider_hint, auth);
+            if success
+                && let Err(error) = remote
+                    .notify_auth_changed_event(provider_hint, auth, prefer_strongest)
+                    .await
+            {
+                crate::logging::warn(&format!(
+                    "Failed to notify server about refreshed auth: {error}"
+                ));
+                app.finish_auth_catalog_refresh();
+                app.set_status_notice("Model setup will retry after reconnect");
             }
             true
         }
@@ -547,12 +673,14 @@ fn auth_provider_hint_for_login_provider(provider: &str) -> Option<&'static str>
 }
 
 fn auth_changed_event_for_login_provider(provider: &str) -> Option<crate::protocol::AuthChanged> {
+    use crate::provider_catalog::LoginProviderTarget;
     let provider_id = auth_provider_hint_for_login_provider(provider)?;
     let mut auth = crate::protocol::AuthChanged::new(provider_id);
     // These fields are informational; the server routes off `provider` and the
     // `expected_*` hints. Reflect the descriptor's auth kind so OAuth logins are
     // not recorded as API-key pastes.
-    let api_key_login = crate::provider_catalog::resolve_login_provider_loose(provider)
+    let descriptor = crate::provider_catalog::resolve_login_provider_loose(provider);
+    let api_key_login = descriptor
         .map(|descriptor| {
             use crate::provider_catalog::LoginProviderAuthKind;
             matches!(
@@ -565,11 +693,18 @@ fn auth_changed_event_for_login_provider(provider: &str) -> Option<crate::protoc
         auth.auth_method = Some(crate::protocol::AuthMethod::RemoteTuiPasteApiKey);
         auth.credential_source = Some(crate::protocol::AuthCredentialSource::ApiKeyFile);
     }
+    // Only logins whose descriptor actually targets the OpenAI-compatible
+    // runtime claim its namespace. Do not key this off
+    // `openai_compatible_profile_by_id`: native providers (`anthropic-api`,
+    // `openai-api`) alias doctor-probe compat profiles with the same id, but
+    // their auth activation deliberately routes through the native runtime.
     if provider_id == "azure-openai" {
         auth.expected_runtime = Some(crate::protocol::RuntimeProviderKey::new("azure-openai"));
         auth.expected_catalog_namespace =
             Some(crate::protocol::CatalogNamespace::new("azure-openai"));
-    } else if crate::provider_catalog::openai_compatible_profile_by_id(provider_id).is_some() {
+    } else if descriptor
+        .is_some_and(|d| matches!(d.target, LoginProviderTarget::OpenAiCompatible(_)))
+    {
         auth.expected_runtime = Some(crate::protocol::RuntimeProviderKey::new(
             "openai-compatible",
         ));
@@ -605,7 +740,11 @@ fn handle_terminal_event_while_disconnected(
 
     match event {
         Some(Ok(Event::FocusGained)) => {
+            needs_redraw |= app.set_client_focused(true);
             app.note_client_focus(true);
+        }
+        Some(Ok(Event::FocusLost)) => {
+            app.set_client_focused(false);
         }
         Some(Ok(Event::Key(key))) => {
             app.note_client_interaction();
@@ -621,12 +760,25 @@ fn handle_terminal_event_while_disconnected(
             needs_redraw = true;
         }
         Some(Ok(Event::Mouse(mouse))) => {
-            app.note_client_interaction();
-            handle_mouse_event(app, mouse);
-            needs_redraw = true;
+            if !matches!(mouse.kind, MouseEventKind::Moved) {
+                app.note_client_interaction();
+                handle_mouse_event(app, mouse);
+                needs_redraw = true;
+            }
         }
         Some(Ok(Event::Resize(_, _))) => {
             needs_redraw = app.should_redraw_after_resize();
+        }
+        None => {
+            // Input EOF: if the controlling terminal is gone this client is an
+            // orphan (window died without a deliverable SIGHUP). Quit instead
+            // of reconnect-looping forever with no way to ever receive input.
+            if super::terminal_liveness::terminal_abandoned() {
+                crate::logging::warn(
+                    "Terminal input closed and controlling terminal is gone while disconnected; exiting orphaned client",
+                );
+                app.should_quit = true;
+            }
         }
         _ => {}
     }
@@ -640,7 +792,7 @@ fn handle_terminal_event_while_disconnected(
 
 pub(super) async fn handle_remote_event<B: Backend>(
     app: &mut App,
-    _terminal: &mut Terminal<B>,
+    terminal: &mut Terminal<B>,
     remote: &mut RemoteConnection,
     state: &mut RemoteRunState,
     event: RemoteRead,
@@ -676,6 +828,19 @@ pub(super) async fn handle_remote_event<B: Backend>(
             Ok((RemoteEventOutcome::Continue, needs_redraw))
         }
         RemoteRead::Event(ServerEvent::ClientDebugRequest { id, command }) => {
+            // Frame-oriented debug commands used to enable visual debugging and
+            // immediately read the frame buffer. On the first request the buffer
+            // is still empty because no draw has happened since enabling capture.
+            // Render once before producing the response so callers always receive
+            // the current TUI state rather than "no frames captured".
+            if debug_command_needs_current_frame(&command) {
+                crate::tui::visual_debug::enable();
+                if let Err(error) = terminal.draw(|frame| crate::tui::ui::draw(frame, app)) {
+                    let output = format!("ERR: failed to capture current frame: {error}");
+                    let _ = remote.send_client_debug_response(id, output).await;
+                    return Ok((RemoteEventOutcome::Continue, false));
+                }
+            }
             let output = handle_debug_command(app, &command, remote).await;
             let _ = remote.send_client_debug_response(id, output).await;
             process_remote_followups(app, remote).await;
@@ -702,6 +867,25 @@ pub(super) async fn handle_remote_event<B: Backend>(
     }
 }
 
+pub(super) fn debug_command_needs_current_frame(command: &str) -> bool {
+    matches!(
+        command.trim(),
+        "frame"
+            | "frame-normalized"
+            | "screen"
+            | "screen-json"
+            | "screen-json-normalized"
+            | "layout"
+            | "margins"
+            | "widgets"
+            | "info-widgets"
+            | "render-stats"
+            | "render-order"
+            | "anomalies"
+            | "theme"
+    )
+}
+
 pub(super) fn handle_disconnect(
     app: &mut App,
     state: &mut RemoteRunState,
@@ -718,30 +902,43 @@ pub(super) fn handle_disconnect(
         "handle_disconnect: session={:?}, remote_session_id={:?}, reason={:?}, detail={}",
         app.resume_session_id, app.remote_session_id, reason, detail
     ));
+    // A disconnect can drop the final auth catalog completion event. Keep any
+    // queued prompt for reconnect, but release the transient model-setup gate so
+    // it cannot remain blocked forever waiting for an event that was lost.
+    app.finish_auth_catalog_refresh();
     state.last_disconnect_reason = Some(detail.clone());
 
     let scheduled_retry =
         app.schedule_pending_remote_retry(&format!("⚡ Connection lost ({detail})."));
     if !scheduled_retry {
-        app.clear_pending_remote_retry();
+        // A queued follow-up that was already dispatched (dequeued into an
+        // in-flight send) has no auto-retry path. Dropping it here would lose
+        // the user's queued message when a reload/disconnect races the
+        // turn-end dispatch (issue #391); put it back on the queue instead so
+        // it is re-sent once the turn is proven idle after reconnect.
+        if !recover_undelivered_queued_continuation(app, "disconnect") {
+            app.clear_pending_remote_retry();
+        }
     }
     let recovered_local = recover_local_interleave_to_queue(app, "disconnect");
     app.current_message_id = None;
     app.last_stream_activity = None;
     app.remote_resume_activity = None;
-    if let Some(chunk) = app.stream_buffer.flush() {
-        app.append_streaming_text(&chunk);
-    }
-    if !app.streaming_text.is_empty() {
+    let ops = app.stream_buffer.flush();
+    app.apply_stream_ops(ops);
+    if !app.streaming.streaming_text.is_empty() {
         let content = app.take_streaming_text();
-        app.push_display_message(DisplayMessage {
-            role: "assistant".to_string(),
-            content,
-            tool_calls: vec![],
-            duration_secs: None,
-            title: None,
-            tool_data: None,
-        });
+        let content = app.collapse_reasoning_for_commit(content);
+        if !content.trim().is_empty() {
+            app.push_display_message(DisplayMessage {
+                role: "assistant".to_string(),
+                content,
+                tool_calls: vec![],
+                duration_secs: None,
+                title: None,
+                tool_data: None,
+            });
+        }
     }
     app.clear_streaming_render_state();
     app.streaming_tool_calls.clear();
@@ -775,6 +972,131 @@ pub(super) fn handle_disconnect(
     state.reconnect_attempts = 1;
 }
 
+/// First wait before the watchdog re-requests history. Generous enough that a
+/// normal (slow) bootstrap completes on its own, short enough that a genuinely
+/// stuck session recovers in seconds instead of requiring a manual `/restart`.
+const REMOTE_HISTORY_RECOVERY_FIRST_DELAY: Duration = Duration::from_secs(6);
+/// Spacing between subsequent re-requests after the first one.
+const REMOTE_HISTORY_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// How many times we re-request history before giving up and telling the user
+/// to `/restart`. Bounded so a server that genuinely never answers does not
+/// spin forever.
+const REMOTE_HISTORY_RECOVERY_MAX_ATTEMPTS: u32 = 4;
+
+/// Watchdog for the "stuck on loading session…" bug.
+///
+/// Every remote prompt path is gated behind `RemoteConnection::has_loaded_history()`:
+/// `submit_prepared_remote_input` parks prompts in `pending_prompt_before_history`,
+/// and `process_remote_followups` returns early at the `!has_loaded_history()`
+/// gate. That gate only clears when the server delivers a `History` event. If
+/// that event never arrives after a (re)connect or reload handoff (dropped
+/// event, momentarily busy agent, or a path that returned without history), the
+/// client is stuck forever showing "loading session…" and the only escape is a
+/// manual `/restart`.
+///
+/// This watchdog detects a connection that has been waiting too long for the
+/// bootstrap history and re-requests it a bounded number of times. If history
+/// still never loads, it surfaces an actionable message instead of leaving the
+/// user staring at a frozen header.
+async fn recover_stuck_remote_history(app: &mut App, remote: &mut RemoteConnection) -> bool {
+    // Once history has loaded the watchdog has nothing to do; make sure its
+    // budget is cleared so a later rewind-triggered reload starts fresh.
+    if remote.has_loaded_history() {
+        if app.remote_history_wait_started.is_some() {
+            app.clear_remote_history_wait();
+        }
+        return false;
+    }
+
+    // A pending server reload intentionally leaves history unloaded until the
+    // reload fires (see `process_remote_followups`); don't fight that path.
+    if app.pending_server_reload {
+        return false;
+    }
+
+    // Only meaningful for an established remote client connection. During the
+    // initial connect/reconnect handshake the run loop drives history loading
+    // directly, and there is no point re-requesting before we've attached.
+    if !app.is_remote {
+        return false;
+    }
+
+    let now = Instant::now();
+    let waited = match app.remote_history_wait_started {
+        Some(started) => now.saturating_duration_since(started),
+        None => {
+            // Begin tracking from the first tick that observes unloaded history
+            // on a live connection.
+            app.remote_history_wait_started = Some(now);
+            return false;
+        }
+    };
+
+    if waited < REMOTE_HISTORY_RECOVERY_FIRST_DELAY {
+        return false;
+    }
+
+    // A large newline-delimited History event may take longer than the
+    // watchdog delay to arrive. Once any part of a frame is buffered, the
+    // response was not dropped: it is actively being assembled by the reader.
+    // Re-requesting here queues another complete (potentially tens-of-MB)
+    // History payload behind the first and can keep the connection saturated
+    // for minutes. Let the in-flight frame finish instead.
+    if remote.has_buffered_inbound_frame() {
+        return false;
+    }
+
+    if app.remote_history_recovery_attempts >= REMOTE_HISTORY_RECOVERY_MAX_ATTEMPTS {
+        // We've exhausted re-requests. Surface a one-time actionable hint so the
+        // user isn't stuck on a silent "loading session…" forever.
+        if app.remote_history_recovery_last_attempt.is_some() {
+            crate::logging::warn(
+                "Remote history never loaded after repeated re-requests; session is stuck on \
+                 'loading session…'. Advising /restart.",
+            );
+            app.push_display_message(DisplayMessage::system(
+                "⚠ Still loading session… the server hasn't sent the conversation history. \
+                 This usually clears on its own; if it persists, run /restart to reconnect."
+                    .to_string(),
+            ));
+            app.set_status_notice("Session history not loading - try /restart");
+            // Clear last_attempt so we don't repeat the message every tick, but
+            // keep attempts at max so we don't re-enter the retry path.
+            app.remote_history_recovery_last_attempt = None;
+            return true;
+        }
+        return false;
+    }
+
+    // Rate-limit re-requests so we don't flood the server.
+    if let Some(last) = app.remote_history_recovery_last_attempt
+        && now.saturating_duration_since(last) < REMOTE_HISTORY_RECOVERY_RETRY_INTERVAL
+    {
+        return false;
+    }
+
+    app.remote_history_recovery_attempts += 1;
+    app.remote_history_recovery_last_attempt = Some(now);
+    crate::logging::warn(&format!(
+        "Remote history still not loaded after {}s; re-requesting session history (attempt {}/{}, session={:?})",
+        waited.as_secs(),
+        app.remote_history_recovery_attempts,
+        REMOTE_HISTORY_RECOVERY_MAX_ATTEMPTS,
+        app.remote_session_id,
+    ));
+    match remote.request_history().await {
+        Ok(_) => {
+            app.set_status_notice("Loading session… re-requesting history");
+        }
+        Err(err) => {
+            crate::logging::error(&format!(
+                "History recovery re-request failed: {err}; will retry on next watchdog tick"
+            ));
+        }
+    }
+    true
+}
+
 /// Record (once per distinct reason) why the restored startup auto-submit is
 /// being deferred. This makes "headed-spawn prompt seen but never sent" cases
 /// debuggable without spamming a log line on every event-loop tick.
@@ -795,7 +1117,65 @@ fn note_startup_submit_deferred(app: &mut App, reason: &'static str) {
     ));
 }
 
+/// Fire a pending server reload (newer binary on disk, or a server/client
+/// runtime-identity mismatch that the History handler intentionally deferred).
+///
+/// Extracted so it can run BEFORE the `has_loaded_history` gate in
+/// `process_remote_followups`: the runtime-identity defer path never marks
+/// history as loaded, so the reload must be allowed to fire while history is
+/// still pending, otherwise the connection stalls indefinitely on
+/// "Loading session...".
+async fn dispatch_pending_server_reload(app: &mut App, remote: &mut RemoteConnection) {
+    app.pending_server_reload = false;
+    if app.auto_server_reload {
+        // Defense-in-depth for issue #277: a correct reload only needs to
+        // happen once. If we keep being told a newer binary is available
+        // after several auto-reloads, treat it as a false-positive loop and
+        // stop hammering the server (which would otherwise flicker the UI).
+        const MAX_AUTO_SERVER_RELOADS: u32 = 3;
+        if app.server_auto_reload_attempts >= MAX_AUTO_SERVER_RELOADS {
+            crate::logging::warn(&format!(
+                "Suppressing server auto-reload after {} attempts; server keeps reporting an update (possible reload loop, issue #277)",
+                app.server_auto_reload_attempts
+            ));
+            app.push_display_message(DisplayMessage::system(
+                "ℹ Server keeps reporting a newer binary after repeated reloads; auto-reload paused to avoid a loop. Use `/reload` manually if needed.".to_string(),
+            ));
+            app.set_status_notice("Server auto-reload paused (possible loop)");
+        } else {
+            app.server_auto_reload_attempts += 1;
+            app.append_reload_message("Reloading server with newer binary...");
+            if let Err(err) = remote.reload().await {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Failed to auto-reload server: {}. Use `/reload` to retry.",
+                    err
+                )));
+                app.set_status_notice("Server update available - auto reload failed");
+            }
+        }
+    } else {
+        app.push_display_message(DisplayMessage::system(
+            "ℹ Newer server binary detected. Auto-reload is disabled by `display.auto_server_reload = false`. Use `/reload` manually when you're ready.".to_string(),
+        ));
+        app.set_status_notice("Server update available - manual /reload recommended");
+    }
+}
+
 pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteConnection) {
+    // A pending *server* reload must be dispatched even when the bootstrap
+    // History payload was intentionally deferred. The runtime-identity /
+    // stale-binary guard in the History handler sets `pending_server_reload =
+    // true` and returns WITHOUT marking history as loaded, by design: we want to
+    // reload the server before applying any session state. If the
+    // `has_loaded_history` gate below ran first, the reload would never fire,
+    // history would stay unloaded forever, and every typed prompt would be stuck
+    // behind "Loading session..." until the user restarted (server/client binary
+    // mismatch reload-handoff stall).
+    if app.pending_server_reload && !app.is_processing {
+        dispatch_pending_server_reload(app, remote).await;
+        return;
+    }
+
     if !remote.has_loaded_history() {
         note_startup_submit_deferred(app, "remote history not loaded yet");
         return;
@@ -810,6 +1190,45 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
 
     if !app.remote_model_switch_in_flight
         && !app.is_processing
+        && let Some(payload) = app.pending_fallback_resend.take()
+    {
+        // A fallback offer was accepted and the server confirmed the route
+        // switch: resend the failed turn's payload on the new route. The
+        // original user message is already in the transcript from the failed
+        // attempt, so do not echo it again; just clear the input box if the
+        // error path restored the prompt there.
+        if let Some(raw_input) = payload.raw_input.as_deref()
+            && app.input == raw_input
+        {
+            app.input.clear();
+            app.cursor_pos = 0;
+        }
+        app.last_submitted_input = payload.raw_input.clone();
+        crate::logging::info("Resending failed turn after accepted fallback route switch");
+        if let Err(error) = begin_remote_send(
+            app,
+            remote,
+            payload.content,
+            payload.images,
+            payload.is_system,
+            payload.system_reminder,
+            payload.auto_retry,
+            0,
+        )
+        .await
+        {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to resend after fallback switch: {}",
+                error
+            )));
+            app.set_status_notice("Fallback resend failed");
+        }
+        return;
+    }
+
+    if !app.remote_model_switch_in_flight
+        && !app.auth_catalog_refresh_pending
+        && !app.is_processing
         && let Some(prepared) = app.pending_prompt_after_model_switch.take()
     {
         if let Err(error) = submit_prepared_remote_input(app, remote, prepared).await {
@@ -818,6 +1237,27 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                 error
             )));
             app.set_status_notice("Queued prompt failed");
+        }
+        return;
+    }
+
+    // Now that history is loaded (guaranteed by the gate above), dispatch any
+    // prompt that the user submitted during the pre-history window. Submitting
+    // it earlier would have been clobbered by the bootstrap History payload's
+    // `session_changed` clear; deferring here fixes the intermittent
+    // "first prompt vanishes / weird render" bug.
+    if !app.is_processing
+        && let Some(prepared) = app.pending_prompt_before_history.take()
+    {
+        crate::logging::info(
+            "Dispatching prompt that was held until remote history finished loading",
+        );
+        if let Err(error) = submit_prepared_remote_input(app, remote, prepared).await {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to submit prompt after session load: {}",
+                error
+            )));
+            app.set_status_notice("Prompt failed");
         }
         return;
     }
@@ -874,42 +1314,6 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
         return;
     }
 
-    if app.pending_server_reload && !app.is_processing {
-        app.pending_server_reload = false;
-        if app.auto_server_reload {
-            // Defense-in-depth for issue #277: a correct reload only needs to
-            // happen once. If we keep being told a newer binary is available
-            // after several auto-reloads, treat it as a false-positive loop and
-            // stop hammering the server (which would otherwise flicker the UI).
-            const MAX_AUTO_SERVER_RELOADS: u32 = 3;
-            if app.server_auto_reload_attempts >= MAX_AUTO_SERVER_RELOADS {
-                crate::logging::warn(&format!(
-                    "Suppressing server auto-reload after {} attempts; server keeps reporting an update (possible reload loop, issue #277)",
-                    app.server_auto_reload_attempts
-                ));
-                app.push_display_message(DisplayMessage::system(
-                    "ℹ Server keeps reporting a newer binary after repeated reloads; auto-reload paused to avoid a loop. Use `/reload` manually if needed.".to_string(),
-                ));
-                app.set_status_notice("Server auto-reload paused (possible loop)");
-            } else {
-                app.server_auto_reload_attempts += 1;
-                app.append_reload_message("Reloading server with newer binary...");
-                if let Err(err) = remote.reload().await {
-                    app.push_display_message(DisplayMessage::error(format!(
-                        "Failed to auto-reload server: {}. Use `/reload` to retry.",
-                        err
-                    )));
-                    app.set_status_notice("Server update available - auto reload failed");
-                }
-            }
-        } else {
-            app.push_display_message(DisplayMessage::system(
-                "ℹ Newer server binary detected. Auto-reload is disabled by `display.auto_server_reload = false`. Use `/reload` manually when you're ready.".to_string(),
-            ));
-            app.set_status_notice("Server update available - manual /reload recommended");
-        }
-    }
-
     if app.pending_split_request && !app.is_processing {
         app.pending_split_request = false;
         let flow_label = app
@@ -962,8 +1366,12 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
         if let Some(interleave_msg) = app.interleave_message.take()
             && !interleave_msg.trim().is_empty()
         {
+            let interleave_images = std::mem::take(&mut app.interleave_images);
             let msg_clone = interleave_msg.clone();
-            match remote.soft_interrupt(interleave_msg, false).await {
+            match remote
+                .soft_interrupt(interleave_msg, interleave_images, false)
+                .await
+            {
                 Err(e) => {
                     app.push_display_message(DisplayMessage::error(format!(
                         "Failed to queue soft interrupt: {}",
@@ -979,6 +1387,7 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
     }
 
     if let Some(interleave_msg) = app.interleave_message.take() {
+        let interleave_images = std::mem::take(&mut app.interleave_images);
         if !interleave_msg.trim().is_empty() {
             app.push_display_message(DisplayMessage {
                 role: "user".to_string(),
@@ -988,8 +1397,17 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                 title: None,
                 tool_data: None,
             });
-            if let Err(e) =
-                begin_remote_send(app, remote, interleave_msg, vec![], false, None, false, 0).await
+            if let Err(e) = begin_remote_send(
+                app,
+                remote,
+                interleave_msg,
+                interleave_images,
+                false,
+                None,
+                false,
+                0,
+            )
+            .await
             {
                 app.push_display_message(DisplayMessage::error(format!(
                     "Failed to send message: {}",
@@ -1020,35 +1438,141 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                 app.visible_turn_started = Some(Instant::now());
             }
         }
-        let _ =
-            begin_remote_send(app, remote, combined, vec![], true, reminder, auto_retry, 0).await;
+        if begin_remote_send(
+            app,
+            remote,
+            combined.clone(),
+            vec![],
+            true,
+            reminder.clone(),
+            auto_retry,
+            0,
+        )
+        .await
+        .is_err()
+        {
+            // Do not drop a dequeued follow-up whose send never reached the
+            // server (issue #391); restore it for redispatch after reconnect.
+            crate::logging::error(
+                "Failed to send queued continuation message; restoring it to the queue",
+            );
+            if let Some(reminder) = reminder {
+                app.hidden_queued_system_messages.insert(0, reminder);
+            }
+            if !combined.is_empty() {
+                app.queued_messages.insert(0, combined);
+            }
+        }
     } else if !app.hidden_queued_system_messages.is_empty() {
         let reminders = std::mem::take(&mut app.hidden_queued_system_messages);
         let combined = reminders.join("\n\n");
-        let _ = begin_remote_send(
+        if begin_remote_send(
             app,
             remote,
             String::new(),
             vec![],
             true,
-            Some(combined),
+            Some(combined.clone()),
             true,
             0,
         )
-        .await;
+        .await
+        .is_err()
+        {
+            crate::logging::error(
+                "Failed to send hidden continuation reminder; restoring it to the queue",
+            );
+            app.hidden_queued_system_messages.insert(0, combined);
+        }
+    }
+}
+
+/// How long a queued follow-up may sit undispatched on an idle client before
+/// the starvation watchdog treats it as stranded.
+const QUEUED_FOLLOWUP_STARVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Recover the "👉 Auto-poking: N incomplete todos" + spinner-forever state
+/// where no request is actually in flight.
+///
+/// `schedule_auto_poke_followup_if_needed` pushes the continuation onto
+/// `queued_messages` and sets `pending_queued_dispatch`. The event loop clears
+/// that flag and calls `process_remote_followups`, which returns early WITHOUT
+/// sending whenever one of its gates is closed (history not loaded, an earlier
+/// pending prompt/split/transfer branch returning first, or `is_processing`
+/// still true from a turn whose terminal event was dropped). The flag is
+/// already consumed by then, and nothing re-arms it: the follow-up sits in
+/// `queued_messages`, `App::is_processing()` keeps reporting true because the
+/// queue is non-empty, and the spinner spins while the model is idle.
+///
+/// `detect_and_cancel_stall` does not cover this: it only runs while
+/// `app.is_processing`, which is false in this variant. So track how long a
+/// queued follow-up has been idle-but-undispatched and re-arm the dispatch past
+/// the timeout, logging it so a recurrence is diagnosable from logs alone.
+fn detect_starved_queued_followup(app: &mut App) -> bool {
+    let starved_candidate =
+        !app.is_processing && !app.pending_queued_dispatch && app.has_queued_followups();
+    if !starved_candidate {
+        app.queued_followup_starved_since = None;
+        return false;
+    }
+    let since = *app
+        .queued_followup_starved_since
+        .get_or_insert_with(Instant::now);
+    let idle_for = since.elapsed();
+    if idle_for < QUEUED_FOLLOWUP_STARVATION_TIMEOUT {
+        return false;
+    }
+    crate::logging::warn(&format!(
+        "QUEUED_FOLLOWUP_STARVED queued_messages={} hidden_reminders={} interleave={} idle_for_secs={} re-arming dispatch",
+        app.queued_messages.len(),
+        app.hidden_queued_system_messages.len(),
+        app.interleave_message.is_some(),
+        idle_for.as_secs(),
+    ));
+    app.queued_followup_starved_since = None;
+    app.pending_queued_dispatch = true;
+    true
+}
+
+/// Client-side stall budget before the TUI cancels an in-flight turn.
+///
+/// The server relays provider events over the local socket; when the upstream
+/// model reasons silently, no events cross the socket, so a hardcoded short
+/// watchdog cannot distinguish a dead connection from a healthy long think
+/// (issue #434). Derive it from `[provider] stream_idle_timeout_secs`, scaled by
+/// the largest reasoning-effort multiplier because effort is invisible here,
+/// plus grace so the server-side idle timeout (which produces a visible error
+/// event) always fires first. Never below 2 minutes.
+fn stall_timeout() -> Duration {
+    const MIN_STALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+    const GRACE: Duration = Duration::from_secs(30);
+    let provider_idle = crate::provider::max_stream_idle_timeout();
+    provider_idle.saturating_add(GRACE).max(MIN_STALL_TIMEOUT)
+}
+
+/// Human-readable stall duration for user-facing stall messages, e.g.
+/// "2 minutes", "3.5 minutes", or "90 seconds".
+fn format_stall_duration(timeout: Duration) -> String {
+    let secs = timeout.as_secs();
+    if secs < 120 {
+        format!("{} seconds", secs)
+    } else if secs.is_multiple_of(60) {
+        format!("{} minutes", secs / 60)
+    } else {
+        format!("{:.1} minutes", secs as f64 / 60.0)
     }
 }
 
 async fn detect_and_cancel_stall(app: &mut App, remote: &mut RemoteConnection) {
-    const STALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+    let stall_timeout = stall_timeout();
     let is_running_tool = matches!(app.status, ProcessingStatus::RunningTool(_));
     if app.is_processing && !is_running_tool {
         let stalled = app
             .last_stream_activity
-            .map(|t| t.elapsed() > STALL_TIMEOUT)
+            .map(|t| t.elapsed() > stall_timeout)
             .unwrap_or_else(|| {
                 app.processing_started
-                    .map(|t| t.elapsed() > STALL_TIMEOUT)
+                    .map(|t| t.elapsed() > stall_timeout)
                     .unwrap_or(false)
             });
         if stalled {
@@ -1084,24 +1608,37 @@ async fn detect_and_cancel_stall(app: &mut App, remote: &mut RemoteConnection) {
             app.current_message_id = None;
             app.processing_started = None;
             app.last_stream_activity = None;
-            if !app.streaming_text.is_empty() {
+            if !app.streaming.streaming_text.is_empty() {
                 let content = app.take_streaming_text();
-                app.push_display_message(DisplayMessage {
-                    role: "assistant".to_string(),
-                    content,
-                    tool_calls: vec![],
-                    duration_secs: None,
-                    title: None,
-                    tool_data: None,
-                });
+                let content = app.collapse_reasoning_for_commit(content);
+                if !content.trim().is_empty() {
+                    app.push_display_message(DisplayMessage {
+                        role: "assistant".to_string(),
+                        content,
+                        tool_calls: vec![],
+                        duration_secs: None,
+                        title: None,
+                        tool_data: None,
+                    });
+                }
             }
-            if !app.schedule_pending_remote_retry(
-                "⚠ Stream stalled (no response for 2 minutes). Processing cancelled.",
-            ) {
+            let stall_desc = format_stall_duration(stall_timeout);
+            if !app.schedule_pending_remote_retry(&format!(
+                "⚠ Stream stalled (no response for {stall_desc}). Processing cancelled.",
+            )) {
+                // Keep a dispatched-but-unfinished queued follow-up on the
+                // queue instead of silently dropping it (issue #391).
+                let recovered = recover_undelivered_queued_continuation(app, "stream stall");
                 app.clear_pending_remote_retry();
-                app.push_display_message(DisplayMessage::system(
-                    "⚠ Stream stalled (no response for 2 minutes). Processing cancelled. You can resend your message.".to_string(),
-                ));
+                if recovered {
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "⚠ Stream stalled (no response for {stall_desc}). Processing cancelled. Your queued follow-up stays queued.",
+                    )));
+                } else {
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "⚠ Stream stalled (no response for {stall_desc}). Processing cancelled. You can resend your message. Raise `[provider] stream_idle_timeout_secs` in config.toml if your model thinks silently for longer.",
+                    )));
+                }
             }
         }
     }
@@ -1159,7 +1696,7 @@ async fn handle_debug_command(app: &mut App, cmd: &str, remote: &mut RemoteConne
             "remote": true,
             "server_version": app.remote_server_version.clone(),
             "server_has_update": app.remote_server_has_update,
-            "version": jcode_build_meta::VERSION,
+            "version": jcode_build_meta::version(),
             "diagram_mode": format!("{:?}", app.diagram_mode),
         })
         .to_string();
@@ -1208,21 +1745,7 @@ async fn parse_and_inject_key(
 }
 
 fn handle_disconnected_local_command(app: &mut App, trimmed: &str) -> bool {
-    let handled = super::commands::handle_help_command(app, trimmed)
-        || super::commands::handle_session_command(app, trimmed)
-        || super::commands::handle_test_command(app, trimmed)
-        || super::commands::handle_disabled_mission_command(app, trimmed)
-        || super::commands::handle_goals_command(app, trimmed)
-        || super::commands::handle_config_command(app, trimmed)
-        || super::commands::handle_log_command(app, trimmed)
-        || super::commands::handle_diff_command(app, trimmed)
-        || super::commands::handle_debug_command(app, trimmed)
-        || super::commands::handle_model_command(app, trimmed)
-        || super::commands::handle_usage_command(app, trimmed)
-        || super::commands::handle_feedback_command(app, trimmed)
-        || super::state_ui::handle_info_command(app, trimmed)
-        || super::auth::handle_auth_command(app, trimmed)
-        || super::commands::handle_dev_command(app, trimmed);
+    let handled = super::commands_dispatch::dispatch_local_command(app, trimmed);
 
     if handled {
         if trimmed.starts_with('/') {
@@ -1239,6 +1762,7 @@ fn handle_disconnected_local_command(app: &mut App, trimmed: &str) -> bool {
 }
 
 fn queue_message_for_reconnect(app: &mut App) {
+    input::promote_dropped_images(app);
     let trimmed = app.input.trim().to_string();
     if trimmed.is_empty() {
         return;
@@ -1355,19 +1879,27 @@ fn handle_disconnected_key_internal(
         }
     }
 
-    if code == KeyCode::Enter && modifiers.contains(KeyModifiers::CONTROL) {
+    if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) {
         queue_message_for_reconnect(app);
         return Ok(());
     }
 
-    if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
-        input::insert_input_text(app, "\n");
+    if app.new_terminal_key_matches(code, modifiers) {
+        app.handle_new_terminal_hotkey();
+        return Ok(());
+    }
+
+    if app.open_resume_key_matches(code, modifiers) {
+        app.open_session_picker();
+        return Ok(());
+    }
+
+    if crate::tui::app::input::newline::enter_inserts_newline(app, code, modifiers) {
         return Ok(());
     }
 
     if let Some(text) = text_input.or_else(|| input::text_input_for_key(code, modifiers)) {
         input::handle_text_input(app, &text);
-        app.follow_chat_bottom_for_typing();
         return Ok(());
     }
 
@@ -1432,4 +1964,103 @@ fn handle_disconnected_key_internal(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod stall_guard_tests {
+    use super::*;
+
+    #[test]
+    fn stall_timeout_never_below_two_minutes() {
+        // Even with the default 180s provider idle timeout, the client stall
+        // guard must give the server-side timeout room to fire first.
+        let timeout = stall_timeout();
+        assert!(
+            timeout >= Duration::from_secs(2 * 60),
+            "stall timeout regressed below 2 minutes: {timeout:?}"
+        );
+        // And it must exceed the max provider idle budget so a healthy silent
+        // reasoning stretch is cancelled server-side (visible error + retry)
+        // rather than by the client watchdog (issue #434).
+        let provider_idle = crate::provider::max_stream_idle_timeout();
+        assert!(
+            timeout > provider_idle,
+            "stall timeout {timeout:?} must exceed provider idle timeout {provider_idle:?}"
+        );
+    }
+
+    #[test]
+    fn format_stall_duration_is_human_readable() {
+        assert_eq!(format_stall_duration(Duration::from_secs(90)), "90 seconds");
+        assert_eq!(format_stall_duration(Duration::from_secs(120)), "2 minutes");
+        assert_eq!(
+            format_stall_duration(Duration::from_secs(210)),
+            "3.5 minutes"
+        );
+        assert_eq!(
+            format_stall_duration(Duration::from_secs(430)),
+            "7.2 minutes"
+        );
+    }
+
+    /// The stranded-auto-poke bug: a continuation sits in `queued_messages`
+    /// with `pending_queued_dispatch` already consumed, so nothing ever sends
+    /// it while `is_processing()` (queue-aware) keeps the spinner up.
+    #[test]
+    fn starved_queued_followup_is_rearmed_after_timeout() {
+        let mut app = App::new_for_remote(None);
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+        app.queued_messages
+            .push(crate::todo::build_auto_poke_message(2));
+
+        // First observation only arms the timer; it must not re-dispatch yet.
+        assert!(!detect_starved_queued_followup(&mut app));
+        assert!(app.queued_followup_starved_since.is_some());
+        assert!(!app.pending_queued_dispatch);
+
+        // Backdate past the timeout to simulate a stranded follow-up.
+        app.queued_followup_starved_since =
+            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
+        assert!(detect_starved_queued_followup(&mut app));
+        assert!(
+            app.pending_queued_dispatch,
+            "watchdog must re-arm dispatch so the queued poke is actually sent"
+        );
+        assert!(app.queued_followup_starved_since.is_none());
+        assert_eq!(
+            app.queued_messages.len(),
+            1,
+            "watchdog must not drop the queued continuation"
+        );
+    }
+
+    /// A live turn (or an already-armed dispatch) is normal, not starvation.
+    #[test]
+    fn starvation_watchdog_ignores_healthy_states() {
+        let mut app = App::new_for_remote(None);
+
+        // Empty queue: nothing to starve.
+        assert!(!detect_starved_queued_followup(&mut app));
+        assert!(app.queued_followup_starved_since.is_none());
+
+        // Queued but a turn is in flight: the queue drains at turn end.
+        app.queued_messages.push("poke".to_string());
+        app.is_processing = true;
+        app.queued_followup_starved_since =
+            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
+        assert!(!detect_starved_queued_followup(&mut app));
+        assert!(
+            app.queued_followup_starved_since.is_none(),
+            "timer must reset once the state is healthy again"
+        );
+
+        // Dispatch already armed: the event loop will send on the next pass.
+        app.is_processing = false;
+        app.pending_queued_dispatch = true;
+        app.queued_followup_starved_since =
+            Some(Instant::now() - QUEUED_FOLLOWUP_STARVATION_TIMEOUT - Duration::from_secs(1));
+        assert!(!detect_starved_queued_followup(&mut app));
+        assert!(app.queued_followup_starved_since.is_none());
+    }
 }

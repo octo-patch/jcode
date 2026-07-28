@@ -28,16 +28,20 @@ pub(crate) enum ProviderAuthArg {
 
 #[derive(Parser, Debug)]
 #[command(name = "jcode")]
-#[command(version = jcode_build_meta::VERSION)]
+#[command(version = jcode_build_meta::version())]
 #[command(about = "J-Code: A coding agent using Claude Max or ChatGPT Pro subscriptions")]
 pub(crate) struct Args {
-    /// Provider to use (jcode, claude, openai, openai-api, openrouter, azure, opencode, opencode-go, zai, 302ai, baseten, cortecs, comtegra, deepseek, fpt, firmware, huggingface, moonshotai, nebius, scaleway, stackit, groq, mistral, perplexity, togetherai, deepinfra, xai, nvidia-nim, lmstudio, ollama, chutes, cerebras, alibaba-coding-plan, openai-compatible, cursor, copilot, gemini, antigravity, google, or auto-detect)
+    /// Initial provider to use (jcode, claude, openai, openai-api, openrouter, azure, opencode, opencode-go, zai, 302ai, baseten, cortecs, comtegra, deepseek, fpt, firmware, huggingface, moonshotai, nebius, scaleway, stackit, groq, mistral, perplexity, togetherai, deepinfra, xai, nvidia-nim, lmstudio, ollama, chutes, cerebras, alibaba-coding-plan, openai-compatible, cursor, copilot, gemini, antigravity, google, or auto-detect). Interactive sessions can switch providers with /model.
     #[arg(short, long, default_value = "auto", global = true)]
     pub(crate) provider: ProviderChoice,
 
-    /// Working directory
+    /// Working directory for the local client process
     #[arg(short = 'C', long, global = true)]
     pub(crate) cwd: Option<String>,
+
+    /// Working directory to send to a remote server when using --socket
+    #[arg(long, global = true)]
+    pub(crate) remote_working_dir: Option<String>,
 
     /// Skip the automatic update check
     #[arg(long, global = true)]
@@ -63,9 +67,19 @@ pub(crate) struct Args {
     #[arg(long, global = true, hide = true)]
     pub(crate) fresh_spawn: bool,
 
+    /// Internal: canonical global hotkey that launched this process.
+    #[arg(long, global = true, hide = true, value_name = "CHORD")]
+    pub(crate) spawn_hotkey: Option<String>,
+
     /// Disable auto-detection of jcode repository and self-dev mode
     #[arg(long, global = true)]
     pub(crate) no_selfdev: bool,
+
+    /// Start the onboarding simulator on launch (same as `/onboarding-sim`).
+    /// Steps through every first-run onboarding screen with synthetic data;
+    /// never touches real auth state.
+    #[arg(long = "onboarding-sim")]
+    pub(crate) onboarding_sim: bool,
 
     /// Custom socket path for server/client communication
     #[arg(long, global = true)]
@@ -88,7 +102,7 @@ pub(crate) struct Args {
     #[arg(long, global = true)]
     pub(crate) tool_profile: Option<String>,
 
-    /// Comma-separated explicit allow-list of tools to expose, e.g. bash,read,write,apply_patch. Use '*' or 'all' to expose all tools, including default-disabled tools.
+    /// Comma-separated explicit allow-list of tools to expose, e.g. bash,read,write,apply_patch. Use '*' or 'all' for the unrestricted full toolset.
     #[arg(long, global = true)]
     pub(crate) tools: Option<String>,
 
@@ -119,6 +133,13 @@ pub(crate) enum Command {
         /// Internal: idle shutdown timeout in seconds for a temporary server.
         #[arg(long, hide = true)]
         temp_idle_timeout_secs: Option<u64>,
+
+        /// Stable display name for this server in connected clients and session pickers.
+        ///
+        /// Useful for long-lived remote runtimes, e.g. `fabian`, `john`, or
+        /// `mount-cloud-fabian`. Unsafe characters are normalized before use.
+        #[arg(long)]
+        server_name: Option<String>,
     },
 
     /// Run as an Agent Client Protocol (ACP) adapter backed by the Jcode daemon
@@ -150,7 +171,11 @@ pub(crate) enum Command {
     /// Login to a provider via OAuth, API key, or local credentials
     Login {
         /// Provider to log in to. Equivalent to --provider for this command, e.g. `jcode login google`.
-        #[arg(value_enum)]
+        // Distinct clap id: the global `--provider` flag also has id "provider";
+        // sharing the id makes clap drop the flag inside `login` (so
+        // `jcode login --provider x` errors) and propagate the global default
+        // into this positional.
+        #[arg(value_enum, id = "login_provider", value_name = "PROVIDER")]
         provider: Option<ProviderChoice>,
 
         /// Account label for multi-account support (stored labels are auto-numbered)
@@ -201,6 +226,12 @@ pub(crate) enum Command {
         /// Environment variable name to store/use for an OpenAI-compatible API key.
         #[arg(long)]
         api_key_env: Option<String>,
+    },
+
+    /// Log in to and manage your Jcode account
+    Account {
+        #[command(subcommand)]
+        action: AccountCommand,
     },
 
     /// Run in simple REPL mode (no TUI)
@@ -318,6 +349,18 @@ pub(crate) enum Command {
         /// Internal: run as the macOS hotkey listener process.
         #[arg(long, hide = true)]
         listen_macos_hotkey: bool,
+
+        /// Internal: show a rate-limited shortcut reminder from a CLI SessionStart hook.
+        #[arg(long, hide = true, value_name = "CLI")]
+        notify_cli_launch: Option<String>,
+
+        /// Internal: run as the Windows hotkey listener process.
+        #[arg(long, hide = true)]
+        listen_windows_hotkey: bool,
+
+        /// Remove the installed platform global hotkey listener.
+        #[arg(long)]
+        uninstall: bool,
     },
 
     /// Install a launcher so jcode appears in your app launcher
@@ -399,8 +442,8 @@ pub(crate) enum Command {
         #[arg(long)]
         coverage_file: Option<String>,
 
-        /// Maximum uncovered provider/model gaps to show in the full summary
-        #[arg(long, default_value_t = 50)]
+        /// Maximum provider/model pairs to list in the full summary (0 = show all)
+        #[arg(long, default_value_t = 0)]
         coverage_limit: usize,
     },
 
@@ -474,10 +517,53 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: RestartCommand,
     },
+
+    /// Show a live macOS menu bar indicator with running/streaming session counts
+    #[command(alias = "menu-bar", alias = "statusbar")]
+    Menubar {
+        /// Print the current counts once as text and exit (no menu bar item)
+        #[arg(long)]
+        once: bool,
+
+        /// Emit the current counts as JSON and exit
+        #[arg(long, conflicts_with = "once")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum AccountCommand {
+    /// Open browser-based device authorization and wait for plan activation
+    Login {
+        /// Do not open a browser automatically; print the public approval URL instead
+        #[arg(long, alias = "headless")]
+        no_browser: bool,
+    },
+    /// Show canonical account, plan, and usage status from /v1/me
+    Status {
+        /// Emit JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open the public Jcode account management page
+    Manage,
+    /// Revoke the current key when reachable, then securely clear local state
+    Logout,
 }
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum ServerCommand {
+    /// Start the background server if it is not already running.
+    Start {
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Internal: hold a lightweight connection open until stdin closes.
+    #[command(hide = true)]
+    Keepalive,
+
     /// Gracefully reload the running background server onto the newest binary.
     ///
     /// This is the preferred way to pick up an upgrade: the daemon hands its

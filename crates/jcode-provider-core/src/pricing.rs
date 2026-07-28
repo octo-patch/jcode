@@ -11,70 +11,73 @@ fn usd_per_token_str_to_micros_per_mtok(raw: &str) -> Option<u64> {
         .map(|usd_per_token| (usd_per_token * 1_000_000_000_000.0).round() as u64)
 }
 
+/// True when an Anthropic service tier value means fast mode. The Anthropic
+/// API spells the latency-optimized tier `auto`; jcode also accepts `priority`
+/// because `/fast on` is shared with OpenAI.
+fn anthropic_tier_is_fast(service_tier: Option<&str>) -> bool {
+    matches!(
+        service_tier
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("auto") | Some("priority")
+    )
+}
+
+/// Published Anthropic API pricing (docs.anthropic.com/en/docs/about-claude/pricing).
+///
+/// `[1m]` long-context variants bill at standard per-token rates: Anthropic
+/// includes the full 1M context window at standard pricing for Fable 5,
+/// Opus 4.8/4.7/4.6 and Sonnet 4.6, so the suffix never changes the estimate.
 pub fn anthropic_api_pricing(model: &str) -> Option<RouteCheapnessEstimate> {
+    anthropic_api_pricing_with_tier(model, None)
+}
+
+/// Anthropic API pricing honoring the active service tier.
+///
+/// Fast mode (research preview) bills premium per-token rates on Opus
+/// 4.8/4.7/4.6; prompt-caching multipliers stack on top (cache read is 0.1x
+/// the fast-mode input rate). Tiers on models without fast-mode pricing fall
+/// back to standard rates.
+pub fn anthropic_api_pricing_with_tier(
+    model: &str,
+    service_tier: Option<&str>,
+) -> Option<RouteCheapnessEstimate> {
     let base = model.strip_suffix("[1m]").unwrap_or(model);
-    let long_context = model.ends_with("[1m]");
+    let exact = |input_usd: f64, output_usd: f64, cache_read_usd: f64, note: &str| {
+        Some(RouteCheapnessEstimate::metered(
+            RouteCostSource::PublicApiPricing,
+            RouteCostConfidence::Exact,
+            usd_to_micros(input_usd),
+            usd_to_micros(output_usd),
+            Some(usd_to_micros(cache_read_usd)),
+            Some(note.to_string()),
+        ))
+    };
+
+    if anthropic_tier_is_fast(service_tier) {
+        match base {
+            "claude-opus-4-8" => {
+                return exact(10.0, 50.0, 1.0, "Anthropic API fast mode pricing");
+            }
+            "claude-opus-4-7" | "claude-opus-4-6" => {
+                return exact(30.0, 150.0, 3.0, "Anthropic API fast mode pricing");
+            }
+            _ => {}
+        }
+    }
+
     match base {
-        "claude-opus-4-8" => Some(RouteCheapnessEstimate::metered(
-            RouteCostSource::PublicApiPricing,
-            RouteCostConfidence::Exact,
-            usd_to_micros(if long_context { 10.0 } else { 5.0 }),
-            usd_to_micros(if long_context { 37.5 } else { 25.0 }),
-            Some(usd_to_micros(if long_context { 1.0 } else { 0.5 })),
-            Some(if long_context {
-                "Anthropic API long-context pricing".to_string()
-            } else {
-                "Anthropic API pricing".to_string()
-            }),
-        )),
-        "claude-opus-4-6" => Some(RouteCheapnessEstimate::metered(
-            RouteCostSource::PublicApiPricing,
-            RouteCostConfidence::Exact,
-            usd_to_micros(if long_context { 10.0 } else { 5.0 }),
-            usd_to_micros(if long_context { 37.5 } else { 25.0 }),
-            Some(usd_to_micros(if long_context { 1.0 } else { 0.5 })),
-            Some(if long_context {
-                "Anthropic API long-context pricing".to_string()
-            } else {
-                "Anthropic API pricing".to_string()
-            }),
-        )),
-        "claude-sonnet-4-6" => Some(RouteCheapnessEstimate::metered(
-            RouteCostSource::PublicApiPricing,
-            RouteCostConfidence::Exact,
-            usd_to_micros(if long_context { 6.0 } else { 3.0 }),
-            usd_to_micros(if long_context { 22.5 } else { 15.0 }),
-            Some(usd_to_micros(if long_context { 0.6 } else { 0.3 })),
-            Some(if long_context {
-                "Anthropic API long-context pricing".to_string()
-            } else {
-                "Anthropic API pricing".to_string()
-            }),
-        )),
-        "claude-haiku-4-5" => Some(RouteCheapnessEstimate::metered(
-            RouteCostSource::PublicApiPricing,
-            RouteCostConfidence::Exact,
-            usd_to_micros(1.0),
-            usd_to_micros(5.0),
-            Some(usd_to_micros(0.1)),
-            Some("Anthropic API pricing".to_string()),
-        )),
-        "claude-opus-4-5" => Some(RouteCheapnessEstimate::metered(
-            RouteCostSource::Heuristic,
-            RouteCostConfidence::Medium,
-            usd_to_micros(5.0),
-            usd_to_micros(25.0),
-            Some(usd_to_micros(0.5)),
-            Some("Estimated from Opus 4.6 API pricing".to_string()),
-        )),
-        "claude-sonnet-4-5" | "claude-sonnet-4-20250514" => Some(RouteCheapnessEstimate::metered(
-            RouteCostSource::Heuristic,
-            RouteCostConfidence::Medium,
-            usd_to_micros(3.0),
-            usd_to_micros(15.0),
-            Some(usd_to_micros(0.3)),
-            Some("Estimated from Sonnet 4.6 API pricing".to_string()),
-        )),
+        "claude-fable-5" => exact(10.0, 50.0, 1.0, "Anthropic API pricing"),
+        "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
+        | "claude-opus-4-5" => exact(5.0, 25.0, 0.5, "Anthropic API pricing"),
+        // Sonnet 5 introductory pricing ($2/$10) runs through 2026-08-31,
+        // after which it moves to the standard Sonnet $3/$15 rates.
+        "claude-sonnet-5" => exact(2.0, 10.0, 0.2, "Anthropic API introductory pricing"),
+        "claude-sonnet-4-6" | "claude-sonnet-4-5" | "claude-sonnet-4-20250514" => {
+            exact(3.0, 15.0, 0.3, "Anthropic API pricing")
+        }
+        "claude-haiku-4-5" => exact(1.0, 5.0, 0.1, "Anthropic API pricing"),
         _ => None,
     }
 }
@@ -135,49 +138,83 @@ pub fn anthropic_oauth_pricing(model: &str, subscription: Option<&str>) -> Route
     }
 }
 
+/// Published OpenAI API pricing (platform.openai.com/docs/pricing).
+///
+/// Standard tier, short-context prices. GPT-5.4+/5.5 bill a higher tier for
+/// requests over ~272k input tokens; per-call estimates here use the standard
+/// tier since jcode cannot see the per-request tier split.
 pub fn openai_api_pricing(model: &str) -> Option<RouteCheapnessEstimate> {
+    openai_api_pricing_with_tier(model, None)
+}
+
+/// OpenAI API pricing honoring the active service tier.
+///
+/// `priority` (fast mode) and `flex` bill different per-token rates on the
+/// models that support them; other tier values and unsupported models fall
+/// back to standard rates.
+pub fn openai_api_pricing_with_tier(
+    model: &str,
+    service_tier: Option<&str>,
+) -> Option<RouteCheapnessEstimate> {
     let base = model.strip_suffix("[1m]").unwrap_or(model);
-    match base {
-        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-pro" => Some(RouteCheapnessEstimate::metered(
+    let exact = |input_usd: f64, output_usd: f64, cache_read_usd: Option<f64>, note: &str| {
+        Some(RouteCheapnessEstimate::metered(
             RouteCostSource::PublicApiPricing,
-            RouteCostConfidence::High,
-            usd_to_micros(2.5),
-            usd_to_micros(15.0),
-            Some(usd_to_micros(0.25)),
-            Some("OpenAI API pricing".to_string()),
-        )),
-        "gpt-5.3-codex" | "gpt-5.2-codex" | "gpt-5.2" | "gpt-5.1" | "gpt-5.1-codex" => {
-            Some(RouteCheapnessEstimate::metered(
-                RouteCostSource::Heuristic,
-                RouteCostConfidence::Low,
-                usd_to_micros(2.5),
-                usd_to_micros(15.0),
-                Some(usd_to_micros(0.25)),
-                Some("Estimated from GPT-5.4 API pricing".to_string()),
-            ))
+            RouteCostConfidence::Exact,
+            usd_to_micros(input_usd),
+            usd_to_micros(output_usd),
+            cache_read_usd.map(usd_to_micros),
+            Some(note.to_string()),
+        ))
+    };
+
+    match service_tier
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("priority") => match base {
+            "gpt-5.5" => return exact(12.5, 75.0, Some(1.25), "OpenAI API priority pricing"),
+            "gpt-5.4" => return exact(5.0, 30.0, Some(0.5), "OpenAI API priority pricing"),
+            "gpt-5.4-mini" => return exact(1.5, 9.0, Some(0.15), "OpenAI API priority pricing"),
+            "gpt-5.3-codex" => return exact(3.5, 28.0, Some(0.35), "OpenAI API priority pricing"),
+            _ => {}
+        },
+        Some("flex") => match base {
+            "gpt-5.5" => return exact(2.5, 15.0, Some(0.25), "OpenAI API flex pricing"),
+            "gpt-5.5-pro" => return exact(15.0, 90.0, None, "OpenAI API flex pricing"),
+            "gpt-5.4" => return exact(1.25, 7.5, Some(0.13), "OpenAI API flex pricing"),
+            "gpt-5.4-mini" => return exact(0.375, 2.25, Some(0.0375), "OpenAI API flex pricing"),
+            "gpt-5.4-nano" => return exact(0.1, 0.625, Some(0.01), "OpenAI API flex pricing"),
+            "gpt-5.4-pro" => return exact(15.0, 90.0, None, "OpenAI API flex pricing"),
+            _ => {}
+        },
+        _ => {}
+    }
+
+    match base {
+        "gpt-5.5" => exact(5.0, 30.0, Some(0.5), "OpenAI API pricing"),
+        "gpt-5.5-pro" | "gpt-5.4-pro" => exact(30.0, 180.0, None, "OpenAI API pricing"),
+        "gpt-5.4" => exact(2.5, 15.0, Some(0.25), "OpenAI API pricing"),
+        "gpt-5.4-mini" => exact(0.75, 4.5, Some(0.075), "OpenAI API pricing"),
+        "gpt-5.4-nano" => exact(0.2, 1.25, Some(0.02), "OpenAI API pricing"),
+        "gpt-5.3-codex" | "gpt-5.3-codex-spark" | "gpt-5.3-chat-latest" => {
+            exact(1.75, 14.0, Some(0.175), "OpenAI API pricing")
         }
-        "gpt-5.3-codex-spark" | "gpt-5.1-codex-mini" => Some(RouteCheapnessEstimate::metered(
-            RouteCostSource::Heuristic,
-            RouteCostConfidence::Low,
-            usd_to_micros(0.25),
-            usd_to_micros(2.0),
-            Some(usd_to_micros(0.025)),
-            Some("Estimated from GPT-5 mini API pricing".to_string()),
-        )),
-        "gpt-5.1-codex-max"
-        | "gpt-5.2-pro"
-        | "gpt-5-chat-latest"
+        "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.2-chat-latest" => {
+            exact(1.75, 14.0, Some(0.175), "OpenAI API pricing")
+        }
+        "gpt-5.2-pro" => exact(21.0, 168.0, None, "OpenAI API pricing"),
+        "gpt-5.1"
+        | "gpt-5.1-codex"
+        | "gpt-5.1-codex-max"
         | "gpt-5.1-chat-latest"
-        | "gpt-5.2-chat-latest"
+        | "gpt-5"
         | "gpt-5-codex"
-        | "gpt-5" => Some(RouteCheapnessEstimate::metered(
-            RouteCostSource::Heuristic,
-            RouteCostConfidence::Low,
-            usd_to_micros(2.5),
-            usd_to_micros(15.0),
-            Some(usd_to_micros(0.25)),
-            Some("Estimated from GPT-5.4 API pricing".to_string()),
-        )),
+        | "gpt-5-chat-latest" => exact(1.25, 10.0, Some(0.125), "OpenAI API pricing"),
+        "gpt-5.1-codex-mini" | "gpt-5-mini" => exact(0.25, 2.0, Some(0.025), "OpenAI API pricing"),
+        "gpt-5-nano" => exact(0.05, 0.4, Some(0.005), "OpenAI API pricing"),
+        "gpt-5-pro" => exact(15.0, 120.0, None, "OpenAI API pricing"),
         _ => None,
     }
 }
@@ -256,14 +293,42 @@ mod tests {
     use crate::RouteBillingKind;
 
     #[test]
-    fn anthropic_api_pricing_handles_long_context_variants() {
+    fn anthropic_api_pricing_long_context_uses_standard_rates() {
+        // Anthropic includes the 1M context window at standard pricing, so the
+        // `[1m]` suffix must not change the estimate.
         let estimate = anthropic_api_pricing("claude-opus-4-6[1m]").expect("priced model");
         assert_eq!(estimate.billing_kind, RouteBillingKind::Metered);
         assert_eq!(estimate.source, RouteCostSource::PublicApiPricing);
         assert_eq!(estimate.confidence, RouteCostConfidence::Exact);
-        assert_eq!(estimate.input_price_per_mtok_micros, Some(10_000_000));
-        assert_eq!(estimate.output_price_per_mtok_micros, Some(37_500_000));
-        assert_eq!(estimate.cache_read_price_per_mtok_micros, Some(1_000_000));
+        assert_eq!(estimate.input_price_per_mtok_micros, Some(5_000_000));
+        assert_eq!(estimate.output_price_per_mtok_micros, Some(25_000_000));
+        assert_eq!(estimate.cache_read_price_per_mtok_micros, Some(500_000));
+        assert_eq!(
+            anthropic_api_pricing("claude-opus-4-6"),
+            anthropic_api_pricing("claude-opus-4-6[1m]")
+        );
+        assert_eq!(
+            anthropic_api_pricing("claude-sonnet-4-6"),
+            anthropic_api_pricing("claude-sonnet-4-6[1m]")
+        );
+    }
+
+    #[test]
+    fn anthropic_api_pricing_matches_published_rates() {
+        let fable = anthropic_api_pricing("claude-fable-5").expect("priced model");
+        assert_eq!(fable.input_price_per_mtok_micros, Some(10_000_000));
+        assert_eq!(fable.output_price_per_mtok_micros, Some(50_000_000));
+        assert_eq!(fable.cache_read_price_per_mtok_micros, Some(1_000_000));
+
+        let sonnet = anthropic_api_pricing("claude-sonnet-4-6").expect("priced model");
+        assert_eq!(sonnet.input_price_per_mtok_micros, Some(3_000_000));
+        assert_eq!(sonnet.output_price_per_mtok_micros, Some(15_000_000));
+        assert_eq!(sonnet.cache_read_price_per_mtok_micros, Some(300_000));
+
+        let haiku = anthropic_api_pricing("claude-haiku-4-5").expect("priced model");
+        assert_eq!(haiku.input_price_per_mtok_micros, Some(1_000_000));
+        assert_eq!(haiku.output_price_per_mtok_micros, Some(5_000_000));
+        assert_eq!(haiku.cache_read_price_per_mtok_micros, Some(100_000));
     }
 
     #[test]
@@ -281,6 +346,56 @@ mod tests {
         assert_eq!(estimate.input_price_per_mtok_micros, Some(2_500_000));
         assert_eq!(estimate.output_price_per_mtok_micros, Some(15_000_000));
         assert_eq!(estimate.cache_read_price_per_mtok_micros, Some(250_000));
+    }
+
+    #[test]
+    fn anthropic_fast_mode_tier_bills_premium_rates() {
+        // Opus 4.6 fast mode: $30/$150, cache read 0.1x fast input.
+        let fast =
+            anthropic_api_pricing_with_tier("claude-opus-4-6", Some("auto")).expect("priced model");
+        assert_eq!(fast.input_price_per_mtok_micros, Some(30_000_000));
+        assert_eq!(fast.output_price_per_mtok_micros, Some(150_000_000));
+        assert_eq!(fast.cache_read_price_per_mtok_micros, Some(3_000_000));
+
+        // Opus 4.8 fast mode: $10/$50. `priority` spelling also accepted.
+        let opus48 = anthropic_api_pricing_with_tier("claude-opus-4-8", Some("priority"))
+            .expect("priced model");
+        assert_eq!(opus48.input_price_per_mtok_micros, Some(10_000_000));
+        assert_eq!(opus48.output_price_per_mtok_micros, Some(50_000_000));
+
+        // standard_only (off) and models without fast pricing use standard rates.
+        assert_eq!(
+            anthropic_api_pricing_with_tier("claude-opus-4-6", Some("standard_only")),
+            anthropic_api_pricing("claude-opus-4-6")
+        );
+        assert_eq!(
+            anthropic_api_pricing_with_tier("claude-sonnet-4-6", Some("auto")),
+            anthropic_api_pricing("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn openai_service_tiers_bill_published_rates() {
+        // gpt-5.4 priority: $5/$30.
+        let priority =
+            openai_api_pricing_with_tier("gpt-5.4", Some("priority")).expect("priced model");
+        assert_eq!(priority.input_price_per_mtok_micros, Some(5_000_000));
+        assert_eq!(priority.output_price_per_mtok_micros, Some(30_000_000));
+
+        // gpt-5.4 flex: $1.25/$7.50.
+        let flex = openai_api_pricing_with_tier("gpt-5.4", Some("flex")).expect("priced model");
+        assert_eq!(flex.input_price_per_mtok_micros, Some(1_250_000));
+        assert_eq!(flex.output_price_per_mtok_micros, Some(7_500_000));
+
+        // Models without a tier-specific price fall back to standard rates.
+        assert_eq!(
+            openai_api_pricing_with_tier("gpt-5.2", Some("priority")),
+            openai_api_pricing("gpt-5.2")
+        );
+        assert_eq!(
+            openai_api_pricing_with_tier("gpt-5.4", None),
+            openai_api_pricing("gpt-5.4")
+        );
     }
 
     #[test]

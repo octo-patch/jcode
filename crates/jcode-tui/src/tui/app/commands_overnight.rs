@@ -97,19 +97,19 @@ fn start_visible_overnight_turn(app: &mut App, content: String) {
     app.thinking_buffer.clear();
     app.streaming_tool_calls.clear();
     app.batch_progress = None;
-    app.streaming_input_tokens = 0;
-    app.streaming_output_tokens = 0;
-    app.streaming_cache_read_tokens = None;
-    app.streaming_cache_creation_tokens = None;
-    app.current_api_usage_recorded = false;
+    app.streaming.streaming_input_tokens = 0;
+    app.streaming.streaming_output_tokens = 0;
+    app.streaming.streaming_cache_read_tokens = None;
+    app.streaming.streaming_cache_creation_tokens = None;
+    app.kv_cache.current_api_usage_recorded = false;
     app.upstream_provider = None;
     app.status_detail = None;
-    app.streaming_tps_start = None;
-    app.streaming_tps_elapsed = Duration::ZERO;
-    app.streaming_tps_collect_output = false;
-    app.streaming_total_output_tokens = 0;
-    app.streaming_tps_observed_output_tokens = 0;
-    app.streaming_tps_observed_elapsed = Duration::ZERO;
+    app.streaming.streaming_tps_start = None;
+    app.streaming.streaming_tps_elapsed = Duration::ZERO;
+    app.streaming.streaming_tps_collect_output = false;
+    app.streaming.streaming_total_output_tokens = 0;
+    app.streaming.streaming_tps_observed_output_tokens = 0;
+    app.streaming.streaming_tps_observed_elapsed = Duration::ZERO;
     app.processing_started = Some(Instant::now());
     app.visible_turn_started = Some(Instant::now());
     app.pending_turn = true;
@@ -198,7 +198,7 @@ fn open_overnight_review(app: &mut App) {
                 )));
                 return;
             }
-            match open::that_detached(&manifest.review_path) {
+            match super::helpers::open_path_or_url_detached(&manifest.review_path) {
                 Ok(()) => {
                     app.push_display_message(DisplayMessage::system(format!(
                         "Opened overnight review page: {}",
@@ -304,9 +304,9 @@ impl App {
         }
         self.overnight_auto_poke = None;
         self.push_display_message(DisplayMessage::system(
-            "🛑 Overnight auto-poke stopped because the last request failed with a non-retryable error. Fix the request/session, then run /overnight status and continue manually if appropriate.".to_string(),
+            "🛑 The last request failed in a way that retrying won't fix, so we stopped the overnight run. Check /overnight status and continue manually if it looks right.".to_string(),
         ));
-        self.set_status_notice("Overnight poke stopped: non-retryable error");
+        self.set_status_notice("Overnight run stopped: this error won't fix itself");
         true
     }
 

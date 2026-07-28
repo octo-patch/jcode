@@ -59,6 +59,9 @@ pub(crate) struct TestEnvGuard {
     prev_runtime_dir: Option<OsString>,
     prev_test_session: Option<OsString>,
     prev_debug_control: Option<OsString>,
+    prev_runtime_provider: Option<OsString>,
+    prev_active_provider: Option<OsString>,
+    prev_openrouter_cache_namespace: Option<OsString>,
     _temp_home: tempfile::TempDir,
 }
 
@@ -72,6 +75,9 @@ impl TestEnvGuard {
         let prev_runtime_dir = std::env::var_os("JCODE_RUNTIME_DIR");
         let prev_test_session = std::env::var_os("JCODE_TEST_SESSION");
         let prev_debug_control = std::env::var_os("JCODE_DEBUG_CONTROL");
+        let prev_runtime_provider = std::env::var_os("JCODE_RUNTIME_PROVIDER");
+        let prev_active_provider = std::env::var_os("JCODE_ACTIVE_PROVIDER");
+        let prev_openrouter_cache_namespace = std::env::var_os("JCODE_OPENROUTER_CACHE_NAMESPACE");
         let runtime_dir = temp_home.path().join("runtime");
         std::fs::create_dir_all(&runtime_dir)?;
 
@@ -79,6 +85,15 @@ impl TestEnvGuard {
         jcode::env::set_var("JCODE_RUNTIME_DIR", &runtime_dir);
         jcode::env::set_var("JCODE_TEST_SESSION", "1");
         jcode::env::set_var("JCODE_DEBUG_CONTROL", "1");
+        jcode::env::remove_var("JCODE_RUNTIME_PROVIDER");
+        jcode::env::remove_var("JCODE_ACTIVE_PROVIDER");
+        jcode::env::remove_var("JCODE_OPENROUTER_CACHE_NAMESPACE");
+        // Disable the memory sidecar/extraction in e2e runs. Its background
+        // extraction makes its own provider `complete()` call, which would steal
+        // a queued mock response from the scenario under test and make turn
+        // outcomes nondeterministic across transports.
+        jcode::env::set_var("JCODE_MEMORY_ENABLED", "0");
+        jcode::env::set_var("JCODE_MEMORY_SIDECAR_ENABLED", "0");
 
         Ok(Self {
             _lock: lock,
@@ -86,6 +101,9 @@ impl TestEnvGuard {
             prev_runtime_dir,
             prev_test_session,
             prev_debug_control,
+            prev_runtime_provider,
+            prev_active_provider,
+            prev_openrouter_cache_namespace,
             _temp_home: temp_home,
         })
     }
@@ -115,6 +133,27 @@ impl Drop for TestEnvGuard {
             jcode::env::set_var("JCODE_DEBUG_CONTROL", prev_debug_control);
         } else {
             jcode::env::remove_var("JCODE_DEBUG_CONTROL");
+        }
+
+        if let Some(prev_runtime_provider) = &self.prev_runtime_provider {
+            jcode::env::set_var("JCODE_RUNTIME_PROVIDER", prev_runtime_provider);
+        } else {
+            jcode::env::remove_var("JCODE_RUNTIME_PROVIDER");
+        }
+
+        if let Some(prev_active_provider) = &self.prev_active_provider {
+            jcode::env::set_var("JCODE_ACTIVE_PROVIDER", prev_active_provider);
+        } else {
+            jcode::env::remove_var("JCODE_ACTIVE_PROVIDER");
+        }
+
+        if let Some(prev_openrouter_cache_namespace) = &self.prev_openrouter_cache_namespace {
+            jcode::env::set_var(
+                "JCODE_OPENROUTER_CACHE_NAMESPACE",
+                prev_openrouter_cache_namespace,
+            );
+        } else {
+            jcode::env::remove_var("JCODE_OPENROUTER_CACHE_NAMESPACE");
         }
     }
 }
@@ -320,14 +359,16 @@ impl WsTestClient {
     async fn subscribe(&mut self) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
+        let working_dir = std::env::current_dir()?.to_string_lossy().into_owned();
         self.send_request(Request::Subscribe {
             id,
-            working_dir: None,
+            working_dir: Some(working_dir),
             selfdev: None,
             target_session_id: None,
             client_instance_id: None,
             client_has_local_history: false,
             allow_session_takeover: false,
+            terminal_env: Vec::new(),
         })
         .await
     }
@@ -579,6 +620,25 @@ pub(crate) async fn run_unix_transport_scenario() -> Result<TransportScenarioRes
             }
         }
 
+        // The assistant message persists asynchronously after `Done`. Poll the
+        // live session history (the same `agent.messages()` that resume reads)
+        // until both the user and assistant messages are present, so the resume
+        // snapshot is deterministic across transports.
+        let persist_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let messages = client.get_history().await?;
+            if messages.len() >= 2 {
+                break;
+            }
+            if Instant::now() >= persist_deadline {
+                anyhow::bail!(
+                    "unix: timed out waiting for assistant message to persist (history had {} message(s))",
+                    messages.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
         let resume_id = client.resume_session(&server_session_id).await?;
         let resume_events = collect_until_history_unix(&mut client, resume_id).await?;
 
@@ -651,6 +711,31 @@ pub(crate) async fn run_websocket_transport_scenario() -> Result<TransportScenar
 
         let message_id = client.send_message("hello over transport").await?;
         collect_until_done_ws(&mut client, message_id).await?;
+
+        // Wait for the assistant message to persist (see the unix scenario): poll
+        // the live history until both messages are present so the resume snapshot
+        // matches across transports rather than racing async persistence.
+        let persist_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let history_id = client.get_history().await?;
+            let events = collect_until_history_ws(&mut client, history_id).await?;
+            let message_count = events
+                .iter()
+                .find_map(|event| match event {
+                    ServerEvent::History { messages, .. } => Some(messages.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            if message_count >= 2 {
+                break;
+            }
+            if Instant::now() >= persist_deadline {
+                anyhow::bail!(
+                    "websocket: timed out waiting for assistant message to persist (history had {message_count} message(s))"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let resume_id = client.resume_session(&server_session_id).await?;
         let resume_events = collect_until_history_ws(&mut client, resume_id).await?;
@@ -831,6 +916,20 @@ pub(crate) async fn wait_for_server_client(
             Err(err) => return Err(err),
         }
     }
+}
+
+pub(crate) async fn subscribe_client(client: &mut server::Client) -> Result<()> {
+    let subscribe_id = client.subscribe().await?;
+    let _ = collect_until_done_unix(client, subscribe_id).await?;
+    Ok(())
+}
+
+pub(crate) async fn wait_for_subscribed_server_client(
+    socket_path: &std::path::Path,
+) -> Result<server::Client> {
+    let mut client = wait_for_server_client(socket_path).await?;
+    subscribe_client(&mut client).await?;
+    Ok(client)
 }
 
 pub(crate) fn kill_child(child: &mut Child) {

@@ -4,12 +4,14 @@
 
 use crate::auth;
 mod accessors;
+mod api_keys;
 mod cache;
 mod display;
 mod model;
 mod openai_helpers;
 mod provider_fetch;
 pub use accessors::*;
+use api_keys::enqueue_api_key_usage_tasks;
 use cache::*;
 pub use jcode_usage_types::{ProviderUsage, ProviderUsageProgress, UsageLimit};
 pub use model::*;
@@ -148,7 +150,9 @@ where
 
     let now = Instant::now();
     let cached_results = if let Ok(map) = cache.lock() {
-        map.values().map(|(_, r)| r.clone()).collect::<Vec<_>>()
+        let mut cached = map.values().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+        sort_reports_most_recent_first(&mut cached);
+        cached
     } else {
         Vec::new()
     };
@@ -247,6 +251,29 @@ fn upsert_provider_usage(results: &mut Vec<ProviderUsage>, report: ProviderUsage
     } else {
         results.push(report);
     }
+    sort_reports_most_recent_first(results);
+}
+
+/// Order reports so the most recently used login comes first. Sources jcode
+/// has never used sort last, alphabetically for stability.
+fn sort_reports_most_recent_first(results: &mut [ProviderUsage]) {
+    results.sort_by(|a, b| {
+        b.last_used_unix_secs
+            .cmp(&a.last_used_unix_secs)
+            .then_with(|| a.provider_name.cmp(&b.provider_name))
+    });
+}
+
+/// Stamp a report with last-used recency from the activity ledger: sets the
+/// sort key and appends a human-readable "Last used" detail line.
+fn attach_activity(report: &mut ProviderUsage, source_key: &str) {
+    if let Some(used) = crate::provider_activity::last_used_unix_secs(source_key) {
+        report.last_used_unix_secs = Some(used);
+        report.extra_info.push((
+            "Last used".to_string(),
+            crate::provider_activity::format_relative_age(used),
+        ));
+    }
 }
 
 fn enqueue_provider_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<ProviderUsage>>) -> usize {
@@ -254,18 +281,131 @@ fn enqueue_provider_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<Provider
 
     total += enqueue_anthropic_usage_tasks(tasks);
     total += enqueue_openai_usage_tasks(tasks);
+    total += enqueue_api_key_usage_tasks(tasks);
 
     if openrouter_api_key().is_some() {
-        tasks.spawn(async { fetch_openrouter_usage_report().await });
+        tasks.spawn(async {
+            fetch_openrouter_usage_report().await.map(|mut report| {
+                attach_activity(&mut report, "openrouter");
+                report
+            })
+        });
         total += 1;
     }
 
     if auth::copilot::has_copilot_credentials() {
-        tasks.spawn(async { fetch_copilot_usage_report().await });
+        tasks.spawn(async {
+            fetch_copilot_usage_report().await.map(|mut report| {
+                attach_activity(&mut report, "copilot");
+                report
+            })
+        });
         total += 1;
     }
 
+    if auth::antigravity::has_cached_auth() {
+        tasks.spawn(async {
+            fetch_antigravity_usage_report().await.map(|mut report| {
+                attach_activity(&mut report, "antigravity");
+                report
+            })
+        });
+        total += 1;
+    }
+
+    if auth::gemini::has_api_key() {
+        tasks.spawn(async {
+            fetch_gemini_usage_report().await.map(|mut report| {
+                attach_activity(&mut report, "gemini");
+                report
+            })
+        });
+        total += 1;
+    }
+
+    if auth::cursor::has_cursor_api_key() {
+        tasks.spawn(async {
+            fetch_cursor_usage_report().await.map(|mut report| {
+                attach_activity(&mut report, "cursor");
+                report
+            })
+        });
+        total += 1;
+    }
+
+    total += enqueue_activity_sweeper_task(tasks);
+
     total
+}
+
+/// Source-key prefixes that already get a dedicated `/usage` report; the
+/// sweeper skips these so used-but-unreported logins (Cursor, Bedrock,
+/// Azure, jcode subscription, ...) still show recency + local spend without
+/// double-listing covered providers.
+fn activity_source_has_dedicated_report(source_key: &str) -> bool {
+    // Dual-auth and OAuth surfaces always reported above.
+    if source_key.starts_with("claude:") || source_key.starts_with("openai:") {
+        return true;
+    }
+    match source_key {
+        "openrouter" => openrouter_api_key().is_some(),
+        "copilot" => auth::copilot::has_copilot_credentials(),
+        "antigravity" => auth::antigravity::has_cached_auth(),
+        "gemini" => auth::gemini::has_api_key(),
+        "cursor" => auth::cursor::has_cursor_api_key(),
+        _ => {
+            // Direct OpenAI-compatible profiles are reported by the API-key
+            // module whenever their key is configured.
+            source_key
+                .strip_prefix("openai-compatible:")
+                .and_then(crate::provider_catalog::openai_compatible_profile_by_id)
+                .map(|profile| {
+                    crate::provider_catalog::load_api_key_from_env_or_config(
+                        profile.api_key_env,
+                        profile.env_file,
+                    )
+                    .is_some()
+                })
+                .unwrap_or(false)
+        }
+    }
+}
+
+/// One catch-all task that reports every ledger entry without a dedicated
+/// fetcher: last-used recency plus locally tracked spend.
+fn enqueue_activity_sweeper_task(tasks: &mut tokio::task::JoinSet<Option<ProviderUsage>>) -> usize {
+    let leftover: Vec<(String, crate::provider_activity::ProviderActivityEntry)> =
+        crate::provider_activity::all_entries()
+            .into_iter()
+            .filter(|(key, _)| !activity_source_has_dedicated_report(key))
+            .collect();
+    if leftover.is_empty() {
+        return 0;
+    }
+
+    let count = leftover.len();
+    for (source_key, entry) in leftover {
+        tasks.spawn(async move {
+            let mut extra_info = Vec::new();
+            if let Some(spend) = entry.spend {
+                extra_info.push((
+                    "Local spend (this machine)".to_string(),
+                    format!(
+                        "${:.2} today · ${:.2} this month · ${:.2} all-time",
+                        spend.day_usd, spend.month_usd, spend.all_time_usd
+                    ),
+                ));
+            }
+            let mut report = ProviderUsage {
+                provider_name: crate::provider_activity::display_name_for_source_key(&source_key),
+                extra_info,
+                ..Default::default()
+            };
+            attach_activity(&mut report, &source_key);
+            Some(report)
+        });
+    }
+    count
 }
 
 fn enqueue_anthropic_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<ProviderUsage>>) -> usize {
@@ -274,16 +414,16 @@ fn enqueue_anthropic_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<Provide
         _ => match auth::claude::load_credentials() {
             Ok(creds) if !creds.access_token.is_empty() => {
                 tasks.spawn(async move {
-                    Some(
-                        fetch_anthropic_usage_for_token(
-                            "Anthropic (Claude)".to_string(),
-                            creds.access_token,
-                            creds.refresh_token,
-                            "default".to_string(),
-                            creds.expires_at,
-                        )
-                        .await,
+                    let mut report = fetch_anthropic_usage_for_token(
+                        "Anthropic (Claude)".to_string(),
+                        creds.access_token,
+                        creds.refresh_token,
+                        "default".to_string(),
+                        creds.expires_at,
                     )
+                    .await;
+                    attach_activity(&mut report, "claude:oauth:default");
+                    Some(report)
                 });
                 return 1;
             }
@@ -321,16 +461,17 @@ fn enqueue_anthropic_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<Provide
         };
 
         tasks.spawn(async move {
-            Some(
-                fetch_anthropic_usage_for_token(
-                    label,
-                    account.access,
-                    account.refresh,
-                    account.label,
-                    account.expires,
-                )
-                .await,
+            let source_key = format!("claude:oauth:{}", account.label);
+            let mut report = fetch_anthropic_usage_for_token(
+                label,
+                account.access,
+                account.refresh,
+                account.label,
+                account.expires,
             )
+            .await;
+            attach_activity(&mut report, &source_key);
+            Some(report)
         });
     }
 
@@ -358,9 +499,11 @@ fn enqueue_openai_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<ProviderUs
                 expires_at: account.expires_at,
             };
             tasks.spawn(async move {
-                Some(
-                    fetch_openai_usage_for_account(display_name, creds, Some(&account_label)).await,
-                )
+                let source_key = format!("openai:oauth:{}", account_label);
+                let mut report =
+                    fetch_openai_usage_for_account(display_name, creds, Some(&account_label)).await;
+                attach_activity(&mut report, &source_key);
+                Some(report)
             });
         }
         return account_count;
@@ -376,14 +519,14 @@ fn enqueue_openai_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<ProviderUs
     }
 
     tasks.spawn(async move {
-        Some(
-            fetch_openai_usage_for_account(
-                openai_provider_display_name("default", None, 1, true),
-                creds,
-                None,
-            )
-            .await,
+        let mut report = fetch_openai_usage_for_account(
+            openai_provider_display_name("default", None, 1, true),
+            creds,
+            None,
         )
+        .await;
+        attach_activity(&mut report, "openai:oauth:default");
+        Some(report)
     });
     1
 }
