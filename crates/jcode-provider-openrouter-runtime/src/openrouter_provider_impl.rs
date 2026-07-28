@@ -94,7 +94,7 @@ impl Provider for OpenRouterProvider {
         );
 
         // Build tools in OpenAI format
-        let api_tools: Vec<Value> = tools
+        let mut api_tools: Vec<Value> = tools
             .iter()
             .map(|t| {
                 serde_json::json!({
@@ -111,6 +111,20 @@ impl Provider for OpenRouterProvider {
                 })
             })
             .collect();
+
+        // MiniMax chat models can request text-to-image generation through the
+        // MiniMax `/v1/image_generation` endpoint. Advertise the function tool
+        // so the model can emit `image_generation` calls; the stream interceptor
+        // below executes them and emits the provider-native generated-image
+        // event so the existing persistence/display/visual-context pipeline is
+        // reused. See `minimax_image` module.
+        let minimax_image_enabled = super::minimax_image::profile_supports_minimax_image_generation(
+            self.profile_id.as_deref(),
+            &model,
+        );
+        if minimax_image_enabled {
+            api_tools.push(super::minimax_image::minimax_image_generation_tool_json());
+        }
 
         // Build request
         let mut request = serde_json::json!({
@@ -294,6 +308,7 @@ impl Provider for OpenRouterProvider {
         let request_for_retries = request;
         let model_for_stream = model.clone();
         let provider_pin = Arc::clone(&self.provider_pin);
+        let minimax_image = minimax_image_enabled;
 
         tokio::spawn(async move {
             if tx
@@ -305,17 +320,54 @@ impl Provider for OpenRouterProvider {
             {
                 return;
             }
-            run_stream_with_retries(
-                client,
-                api_base,
-                auth,
-                send_openrouter_headers,
-                request_for_retries,
-                tx,
-                provider_pin,
-                model_for_stream,
-            )
-            .await;
+            if minimax_image {
+                // Route the SSE stream through an intermediate channel so
+                // completed `image_generation` tool calls can be executed
+                // against the MiniMax image endpoint and turned into
+                // `StreamEvent::GeneratedImage` + `StreamEvent::ToolResult`
+                // before the agent loop observes them. The `ToolUseStart`/
+                // `ToolInputDelta`/`ToolUseEnd` events are still forwarded so
+                // the assistant turn records the call and the conversation
+                // history stays valid for MiniMax.
+                let (mid_tx, mid_rx) = mpsc::channel::<Result<StreamEvent>>(100);
+                let interceptor_client = client.clone();
+                let interceptor_api_base = api_base.clone();
+                let interceptor_auth = auth.clone();
+                let stream_task = tokio::spawn(async move {
+                    run_stream_with_retries(
+                        client,
+                        api_base,
+                        auth,
+                        send_openrouter_headers,
+                        request_for_retries,
+                        mid_tx,
+                        provider_pin,
+                        model_for_stream,
+                    )
+                    .await;
+                });
+                super::minimax_image::run_minimax_image_interceptor(
+                    mid_rx,
+                    tx,
+                    interceptor_client,
+                    interceptor_api_base,
+                    interceptor_auth,
+                )
+                .await;
+                let _ = stream_task.await;
+            } else {
+                run_stream_with_retries(
+                    client,
+                    api_base,
+                    auth,
+                    send_openrouter_headers,
+                    request_for_retries,
+                    tx,
+                    provider_pin,
+                    model_for_stream,
+                )
+                .await;
+            }
         });
 
         Ok(Box::pin(ReceiverStream::new(rx)))

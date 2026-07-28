@@ -433,7 +433,7 @@ fn apply_kimi_coding_agent_headers(
 }
 
 #[derive(Debug, Clone)]
-enum ProviderAuth {
+pub(crate) enum ProviderAuth {
     AuthorizationBearer {
         token: String,
         label: String,
@@ -452,7 +452,10 @@ enum ProviderAuth {
 }
 
 impl ProviderAuth {
-    async fn apply(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+    pub(crate) async fn apply(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder> {
         match self {
             Self::AuthorizationBearer { token, .. } => Ok(req.bearer_auth(token)),
             Self::HeaderValue {
@@ -2770,6 +2773,8 @@ impl OpenRouterProvider {
     }
 }
 
+#[path = "minimax_image.rs"]
+mod minimax_image;
 #[path = "openrouter_provider_impl.rs"]
 mod openrouter_provider_impl;
 #[path = "openrouter_sse_stream.rs"]
