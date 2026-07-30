@@ -269,7 +269,7 @@ const ISSUE_DRIVEN_LIVE_PROVIDER_TARGETS: &[IssueDrivenLiveProviderTarget] = &[
     IssueDrivenLiveProviderTarget {
         provider_id: "minimax",
         provider_label: "MiniMax",
-        model: Some("MiniMax-M2.7"),
+        model: Some("MiniMax-M3"),
         reason: "MiniMax endpoint/key-region selection and live balance/readiness",
         issue_refs: &["#110", "#131", "#189"],
     },
@@ -3071,7 +3071,7 @@ mod tests {
             ),
             ("  [#223] xiaomi-mimo / mimo-v2.5: READY", Pass),
             ("  [#234] opencode-go / kimi-k2.5: no evidence yet", Dim),
-            ("  [#110] minimax / MiniMax-M2.7: seen, not yet READY", Warn),
+            ("  [#110] minimax / MiniMax-M3: seen, not yet READY", Warn),
             ("Ledger: /home/x/coverage.json", Dim),
             ("✓ Credential loaded - Passed", Pass),
             ("✗ streaming chat completion - Failed", Fail),

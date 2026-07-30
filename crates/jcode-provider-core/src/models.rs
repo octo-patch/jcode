@@ -340,6 +340,13 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
         return Some(262_144);
     }
 
+    // --- MiniMax family ---
+    // MiniMax-M3 advertises a 1,000,000-token context window; the earlier M2
+    // family ships 204,800. Match M3 before the broader family fallback so the
+    // newer flagship resolves to its published window.
+    if m.contains("minimax-m3") {
+        return Some(1_000_000);
+    }
     // --- MiniMax M2 family: 204,800 context ---
     if m.contains("minimax") {
         return Some(204_800);
