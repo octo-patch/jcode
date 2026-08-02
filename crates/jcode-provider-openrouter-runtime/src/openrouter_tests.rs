@@ -718,6 +718,8 @@ fn minimax_profile_exposes_static_models_before_catalog_refresh() {
     let models = jcode_base::provider_catalog::openai_compatible_profile_static_models(
         jcode_provider_metadata::MINIMAX_PROFILE,
     );
+    assert_eq!(models.first().map(String::as_str), Some("MiniMax-M3"));
+    assert_eq!(models.get(1).map(String::as_str), Some("MiniMax-M2.7"));
     assert!(models.iter().any(|model| model == "MiniMax-M2.7"));
     assert!(models.iter().any(|model| model == "MiniMax-M2.7-highspeed"));
     assert!(models.iter().any(|model| model == "MiniMax-M2"));
