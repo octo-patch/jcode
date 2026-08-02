@@ -340,8 +340,11 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
         return Some(262_144);
     }
 
-    // --- MiniMax M2 family: 204,800 context ---
+    // --- MiniMax family ---
     if m.contains("minimax") {
+        if m.contains("minimax-m3") {
+            return Some(1_000_000);
+        }
         return Some(204_800);
     }
 
