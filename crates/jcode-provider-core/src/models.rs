@@ -340,6 +340,11 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
         return Some(262_144);
     }
 
+    // --- MiniMax M3: 1,000,000 context window ---
+    if m.contains("minimax-m3") {
+        return Some(1_000_000);
+    }
+
     // --- MiniMax M2 family: 204,800 context ---
     if m.contains("minimax") {
         return Some(204_800);
@@ -488,6 +493,19 @@ mod tests {
     fn bare_k3_resolves_globally_to_one_million_context() {
         // Global resolution path used by the TUI meter and compaction budget (#577).
         assert_eq!(context_limit_for_model("k3"), Some(1_048_576));
+    }
+
+    #[test]
+    fn minimax_m3_family_resolves_to_one_million_context() {
+        // MiniMax-M3 ships a 1M window; the M2 family keeps its 204,800 window.
+        assert_eq!(
+            open_weight_family_context_limit("minimax-m3"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            open_weight_family_context_limit("minimax-m2.7"),
+            Some(204_800)
+        );
     }
 
     #[test]
