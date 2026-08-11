@@ -507,6 +507,7 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
         // before the picker/routes are rebuilt. Keep the documented text models
         // selectable immediately after saving a key.
         "minimax" => {
+            push("MiniMax-M3");
             push("MiniMax-M2.7");
             push("MiniMax-M2.7-highspeed");
             push("MiniMax-M2.5");
